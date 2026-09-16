@@ -183,6 +183,20 @@ def _dominant_line_cluster(line_stats: dict[int, dict[str, Any]], gap_ms: int = 
     return max(clusters, key=len) if clusters else []
 
 
+# How far a unanimous word-level cluster may sit from the line-level shift and
+# still be trusted to override it. A real case measured ~9000ms of disagreement
+# from a chorus repeated three times inside one oversized, ASR-garbled segment
+# (line-level anchored to the segment's own start, word-level correctly landing
+# on the actual matched substring deep inside it) -- likely closer to the truth
+# than the line-level number it was compared against, but nothing here can tell
+# the two apart automatically, and refusing costs nothing but a missed
+# correction (fall back to the line shift, same as before this bootstrap
+# existed). 2000-3000ms is the largest disagreement seen on a genuinely good
+# match, so this sits with real margin below the ~9000ms failure and real
+# margin above that: neither edge is razor-thin.
+MAX_WORD_VS_LINE_SHIFT_DIFF_MS = 5000
+
+
 def _bootstrap_word_shift(exact_anchors: list[dict[str, Any]], center: int) -> dict[str, Any]:
     """Find a global word-level shift from line votes, with the safety valves a
     single mis-timed segment needs to be kept from swinging the whole song.
@@ -215,7 +229,7 @@ def _bootstrap_word_shift(exact_anchors: list[dict[str, Any]], center: int) -> d
     if coverage < 0.6:
         result["status"] = "no_dominant_cluster"
         return result
-    if abs(cluster_median - center) > 8000:
+    if abs(cluster_median - center) > MAX_WORD_VS_LINE_SHIFT_DIFF_MS:
         # Seen on a song with a chorus repeated three times: four lines' char-level
         # consensus sat ~9000ms away from -- and opposite in sign to -- the
         # line-level shift, while the fifth line's two levels agreed almost

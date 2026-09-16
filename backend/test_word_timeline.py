@@ -171,6 +171,18 @@ class WordTimelineTests(unittest.TestCase):
         self.assertEqual(result["shift_source"], "line")
         self.assertEqual(result["word_anchor_rejected_count"], 0)
 
+    def test_bootstrap_accepts_a_cluster_within_the_safety_margin(self):
+        # A genuine segmentation-bias case (like the ~2600ms one on 《和你一样》)
+        # still needs to clear the valve. This checks a disagreement close to but
+        # under MAX_WORD_VS_LINE_SHIFT_DIFF_MS (5000ms) is still trusted.
+        lines = ["春风吹过山岗", "我们一起歌唱", "直到夜色散场", "风起云涌变幻"]
+        starts = [0, 20000, 40000, 60000]
+        rows = [provider_row(text, start) for text, start in zip(lines, starts)]
+        asr = [self._decoupled_segment(text, start, 3000, 6800) for text, start in zip(lines, starts)]
+        result = score_provider_timeline(rows, asr, title_score=1)
+        self.assertEqual(result["word_bootstrap_status"], "accepted")
+        self.assertEqual(result["shift_source"], "word")
+
     def test_bootstrap_refuses_a_cluster_far_from_the_line_shift(self):
         # A tight, unanimous word-level cluster is still refused if it sits far
         # from the line-level shift -- that combination showed up for real on a
