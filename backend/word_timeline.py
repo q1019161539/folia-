@@ -6,7 +6,7 @@ import math
 import statistics
 from typing import Any, Callable
 
-from standard_timeline import clamp_forced_words, interpolated_shift_ms, normalized, score_timeline
+from standard_timeline import clamp_forced_words, interpolated_shift_ms, mad_ms, normalized, score_timeline
 
 
 def normalize_provider_rows(
@@ -146,6 +146,89 @@ def _line_word_anchors(
     return sorted(anchors + additions, key=lambda item: (item["qwen_start_ms"], item["standard_char_index"]))
 
 
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _line_delta_stats(exact_by_line: dict[int, list[int]]) -> dict[int, dict[str, Any]]:
+    """Per-line median/MAD of character deltas, for lines with enough chars to
+    vouch for themselves (>=2 -- the same bar `apply_hybrid_words` uses to trust
+    a line's own local shift over the global one)."""
+    return {
+        line: {"median": statistics.median(deltas), "mad": mad_ms(deltas), "count": len(deltas)}
+        for line, deltas in exact_by_line.items()
+        if len(deltas) >= 2
+    }
+
+
+def _dominant_line_cluster(line_stats: dict[int, dict[str, Any]], gap_ms: int = 1500) -> list[int]:
+    """Group per-line shift votes (one line, one vote) into offset clusters and
+    return the lines in the largest one.
+
+    A merged ASR segment biases every line it touches by roughly the same
+    lead-in, so segmentation artefacts show up as their own tight cluster
+    sitting seconds away from the real offset -- exactly the ~2600ms split
+    found on 《和你一样》. This only needs to find the largest tight group, not
+    classify every line; anything left out simply isn't part of it.
+    """
+    ordered = sorted(line_stats.items(), key=lambda item: item[1]["median"])
+    clusters: list[list[int]] = []
+    for line, stat in ordered:
+        if clusters:
+            cluster_median = statistics.median(line_stats[member]["median"] for member in clusters[-1])
+            if abs(stat["median"] - cluster_median) <= gap_ms:
+                clusters[-1].append(line)
+                continue
+        clusters.append([line])
+    return max(clusters, key=len) if clusters else []
+
+
+def _bootstrap_word_shift(exact_anchors: list[dict[str, Any]], center: int) -> dict[str, Any]:
+    """Find a global word-level shift from line votes, with the safety valves a
+    single mis-timed segment needs to be kept from swinging the whole song.
+
+    The old approach filtered every character against a *line-level* expected
+    offset, which is exactly backwards when the line-level numbers are the ones
+    carrying the ASR segmentation bias (see standard_timeline's anchor_trend_stats
+    docstring for the mechanism): 《和你一样》 lost 94% of its correct word anchors
+    that way, because their true offset disagreed with a line-level `expected`
+    that was itself wrong by ~2600ms. Voting one line at a time instead of one
+    character at a time also stops a single 20-character mismatched line from
+    outvoting several short correct ones.
+    """
+    exact_by_line: dict[int, list[int]] = {}
+    for item in exact_anchors:
+        exact_by_line.setdefault(int(item["lyric_index"]), []).append(item["qwen_start_ms"] - item["provider_start_ms"])
+    line_stats = _line_delta_stats(exact_by_line)
+    result: dict[str, Any] = {
+        "line_stats": line_stats,
+        "cluster_lines": [],
+        "word_shift_ms": None,
+        "status": "insufficient_lines",
+    }
+    if len(line_stats) < 3:
+        return result
+    cluster = _dominant_line_cluster(line_stats)
+    result["cluster_lines"] = cluster
+    coverage = len(cluster) / len(line_stats)
+    cluster_median = statistics.median(line_stats[line]["median"] for line in cluster)
+    if coverage < 0.6:
+        result["status"] = "no_dominant_cluster"
+        return result
+    if abs(cluster_median - center) > 8000:
+        # Seen on a song with a chorus repeated three times: four lines' char-level
+        # consensus sat ~9000ms away from -- and opposite in sign to -- the
+        # line-level shift, while the fifth line's two levels agreed almost
+        # exactly. That pattern points at a timestamp base mismatch between
+        # segment-level and word-level times on that job, not at a real 9-second
+        # performance offset. This valve exists precisely to refuse to let such a
+        # cluster take over the global shift; it does not diagnose the mismatch.
+        result["status"] = "far_from_line_shift"
+        return result
+    result.update(word_shift_ms=round(cluster_median), status="accepted")
+    return result
+
+
 def score_provider_timeline(
     rows: list[dict[str, Any]],
     asr_segments: list[dict[str, Any]],
@@ -156,11 +239,8 @@ def score_provider_timeline(
     line_result = score_timeline(timed, asr_segments, title_score=title_score)
     if not line_result.get("core_anchors"):
         return {**line_result, "word_anchors": [], "word_anchor_count": 0, "word_coverage": 0.0}
-    # Both steps here are evidence work, not confidence judgement, so both read the
-    # evidence chain: harvesting word anchors from every lyric line it reaches, and
-    # then vetting each one against the local expected offset. That vetting wants
-    # the denser chain precisely because a live performance drifts locally, and the
-    # word anchor still has to land within 1800ms of it to be accepted at all.
+    # Harvesting is evidence work, so it reads the evidence chain -- every extra
+    # lyric line it reaches is more per-character material to vote with below.
     # (Confidence and drift read core_anchors alone -- see standard_timeline.)
     word_anchors: list[dict[str, Any]] = []
     for anchor in line_result.get("evidence_anchors") or line_result["core_anchors"]:
@@ -169,33 +249,59 @@ def score_provider_timeline(
             continue
         word_anchors.extend(_line_word_anchors(lyric_index, asr_index, timed[lyric_index], asr_segments[asr_index]))
     center = int(line_result.get("shift_ms", 0))
+    raw_exact = [item for item in word_anchors if item["kind"] == "exact"]
+    bootstrap = _bootstrap_word_shift(raw_exact, center)
+    line_stats, cluster_lines = bootstrap["line_stats"], set(bootstrap["cluster_lines"])
+    cluster_mad = mad_ms([line_stats[line]["median"] for line in cluster_lines]) if cluster_lines else 0
+    # Filtering is independent of whether the *global* bootstrap succeeded: a
+    # line with enough characters to vouch for itself keeps its own anchors on
+    # its own consensus regardless of what the rest of the song is doing (that
+    # consensus is exactly what apply_hybrid_words will trust as this line's own
+    # local_shift downstream). Only characters in lines too sparse to vouch for
+    # themselves fall back to the global word shift, or -- if that isn't trustworthy
+    # either -- the old per-anchor line-level interpolation, unchanged.
     accepted_word_anchors = []
     for item in word_anchors:
         delta = item["qwen_start_ms"] - item["provider_start_ms"]
-        expected = interpolated_shift_ms(
-            item["provider_start_ms"], line_result.get("evidence_anchors"), center
-        )
-        if abs(delta - expected) <= 1800:
+        line = int(item["lyric_index"])
+        stat = line_stats.get(line)
+        if stat is not None:
+            expected, window = stat["median"], _clamp(3 * stat["mad"], 500, 2000)
+        elif bootstrap["status"] == "accepted":
+            expected, window = bootstrap["word_shift_ms"], _clamp(3 * cluster_mad, 500, 2000)
+        else:
+            expected = interpolated_shift_ms(item["provider_start_ms"], line_result.get("evidence_anchors"), center)
+            window = 1800
+        if abs(delta - expected) <= window:
             accepted_word_anchors.append({**item, "delta_ms": delta})
-    # Watch the accept/reject split across runs. `expected` comes from a piecewise
-    # interpolation over the evidence chain, so if that chain ever starts admitting
-    # many extra anchors, a wrong one could bend the expected offset around it and
-    # silently reject good word anchors. Today evidence == core on most songs and
-    # the split is stable; these counts are how that would become visible.
+    # Watch the accept/reject split across runs -- this is how a systematic
+    # rejection problem like 《和你一样》's (94% of its correct word anchors gone)
+    # becomes visible again if some future change reintroduces one.
     raw_word_anchor_count = len(word_anchors)
     word_anchors = accepted_word_anchors
     exact = [item for item in word_anchors if item["kind"] == "exact"]
     word_lines = {item["lyric_index"] for item in exact}
-    shift_ms = center
+    accepted_exact_counts: dict[int, int] = {}
+    for item in exact:
+        accepted_exact_counts[item["lyric_index"]] = accepted_exact_counts.get(item["lyric_index"], 0) + 1
+    # The same >=2 bar apply_hybrid_words uses downstream to trust a line's own
+    # local shift over whatever global shift_ms this reports.
+    local_shift_lines = {line for line, count in accepted_exact_counts.items() if count >= 2}
+    shift_source = "word" if bootstrap["status"] == "accepted" else "line"
+    shift_ms = bootstrap["word_shift_ms"] if shift_source == "word" else center
     p90 = None
     span_ms = 0
-    if len(exact) >= 5 and len(word_lines) >= 2:
-        shift_ms = round(statistics.median(item["delta_ms"] for item in exact))
-        residuals = sorted(abs(item["delta_ms"] - shift_ms) for item in exact)
+    word_median_abs, word_mad = 0, 0
+    if exact:
+        residuals_signed = [item["delta_ms"] - shift_ms for item in exact]
+        residuals = sorted(abs(value) for value in residuals_signed)
         p90 = residuals[min(len(residuals) - 1, math.ceil(len(residuals) * 0.9) - 1)]
         span_ms = max(item["qwen_start_ms"] for item in exact) - min(item["qwen_start_ms"] for item in exact)
+        word_median_abs = round(statistics.median(residuals))
+        word_mad = mad_ms(residuals_signed)
     lyric_characters = sum(len(normalized(row.get("text", ""))) for row in timed)
     coverage = len({(item["lyric_index"], item["standard_char_index"]) for item in exact}) / max(1, lyric_characters)
+    timing_model = "word_local_hybrid" if local_shift_lines else f"{shift_source}_global"
     # Confidence is decided by line-level evidence alone. Word-level anchors stay
     # as timing material (they drive the hybrid per-character merge) and as a
     # ranking bonus, but they no longer vote on confidence: a live cover drifts
@@ -211,6 +317,14 @@ def score_provider_timeline(
         **line_result,
         "score": round(score, 3),
         "shift_ms": shift_ms,
+        "line_shift_ms": center,
+        "effective_shift_ms": shift_ms,
+        "shift_source": shift_source,
+        "timing_model": timing_model,
+        "word_bootstrap_status": bootstrap["status"],
+        "word_eligible_line_count": len(line_stats),
+        "word_dominant_cluster_line_count": len(cluster_lines),
+        "word_local_shift_line_count": len(local_shift_lines),
         "word_anchors": word_anchors,
         "word_anchor_count": len(exact),
         "word_anchor_raw_count": raw_word_anchor_count,
@@ -219,6 +333,8 @@ def score_provider_timeline(
         "word_anchor_lines": len(word_lines),
         "word_anchor_span_ms": span_ms,
         "word_residual_p90_ms": p90,
+        "word_median_abs_residual_ms": word_median_abs,
+        "word_mad_ms": word_mad,
         "word_coverage": round(coverage, 4),
         "low_confidence": low_confidence,
         "confidence": "low" if low_confidence else "high",

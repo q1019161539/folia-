@@ -130,6 +130,68 @@ class WordTimelineTests(unittest.TestCase):
         self.assertTrue(result["low_confidence"])
         self.assertEqual(result["confidence"], "low")
 
+    def test_segment_bias_no_longer_mass_rejects_a_lines_word_anchors(self):
+        # Reproduces the exact 《和你一样》mechanism: a merged ASR segment biases
+        # a line's own *coarse* (line-level) matched start away from its true
+        # singing time, while every character's real Qwen timing stays exactly
+        # where it was actually sung -- there is no real tempo drift here, only
+        # two lines whose segment happened to start 2600ms into the previous
+        # line's tail. The old filter compared each character against an
+        # `expected` derived from that same biased coarse anchor (interpolated
+        # over the evidence chain), so a line caught in the bias lost all of its
+        # word evidence even though its own characters agreed with each other
+        # perfectly: |3000 - 5600| = 2600ms > the old fixed 1800ms window.
+        lines = ["春风吹过山岗", "我们一起歌唱", "直到夜色散场", "风起云涌变幻", "江山如此多娇"]
+        starts = [0, 20000, 40000, 60000, 80000]
+        rows = [provider_row(text, start) for text, start in zip(lines, starts)]
+        biased_lines = {1, 3}
+        asr = [
+            self._decoupled_segment(text, start, 5600 if i in biased_lines else 3000, 3000)
+            for i, (text, start) in enumerate(zip(lines, starts))
+        ]
+        result = score_provider_timeline(rows, asr, title_score=1)
+        self.assertEqual(result["word_bootstrap_status"], "accepted")
+        self.assertEqual(result["shift_source"], "word")
+        self.assertEqual(result["shift_ms"], 3000)
+        self.assertEqual(result["word_anchor_lines"], 5)
+        self.assertEqual(result["word_anchor_rejected_count"], 0)
+
+    def test_bootstrap_needs_at_least_three_lines_before_it_overrides_the_line_shift(self):
+        # Two internally-consistent lines is not enough evidence to promote a
+        # global word shift over the line-level one (the safety valve requires
+        # at least three) -- but each line still keeps its own anchors on its
+        # own self-consistency regardless of whether the global vote succeeds.
+        rows = [provider_row("春风吹过山岗", 0), provider_row("我们一起歌唱", 20000)]
+        asr = [
+            self._decoupled_segment("春风吹过山岗", 0, 3000, 3000),
+            self._decoupled_segment("我们一起歌唱", 20000, 3000, 3000),
+        ]
+        result = score_provider_timeline(rows, asr, title_score=1)
+        self.assertEqual(result["word_bootstrap_status"], "insufficient_lines")
+        self.assertEqual(result["shift_source"], "line")
+        self.assertEqual(result["word_anchor_rejected_count"], 0)
+
+    def test_bootstrap_refuses_a_cluster_far_from_the_line_shift(self):
+        # A tight, unanimous word-level cluster is still refused if it sits far
+        # from the line-level shift -- that combination showed up for real on a
+        # song with a chorus repeated three times, where four lines' word-level
+        # consensus sat ~9000ms away from (and opposite in sign to) the
+        # line-level shift while a fifth line's two levels agreed almost
+        # exactly. That pattern means a timestamp base mismatch somewhere, not a
+        # genuine multi-second performance offset, and the valve exists to keep
+        # it from ever taking over the global shift. It must still be visible in
+        # cluster_lines for diagnosis, and per-line filtering must not punish
+        # lines for it.
+        lines = ["春风吹过山岗", "我们一起歌唱", "直到夜色散场", "风起云涌变幻"]
+        starts = [0, 20000, 40000, 60000]
+        rows = [provider_row(text, start) for text, start in zip(lines, starts)]
+        asr = [self._decoupled_segment(text, start, 3000, 13000) for text, start in zip(lines, starts)]
+        result = score_provider_timeline(rows, asr, title_score=1)
+        self.assertEqual(result["word_bootstrap_status"], "far_from_line_shift")
+        self.assertEqual(result["word_dominant_cluster_line_count"], 4)
+        self.assertEqual(result["shift_source"], "line")
+        self.assertEqual(result["word_anchor_rejected_count"], 0)
+
     def test_line_level_evidence_alone_yields_high_confidence(self):
         lines = ["春风吹过山岗", "我们一起歌唱", "直到夜色散场"]
         starts = [0, 6000, 12000]

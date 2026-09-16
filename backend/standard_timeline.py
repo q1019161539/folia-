@@ -134,8 +134,12 @@ def max_anchor_drift_ms(anchors: list[dict[str, Any]] | None, shift_ms: int) -> 
     return max((abs(delta - int(shift_ms)) for delta in deltas), default=0)
 
 
-def _mad_ms(values: list[float]) -> int:
-    """Median absolute deviation, scaled to compare with a standard deviation."""
+def mad_ms(values: list[float]) -> int:
+    """Median absolute deviation, scaled to compare with a standard deviation.
+
+    Public so word_timeline's own line-vote bootstrap can reuse the same robust
+    spread measure instead of duplicating it.
+    """
     if not values:
         return 0
     center = statistics.median(values)
@@ -156,7 +160,7 @@ def anchor_residual_stats(anchors: list[dict[str, Any]] | None, shift_ms: int) -
     absolute = sorted(abs(value) for value in signed)
     return {
         "median_abs_residual_ms": round(statistics.median(absolute)),
-        "mad_ms": _mad_ms(signed),
+        "mad_ms": mad_ms(signed),
         "residual_p90_ms": absolute[min(len(absolute) - 1, math.ceil(len(absolute) * 0.9) - 1)],
     }
 
@@ -212,8 +216,8 @@ def anchor_trend_stats(anchors: list[dict[str, Any]] | None, shift_ms: int) -> d
     center_ms = statistics.median(time_ms for time_ms, _ in points)
     intercept = statistics.median(delta - slope * (time_ms - center_ms) for time_ms, delta in points)
     trend_residuals = [delta - (intercept + slope * (time_ms - center_ms)) for time_ms, delta in points]
-    shift_mad = _mad_ms([delta - int(shift_ms) for _, delta in points])
-    affine_mad = _mad_ms(trend_residuals)
+    shift_mad = mad_ms([delta - int(shift_ms) for _, delta in points])
+    affine_mad = mad_ms(trend_residuals)
     return {
         "long_baseline_pairs": len(slopes),
         "drift_over_span_ms": round(slope * span_ms),
