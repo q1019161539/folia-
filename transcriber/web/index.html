@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Folia · 录播转录</title>
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <header class="appbar">
+    <div class="brand"><span class="brand-mark">F</span><div><strong>Folia</strong><small>录播转录</small></div></div>
+    <div class="system-state"><a href="/" target="_top">返回视频工坊</a> · <i></i> 飞牛本地运行 · CPU</div>
+  </header>
+
+  <main class="app-shell">
+    <nav class="workflow" aria-label="处理步骤">
+      <button class="workflow-tab active" data-stage="all"><span>01</span><b>一键处理</b><small>推荐</small></button>
+      <button class="workflow-tab" data-stage="extract"><span>02</span><b>提取音频</b><small>独立运行</small></button>
+      <button class="workflow-tab" data-stage="asr"><span>03</span><b>语音转录</b><small>独立运行</small></button>
+      <button class="workflow-tab" data-stage="align"><span>04</span><b>时间对齐</b><small>独立运行</small></button>
+    </nav>
+
+    <div class="content-grid">
+      <section class="primary-column">
+        <article class="card create-card">
+          <div class="section-title">
+            <div><p class="eyebrow">新建任务</p><h1 id="stage-title">一键完整处理</h1></div>
+            <span id="stage-pill" class="stage-pill">视频 → 原始音频 → 文字 → 时间戳</span>
+          </div>
+
+          <button id="choose-file" class="source-card empty" type="button">
+            <span id="source-icon" class="source-icon">＋</span>
+            <span class="source-copy"><b id="source-name">选择飞牛里的录播文件</b><small id="selected-file">从 bililive-tools 录播目录中浏览</small></span>
+            <span class="source-action">浏览录播</span>
+          </button>
+          <button id="choose-work" class="reuse-button" type="button" hidden>从过程文件目录选择已有任务</button>
+
+          <div class="setting-block">
+            <div class="setting-heading"><b>处理范围</b><small>第一次建议先跑 10 分钟</small></div>
+            <div class="segmented" id="duration-mode">
+              <label><input type="radio" name="duration" value="10" checked><span><b>快速试跑</b><small>开头 10 分钟</small></span></label>
+              <label><input type="radio" name="duration" value=""><span><b>整场录播</b><small>处理全部时长</small></span></label>
+              <label><input type="radio" name="duration" value="custom"><span><b>自定义</b><small><input id="custom-minutes" type="number" min="0.1" step="0.1" value="30" disabled> 分钟</small></span></label>
+            </div>
+          </div>
+
+          <div class="common-options" id="common-options">
+            <label class="option-card"><span><b>逐句时间戳</b><small>默认开启；转录后自动进行句级时间对齐</small></span><input id="use-alignment" type="checkbox" checked><i></i></label>
+          </div>
+
+          <details class="advanced">
+            <summary>高级设置 <span>模型、切块和任务 ID</span></summary>
+            <div class="advanced-grid">
+              <label>任务 ID<input id="run-id" placeholder="选择文件后自动生成"></label>
+              <label>ASR 切块<select id="chunk-seconds"><option value="180">180 秒（推荐）</option><option value="120">120 秒</option><option value="60">60 秒</option></select></label>
+              <label>ASR 引擎<select id="asr-engine"><option value="local">本地 Qwen3-ASR（免费 / CPU）</option><option value="aliyun">阿里云 qwen3-asr-flash</option></select><small id="aliyun-hint" class="field-hint"></small></label>
+              <label>ASR 音源<select id="asr-source" disabled><option value="mix">原始混音（人声分离暂时关闭）</option></select></label>
+            </div>
+          </details>
+
+          <div class="start-row">
+            <div class="save-summary"><span>结果保存到</span><code id="output-path">选择录播后显示</code></div>
+            <button id="start-button" class="start-button" type="button"><span>▶</span> 开始完整处理</button>
+          </div>
+          <p id="action-message" class="action-message"></p>
+        </article>
+
+        <article id="result-card" class="card result-card">
+          <div class="result-head">
+            <div><p class="eyebrow">当前任务</p><h2 id="current-job-title">尚未选择任务</h2></div>
+            <div class="job-actions"><button id="cancel-button" class="cancel-button" type="button" hidden>中止任务</button><span id="log-status" class="status">未选择</span></div>
+          </div>
+          <div class="progress-area">
+            <div class="progress-copy"><span id="progress-label">等待任务</span><b id="progress-value">0%</b></div>
+            <div class="progress-track"><i id="progress-bar"></i></div>
+          </div>
+          <div class="result-tabs" role="tablist">
+            <button class="result-tab active" data-view="transcript">转录结果</button>
+            <button class="result-tab" data-view="files">文件</button>
+            <button class="result-tab" data-view="log">运行日志</button>
+          </div>
+          <div id="transcript-view" class="result-view active"><div id="transcript-list" class="empty-result">处理完成后，这里会按时间轴显示转录文字。</div></div>
+          <div id="files-view" class="result-view"><div class="path-list"><div><span>结果目录</span><code id="job-output-path">—</code></div><div><span>中间文件</span><code id="work-path">—</code></div></div><div id="downloads" class="downloads"></div></div>
+          <div id="log-view" class="result-view"><pre id="job-log">选择右侧任务可查看日志。</pre></div>
+        </article>
+      </section>
+
+      <aside class="card history-card">
+        <div class="history-head"><div><p class="eyebrow">最近任务</p><h2>处理记录</h2></div><button id="refresh-jobs" class="icon-button" aria-label="刷新任务">↻</button></div>
+        <div id="job-list" class="job-list"><p class="muted">暂无任务</p></div>
+      </aside>
+    </div>
+  </main>
+
+  <dialog id="file-dialog" class="file-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">飞牛录播目录</p><h2>选择一个视频</h2></div><button id="close-files" class="close-button" aria-label="关闭">×</button></div>
+    <div class="browser-toolbar"><div id="breadcrumbs" class="breadcrumbs"></div><button id="refresh-files" class="icon-button" aria-label="刷新目录">↻</button></div>
+    <div id="file-list" class="file-list"><p class="muted">正在读取录播目录……</p></div>
+  </dialog>
+
+  <dialog id="work-dialog" class="file-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">飞牛过程文件目录</p><h2>选择已有任务</h2></div><button id="close-work" class="close-button" aria-label="关闭">×</button></div>
+    <div class="browser-toolbar"><div class="breadcrumbs">/work/jobs · 只显示当前模块可复用的任务</div><button id="refresh-work" class="icon-button" aria-label="刷新目录">↻</button></div>
+    <div id="work-list" class="file-list"><p class="muted">正在读取过程文件目录……</p></div>
+  </dialog>
+
+  <script src="assets/app.js?v=20260908-2"></script>
+</body>
+</html>

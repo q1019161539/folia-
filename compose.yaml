@@ -1,0 +1,189 @@
+name: folia-video-studio
+services:
+  studio-web:
+    container_name: folia-video-web
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+    restart: unless-stopped
+    environment:
+      STUDIO_PASSWORD: ${STUDIO_PASSWORD}
+    ports:
+      - "18081:80"
+    depends_on:
+      studio-api:
+        condition: service_healthy
+      folia-renderer:
+        condition: service_healthy
+      transcriber:
+        condition: service_healthy
+    labels:
+      watchcow.enable: "true"
+      watchcow.appname: "watchcow.folia-video-studio"
+      watchcow.display_name: "Folia 歌词视频工坊"
+      watchcow.desc: "直播切片歌词识别、校对、实时预览与视频合成"
+      watchcow.service_port: "18081"
+      watchcow.protocol: "http"
+      watchcow.path: "/"
+      watchcow.ui_type: "url"
+      watchcow.all_users: "true"
+    networks: [studio]
+
+  studio-api:
+    container_name: folia-video-api
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      MEDIA_ROOT: /media/bililive
+      MEDIA_WRITE_ROOT: /media-output
+      MEDIA_HOST_PATH: /vol1/1000/docker/bililive-tool/video
+      DATA_ROOT: /data
+      WORK_ROOT: /work
+      OUTPUT_ROOT: /output
+      OUTPUT_HOST_PATH: /vol1/1000/video/Folia成片
+      LOCAL_WORKER_URL: http://local-worker:8001
+      TRANSCRIBER_URL: http://transcriber:8080
+      LYRICS_SERVICE_URL: http://lyrics-service:8090
+      BROWSER_CDP_HTTP: http://host.docker.internal:19222
+      FOLIA_RENDERER_URL: http://folia-renderer:8091
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-flash}
+    ports:
+      - "127.0.0.1:18082:8000"
+    volumes:
+      - /vol1/1000/docker/bililive-tool/video:/media/bililive:ro
+      - /vol1/1000/docker/bililive-tool/video:/media-output:rw
+      - ./data:/data
+      - ./work:/work
+      - /vol1/1000/video/Folia成片:/output
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    group_add:
+      - "44"
+      - "109"
+    healthcheck:
+      test: ["CMD","curl","-fsS","http://127.0.0.1:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [studio, folia]
+    depends_on:
+      transcriber:
+        condition: service_healthy
+      local-worker:
+        condition: service_healthy
+      lyrics-service:
+        condition: service_healthy
+      folia-renderer:
+        condition: service_healthy
+
+  folia-renderer:
+    container_name: folia-video-native-renderer
+    build: ./folia-renderer
+    restart: unless-stopped
+    environment:
+      MEDIA_ROOT: /media/bililive
+      OUTPUT_ROOT: /output
+      RENDER_PORT: "8091"
+    volumes:
+      - /vol1/1000/docker/bililive-tool/video:/media/bililive:ro
+      - /vol1/1000/video/Folia成片:/output
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    group_add:
+      - "44"
+      - "109"
+    shm_size: "2gb"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8091/healthz"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+    networks: [studio]
+
+  lyrics-service:
+    container_name: folia-video-lyrics
+    build: ./lyrics-service
+    restart: unless-stopped
+    environment:
+      XDG_CACHE_HOME: /data/cache
+      XDG_CONFIG_HOME: /data/config
+    volumes:
+      - ./data/lddc:/data
+    healthcheck:
+      test: ["CMD","curl","-fsS","http://127.0.0.1:8090/healthz"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+    networks: [studio]
+
+  local-worker:
+    container_name: folia-video-ai
+    build:
+      context: ./backend
+      dockerfile: Workerfile
+    restart: unless-stopped
+    environment:
+      WHISPER_MODEL: large-v3-turbo
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE_TYPE: int8
+      HF_HOME: /models/huggingface
+    volumes:
+      - ./models:/models
+    healthcheck:
+      test: ["CMD","curl","-fsS","http://127.0.0.1:8001/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+    networks: [studio]
+
+  chromium-cdp-proxy:
+    container_name: folia-video-preview
+    image: alpine/socat:latest
+    restart: unless-stopped
+    network_mode: host
+    command: ["TCP-LISTEN:19222,fork,reuseaddr", "TCP:127.0.0.1:16002"]
+
+  transcriber:
+    container_name: folia-video-transcriber
+    build: ./transcriber
+    restart: unless-stopped
+    env_file:
+      - ../folia-asr-mvp/.env
+    environment:
+      FOLIA_INPUT_ROOT: /input
+      FOLIA_WORK_ROOT: /work/jobs
+      FOLIA_OUTPUT_ROOT: /output/jobs
+      FOLIA_WORK_DISPLAY_ROOT: /vol1/1000/docker/folia-asr-mvp/work/jobs
+      FOLIA_OUTPUT_DISPLAY_ROOT: /vol1/1000/docker/folia-asr-mvp/output/jobs
+      FOLIA_FRIENDLY_OUTPUT_ROOT: /output/recordings
+      FOLIA_FRIENDLY_OUTPUT_DISPLAY_ROOT: /vol1/1000/docker/folia-asr-mvp/output/recordings
+      FOLIA_LOCAL_WORKER_URL: http://local-worker:8001
+      HF_HOME: /models/huggingface
+      HUGGINGFACE_HUB_CACHE: /models/huggingface/hub
+      TORCH_HOME: /models/torch
+      XDG_CACHE_HOME: /models/cache
+      PORT: "8080"
+    volumes:
+      - /vol1/1000/docker/bililive-tool/video:/input:ro
+      - /vol1/1000/docker/folia-asr-mvp/output:/output
+      - /vol1/1000/docker/folia-asr-mvp/work:/work
+      - /vol1/1000/docker/folia-asr-mvp/models:/models
+    mem_limit: 14g
+    cpus: 10
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/config', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+    networks: [studio]
+
+networks:
+  studio: {}
+  folia:
+    external: true
+    name: folia_folia-edge

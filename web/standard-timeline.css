@@ -1,0 +1,22 @@
+.timeline-match {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid #8bd7ff33;
+  border-radius: 8px;
+  background: #8bd7ff0b;
+  color: #bfe9ff;
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+.timeline-match.low {
+  border-color: #ffd75a55;
+  background: #ffd75a0d;
+  color: #ffe29a;
+}
+
+.timeline-match.failed {
+  border-color: #ff777755;
+  background: #ff77770d;
+  color: #ffb4b4;
+}

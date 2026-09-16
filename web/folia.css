@@ -1,0 +1,5 @@
+.folia-frame{position:absolute;inset:0;width:100%;height:100%;border:0;background:transparent;pointer-events:none;z-index:2;opacity:0;transition:opacity .2s linear}
+.folia-frame.active{opacity:var(--folia-opacity,1)}
+.stage:not(.pv) .folia-frame{display:none}
+.stage.pv video{opacity:0}
+.stage.pv.folia-ready #lyricsLayer{display:none}

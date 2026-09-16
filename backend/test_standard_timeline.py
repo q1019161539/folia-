@@ -1,0 +1,279 @@
+import unittest
+
+from standard_timeline import (
+    build_shifted_timeline,
+    choose_best_timeline_candidate,
+    clamp_forced_words,
+    estimate_untimed_timeline,
+    find_suspect_anchor_regions,
+    is_high_confidence,
+    lyric_render_window,
+    max_anchor_drift_ms,
+    parse_lrc,
+    plain_lyric_lines,
+    is_lyric_metadata,
+    resolve_deepseek_full_realign,
+    score_timeline,
+)
+
+
+def asr(text, start, index):
+    return {"text": text, "start_ms": start, "end_ms": start + 1200, "line_id": index}
+
+
+class StandardTimelineTests(unittest.TestCase):
+    def test_lrc_offset_multiple_tags_and_metadata(self):
+        rows = parse_lrc("[offset:+120]\n[ar:歌手]\n[00:01.20][00:03.450]第一句\n[00:05.00]作词：某人\n[00:06.00]古筝 : 某人\n[00:07.00]录音师：某人\n[00:08.00]出品人：某人\n")
+        self.assertEqual([(x["start_ms"], x["text"]) for x in rows], [(1320, "第一句"), (3570, "第一句")])
+
+    def test_provider_intros_not_treated_as_lyrics(self):
+        values = [
+            "合音：甲/乙", "乐队统筹：某人", "灯光设计：某人", "录音室：Studio",
+            "混音室：凃惠源音乐工作室",
+            "原唱：千百顺", "翻唱：某人", "主唱：某人",
+            "MIDI程序：韦伟", "和声演唱：王笑文", "口哨：王佩君",
+            "录音棚：好听音乐", "混音棚：大陆桥声音工作室",
+            "木吉他：某人", "【未经著作权人许可 不得翻唱翻录或使用】",
+            "「释放你的音乐才华，AI作歌就选Vemus未音APP！」",
+        ]
+        self.assertTrue(all(is_lyric_metadata(value) for value in values))
+        self.assertTrue(is_lyric_metadata("心之火 - F.I.R.飞儿乐团/彭佳慧", "心之火", "F.I.R.飞儿乐团 / 彭佳慧"))
+        self.assertFalse(is_lyric_metadata("爱是一场漫长旅行", "心之火", "彭佳慧"))
+
+    def test_high_confidence_candidate_beats_higher_scoring_low_confidence(self):
+        items = [
+            {"title_similarity": 1.0, "result": {"score": 315, "low_confidence": True, "anchors": list(range(12))}},
+            {"title_similarity": 1.0, "result": {"score": 296, "low_confidence": False, "anchors": list(range(11))}},
+        ]
+        self.assertIs(choose_best_timeline_candidate(items), items[1])
+
+    def test_verbatim_release_beats_line_only_remix_of_the_same_title(self):
+        # Real 《很任性》 case: the original artist's word-timed release scored
+        # higher but read low-confidence against a live cover, while a line-only
+        # remix upload of the same title read high-confidence and took the pick.
+        items = [
+            {"candidate": {"timing_type": "verbatim"}, "title_similarity": 1.0,
+             "result": {"score": 148.7, "low_confidence": True, "anchors": list(range(6))}},
+            {"candidate": {"timing_type": "line"}, "title_similarity": 1.0,
+             "result": {"score": 147.2, "low_confidence": False, "anchors": list(range(6))}},
+        ]
+        self.assertIs(choose_best_timeline_candidate(items), items[0])
+
+    def test_verbatim_preference_does_not_cross_to_another_song(self):
+        # A word-timed release of a different song must not outrank the correct
+        # title just for being verbatim.
+        items = [
+            {"candidate": {"timing_type": "verbatim"}, "title_similarity": 0.4,
+             "result": {"score": 300, "low_confidence": False, "anchors": list(range(9))}},
+            {"candidate": {"timing_type": "line"}, "title_similarity": 1.0,
+             "result": {"score": 150, "low_confidence": False, "anchors": list(range(6))}},
+        ]
+        self.assertIs(choose_best_timeline_candidate(items), items[1])
+
+    def test_repeated_chorus_uses_consistent_later_offset(self):
+        lrc = parse_lrc("[00:10.00]一起看海\n[00:14.00]等风吹来\n[01:10.00]一起看海\n[01:14.00]等风吹来\n[01:20.00]只有这次结尾")
+        result = score_timeline(lrc, [asr("一起看海", 5000, 0), asr("等风吹来", 9000, 1), asr("只有这次结尾", 15000, 2)])
+        self.assertEqual(result["shift_ms"], -65000)
+        self.assertEqual([x["lyric_index"] for x in result["anchors"]], [2, 3, 4])
+
+    def test_shifted_timeline_keeps_unrecognized_rows(self):
+        lrc = parse_lrc("[00:10.00]甲乙丙丁\n[00:14.00]漏识别的一句\n[00:18.00]戊己庚辛")
+        result = score_timeline(lrc, [asr("甲乙丙丁", 5000, 0), asr("戊己庚辛", 13000, 1)])
+        rows = build_shifted_timeline(lrc, result["shift_ms"], 20000, anchors=result["anchors"])
+        self.assertEqual([x["text"] for x in rows], ["甲乙丙丁", "漏识别的一句", "戊己庚辛"])
+        self.assertTrue(all(a["end_ms"] <= b["start_ms"] for a, b in zip(rows, rows[1:])))
+
+    def test_shifted_timeline_moves_every_line_by_one_shift(self):
+        # A performance that drifts (5s / 7s / 9s late) keeps the release's own
+        # rhythm: every line moves by the median shift, nobody gets bent toward a
+        # neighbouring anchor. The drift itself is what max_anchor_drift_ms reports
+        # so the caller can hand the song to DeepSeek.
+        lrc = parse_lrc(
+            "[00:10.00]第一段独特歌词\n"
+            "[00:20.00]中间一句歌词\n"
+            "[00:30.00]最后一段独特歌词"
+        )
+        result = score_timeline(lrc, [
+            asr("第一段独特歌词", 15000, 0),
+            asr("中间一句歌词", 27000, 1),
+            asr("最后一段独特歌词", 39000, 2),
+        ])
+        rows = build_shifted_timeline(lrc, result["shift_ms"], 50000, anchors=result["anchors"])
+        shift = result["shift_ms"]
+        self.assertEqual([row["start_ms"] - row["standard_start_ms"] for row in rows], [shift] * 3)
+        self.assertEqual([row["local_shift_ms"] for row in rows], [shift] * 3)
+        self.assertEqual([row.get("asr_start_ms") for row in rows], [15000, 27000, 39000])
+        self.assertGreater(max_anchor_drift_ms(result["anchors"], shift), 0)
+
+    def test_unrecognized_line_keeps_its_place_in_the_shifted_sheet(self):
+        lrc = parse_lrc(
+            "[00:10.00]开头锚点歌词\n"
+            "[00:20.00]没有识别的一句\n"
+            "[00:30.00]结尾锚点歌词"
+        )
+        result = score_timeline(lrc, [
+            asr("开头锚点歌词", 15000, 0),
+            asr("结尾锚点歌词", 39000, 1),
+        ])
+        rows = build_shifted_timeline(lrc, result["shift_ms"], 50000, anchors=result["anchors"])
+        self.assertEqual([row["start_ms"] - row["standard_start_ms"] for row in rows], [result["shift_ms"]] * 3)
+        self.assertEqual(rows[1]["segment_ids"], [])
+
+    def test_max_anchor_drift_reports_worst_section(self):
+        anchors = [{"delta_ms": 5000}, {"delta_ms": 7000}, {"delta_ms": 12000}]
+        self.assertEqual(max_anchor_drift_ms(anchors, 7000), 5000)
+        self.assertEqual(max_anchor_drift_ms([], 7000), 0)
+        self.assertEqual(max_anchor_drift_ms(None, 7000), 0)
+
+    def test_shifted_timeline_does_not_hold_line_through_long_instrumental_gap(self):
+        lrc = parse_lrc(
+            "[00:10.000]第一句\n[00:15.000]第二句\n[00:20.000]第三句\n"
+            "[00:25.000]间奏前\n[00:42.000]间奏后"
+        )
+        rows = build_shifted_timeline(lrc, 0, 50000)
+        before_gap = next(row for row in rows if row["text"] == "间奏前")
+        self.assertEqual(before_gap["end_ms"], 30000)
+        self.assertFalse(any(row["start_ms"] < 38000 and row["end_ms"] > 32000 for row in rows))
+
+    def test_single_anchor_is_low_confidence(self):
+        lrc = parse_lrc("[00:10.00]独特的一句话")
+        result = score_timeline(lrc, [asr("独特的一句话", 3000, 0)])
+        self.assertEqual(result["anchor_count"], 1)
+        self.assertTrue(result["low_confidence"])
+
+    def test_zero_anchor_is_rejected(self):
+        result = score_timeline(parse_lrc("[00:10.00]歌词"), [asr("主播聊天", 3000, 0)])
+        self.assertEqual(result["anchors"], [])
+
+    def test_untimed_interpolation_is_complete_and_monotonic(self):
+        lyrics = plain_lyric_lines("第一句\n漏掉的第二句\n第三句\n结尾")
+        evidence = [
+            {"standard_line_index": 0, "asr_start_ms": 2000, "segment_ids": [0]},
+            {"standard_line_index": 2, "asr_start_ms": 10000, "segment_ids": [2]},
+        ]
+        rows = estimate_untimed_timeline(lyrics, evidence, 18000)
+        self.assertEqual([x["text"] for x in rows], lyrics)
+        self.assertTrue(all(a["end_ms"] <= b["start_ms"] for a, b in zip(rows, rows[1:])))
+        self.assertTrue(all(0 <= x["start_ms"] < x["end_ms"] <= 18000 for x in rows))
+
+    def test_qwen_words_are_clamped_to_fixed_line(self):
+        words = [{"text": "你", "start_ms": 700, "end_ms": 1700}, {"text": "好", "start_ms": 2800, "end_ms": 3400}]
+        result = clamp_forced_words(words, 1000, 3000)
+        self.assertEqual("".join(item["text"] for item in result), "你好")
+        self.assertGreaterEqual(result[0]["start_ms"], 1000)
+        self.assertLessEqual(result[-1]["end_ms"], 3000)
+
+    def test_final_render_window_keeps_five_seconds_around_lyrics(self):
+        rows = [{"start": 28000, "end": 32000}, {"start": 90000, "end": 95000}]
+        self.assertEqual(lyric_render_window(rows, 120000), (23000, 100000))
+
+    def test_final_render_window_does_not_pad_beyond_source(self):
+        rows = [{"start": 3000, "end": 98000}]
+        self.assertEqual(lyric_render_window(rows, 100000), (0, 100000))
+
+    def test_suspect_regions_empty_when_anchors_look_normal(self):
+        lines = [{"start_ms": i * 5000, "text": "四个字词"} for i in range(6)]
+        anchors = [
+            {"lyric_index": i, "asr_index": i, "asr_start_ms": i * 5000, "asr_end_ms": i * 5000 + 1200, "lyric_text": "四个字词"}
+            for i in range(6)
+        ]
+        segments = [{"start_ms": a["asr_start_ms"], "end_ms": a["asr_end_ms"], "text": "四个字词"} for a in anchors]
+        self.assertEqual(find_suspect_anchor_regions(anchors, lines, segments), [])
+
+    def test_suspect_regions_flags_long_duration_anchor(self):
+        lines = [{"start_ms": i * 5000, "text": "四个字词"} for i in range(3)]
+        anchors = [
+            {"lyric_index": 0, "asr_index": 0, "asr_start_ms": 0, "asr_end_ms": 1200, "lyric_text": "四个字词"},
+            {"lyric_index": 1, "asr_index": 1, "asr_start_ms": 5000, "asr_end_ms": 11300, "lyric_text": "四个字词"},
+            {"lyric_index": 2, "asr_index": 2, "asr_start_ms": 12000, "asr_end_ms": 13200, "lyric_text": "四个字词"},
+        ]
+        segments = [{"start_ms": a["asr_start_ms"], "end_ms": a["asr_end_ms"], "text": a["lyric_text"]} for a in anchors]
+        regions = find_suspect_anchor_regions(anchors, lines, segments)
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(regions[0]["reason"], "long_duration")
+        self.assertEqual((regions[0]["lyric_start"], regions[0]["lyric_end"]), (1, 2))
+
+    def test_suspect_regions_flags_sparse_gap(self):
+        lines = [{"start_ms": i * 5000, "text": "四个字词"} for i in range(8)]
+        anchors = [
+            {"lyric_index": 0, "asr_index": 0, "asr_start_ms": 0, "asr_end_ms": 1200, "lyric_text": "四个字词"},
+            {"lyric_index": 6, "asr_index": 5, "asr_start_ms": 30000, "asr_end_ms": 31200, "lyric_text": "四个字词"},
+        ]
+        segments = [{"start_ms": i * 5000, "end_ms": i * 5000 + 1200, "text": "杂音或没对上"} for i in range(6)]
+        regions = find_suspect_anchor_regions(anchors, lines, segments)
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(regions[0]["reason"], "sparse_gap")
+        self.assertEqual((regions[0]["lyric_start"], regions[0]["lyric_end"]), (1, 6))
+        self.assertEqual((regions[0]["segment_start"], regions[0]["segment_end"]), (1, 4))
+
+    def test_suspect_regions_long_duration_at_end_falls_back_to_line_count(self):
+        lines = [{"start_ms": i * 5000, "text": "四个字词"} for i in range(5)]
+        anchors = [
+            {"lyric_index": 0, "asr_index": 0, "asr_start_ms": 0, "asr_end_ms": 1200, "lyric_text": "四个字词"},
+            {"lyric_index": 4, "asr_index": 1, "asr_start_ms": 20000, "asr_end_ms": 26300, "lyric_text": "四个字词"},
+        ]
+        segments = [{"start_ms": 0, "end_ms": 1200, "text": "四个字词"}, {"start_ms": 20000, "end_ms": 26300, "text": "四个字词"}]
+        regions = find_suspect_anchor_regions(anchors, lines, segments)
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(regions[0]["reason"], "long_duration")
+        self.assertEqual(regions[0]["lyric_end"], 5)
+
+    def test_suspect_regions_caps_to_max_regions(self):
+        indexes = [0, 1, 3, 6, 10, 15, 21, 28]
+        lines = [{"start_ms": i * 5000, "text": "四个字词"} for i in range(30)]
+        anchors = [
+            {"lyric_index": li, "asr_index": position, "asr_start_ms": position * 5000, "asr_end_ms": position * 5000 + 5000, "lyric_text": "四个字词"}
+            for position, li in enumerate(indexes)
+        ]
+        segments = [{"start_ms": a["asr_start_ms"], "end_ms": a["asr_end_ms"], "text": "四个字词"} for a in anchors]
+        regions = find_suspect_anchor_regions(anchors, lines, segments)
+        self.assertEqual(len(regions), 5)
+        self.assertTrue(all(r["reason"] == "long_duration" for r in regions))
+        spans = sorted(r["lyric_end"] - r["lyric_start"] for r in regions)
+        self.assertEqual(spans, [3, 4, 5, 6, 7])
+
+    def test_is_high_confidence(self):
+        self.assertTrue(is_high_confidence({"low_confidence": False}))
+        self.assertFalse(is_high_confidence({"low_confidence": True}))
+        self.assertFalse(is_high_confidence({}))
+
+    def test_full_realign_accepts_valid_lines_and_sorts_by_start(self):
+        lines = [{"text": "第0行"}, {"text": "第1行"}, {"text": "第2行"}]
+        payload = {"lines": [
+            {"index": 2, "text": "第2行", "start_ms": 9000, "end_ms": 9500},
+            {"index": 0, "text": "第0行", "start_ms": 5000, "end_ms": 5500},
+        ]}
+        resolved = resolve_deepseek_full_realign(payload, lines, asr_min_ms=4000, asr_max_ms=10000)
+        self.assertEqual([item["standard_line_index"] for item in resolved], [0, 2])
+        self.assertEqual(resolved[0]["start_ms"], 5000)
+
+    def test_full_realign_clamps_to_real_asr_range(self):
+        lines = [{"text": "第0行"}]
+        payload = {"lines": [{"index": 0, "text": "第0行", "start_ms": 100, "end_ms": 99999}]}
+        resolved = resolve_deepseek_full_realign(payload, lines, asr_min_ms=5000, asr_max_ms=20000)
+        self.assertEqual(resolved[0]["start_ms"], 5000)
+        self.assertEqual(resolved[0]["end_ms"], 20000)
+
+    def test_full_realign_rejects_out_of_range_index_and_bad_types(self):
+        lines = [{"text": "第0行"}]
+        payload = {"lines": [
+            {"index": 5, "text": "不存在的行", "start_ms": 1000, "end_ms": 2000},
+            {"index": 0, "text": "第0行", "start_ms": "not-a-number", "end_ms": 2000},
+            {"index": 0},
+        ]}
+        self.assertEqual(resolve_deepseek_full_realign(payload, lines, asr_min_ms=0, asr_max_ms=5000), [])
+
+    def test_full_realign_falls_back_to_local_lyric_text_when_missing(self):
+        lines = [{"text": "本地文本"}]
+        payload = {"lines": [{"index": 0, "start_ms": 1000, "end_ms": 2000}]}
+        resolved = resolve_deepseek_full_realign(payload, lines, asr_min_ms=0, asr_max_ms=5000)
+        self.assertEqual(resolved[0]["text"], "本地文本")
+
+    def test_full_realign_handles_malformed_payload(self):
+        self.assertEqual(resolve_deepseek_full_realign({}, [{"text": "x"}], 0, 1000), [])
+        self.assertEqual(resolve_deepseek_full_realign({"lines": "not-a-list"}, [{"text": "x"}], 0, 1000), [])
+        self.assertEqual(resolve_deepseek_full_realign(None, [{"text": "x"}], 0, 1000), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

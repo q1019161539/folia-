@@ -1,0 +1,35 @@
+.align-progress {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid #c7ff5833;
+  border-radius: 9px;
+  background: #c7ff5808;
+}
+.align-progress > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.align-progress-track {
+  height: 7px;
+  margin: 8px 0;
+  overflow: hidden;
+  border-radius: 99px;
+  background: #ffffff0d;
+}
+.align-progress-track i {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: linear-gradient(90deg, #80e8a0, var(--lime));
+  transition: width .3s;
+}
+.align-progress.done { border-color: #78eeac55; }
+.align-progress.partial { border-color: #ffd75a66; background: #ffd75a09; }
+.align-progress.failed { border-color: #ff6b6b55; }
+.align-progress small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

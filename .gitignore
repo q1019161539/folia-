@@ -1,0 +1,11 @@
+.env
+data/
+models/
+work/
+effects/node_modules/
+backend/__pycache__/
+*.pyc
+*.tar.gz
+*.tgz
+.remote-live/
+
