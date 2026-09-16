@@ -856,23 +856,25 @@ def auto_standard_timeline_task(jid:str):
         chosen=choose_best_timeline_candidate(usable) if usable else max(scored,key=lambda x:float(x['result'].get('score',0)))
 
         candidate,result=chosen['candidate'],chosen['result']
-        # 本地免费探测：即使本地整体判定已经是高置信，个别行也可能因为大段合并/
-        # 长时间没有锚点等原因单独出问题；find_suspect_anchor_regions 没发现可疑
-        # 区域时直接返回空列表、不产生任何网络调用。
         # 判定一律只读 core_anchors——那是核心锚点链，是这首歌的时钟；evidence_anchors
         # 是容忍窗宽达数秒的证据链，只负责把 ASR 行挂到歌词行上，拿它做任何质量判断
         # 都是拿一把松尺子量紧公差（历史教训见 standard_timeline.max_anchor_drift_ms）。
+        # find_suspect_anchor_regions 已经不参与判定，只进报告当警告看：它那条
+        # "连续≥4 行无锚点"量的是锚点有没有覆盖到每四行，不是那四行时间轴对不对，
+        # 而一首 40 行的歌被 6~16 个核心锚点匹配本来就是稀疏的，于是它几乎首首命中，
+        # 在残差门槛被删掉之后直接顶替成了第二个"一律低置信"开关。
         if chosen['timed']:
             core_anchors=result.get('core_anchors') or []
             evidence_anchors=result.get('evidence_anchors') or core_anchors
-            need_ai_help=(not is_high_confidence(result)) or bool(find_suspect_anchor_regions(core_anchors,chosen['timed'],asr))
+            suspect_regions=find_suspect_anchor_regions(core_anchors,chosen['timed'],asr)
+            need_ai_help=not is_high_confidence(result)
             lines=build_shifted_timeline(chosen['timed'],int(result['shift_ms']),duration_ms,anchors=evidence_anchors)
             mode='standard-piecewise'; shift_ms=int(result['shift_ms']); lyrics=[row['text'] for row in chosen['timed']]
             word_counts={'qwen_exact':0,'qwen_corrected':0,'lddc_standard':0,'interpolated':0,'rejected':0}
             if chosen.get('provider_rows') and candidate.get('timing_type')=='verbatim':
                 word_counts=apply_hybrid_words(lines,chosen['provider_rows'],result.get('word_anchors') or [],shift_ms)
         else:
-            need_ai_help=True
+            need_ai_help=True; suspect_regions=[]
             lines=estimate_untimed_timeline(chosen['plain'],chosen['evidence'],duration_ms)
             mode='estimated-full'; shift_ms=None; lyrics=chosen['plain']; core_anchors=[{'asr_index':(row.get('segment_ids') or [None])[0],'lyric_index':row.get('standard_line_index'),'asr_start_ms':row.get('asr_start_ms',row.get('start_ms')),'asr_text':row.get('recognized_text',''),'lyric_text':row.get('standard_text',row.get('text',''))} for row in chosen['evidence']]; evidence_anchors=core_anchors; word_counts={'qwen_exact':0,'qwen_corrected':0,'lddc_standard':0,'interpolated':0,'rejected':0}
         if not lines: raise RuntimeError('标准歌词整体移动后不在当前视频时间范围内')
@@ -903,7 +905,7 @@ def auto_standard_timeline_task(jid:str):
             meta=item['candidate']; scored_result=item['result']
             summaries.append({'candidate_id':meta['candidate_id'],'platform':meta.get('platform','netease'),'title':meta.get('title',''),'artist':meta.get('artist',''),'album':meta.get('album',''),'timing_type':meta.get('timing_type','line'),'word_coverage':meta.get('word_coverage',0),'timed':bool(item['timed']),'score':round(float(scored_result.get('score',0)),3),'anchor_count':len(scored_result.get('core_anchors') or []),'word_anchor_count':int(scored_result.get('word_anchor_count',0)),'word_residual_p90_ms':scored_result.get('word_residual_p90_ms'),'low_confidence':bool(scored_result.get('low_confidence',True))})
         low_confidence=confidence_tier!='high'
-        report={'status':'completed','mode':mode,'platform':candidate.get('platform','netease'),'candidate_id':candidate['candidate_id'],'song_id':candidate.get('song_id',''),'lddc_ref':chosen.get('lddc_ref',''),'timing_type':candidate.get('timing_type','line'),'word_coverage':candidate.get('word_coverage',0),'title':candidate.get('title',''),'artist':candidate.get('artist',''),'album':candidate.get('album',''),'shift_ms':shift_ms,'shift_min_ms':result.get('shift_min_ms'),'shift_max_ms':result.get('shift_max_ms'),'shift_range_ms':result.get('shift_range_ms'),'anchor_count':len(core_anchors),'evidence_anchor_count':len(evidence_anchors),'anchor_span_ms':result.get('anchor_span_ms',0),'core_span_ms':result.get('core_span_ms',0),'residual_p90_ms':result.get('residual_p90_ms'),'median_abs_residual_ms':result.get('median_abs_residual_ms'),'mad_ms':result.get('mad_ms'),'max_anchor_drift_ms':result.get('max_anchor_drift_ms'),'shazam':shazam_hit,'confidence_tier':confidence_tier,'full_realign_used':full_realign_used,'word_anchor_count':int(result.get('word_anchor_count',0)),'word_anchor_lines':int(result.get('word_anchor_lines',0)),'word_anchor_span_ms':int(result.get('word_anchor_span_ms',0)),'word_residual_p90_ms':result.get('word_residual_p90_ms'),'word_timing_counts':word_counts,'confidence':'low' if low_confidence else 'high','low_confidence':low_confidence,'reason':result.get('reason',''),'core_anchors':core_anchors,'evidence_anchors':evidence_anchors,'candidates':summaries,'finished_at':time.time()}
+        report={'status':'completed','mode':mode,'platform':candidate.get('platform','netease'),'candidate_id':candidate['candidate_id'],'song_id':candidate.get('song_id',''),'lddc_ref':chosen.get('lddc_ref',''),'timing_type':candidate.get('timing_type','line'),'word_coverage':candidate.get('word_coverage',0),'title':candidate.get('title',''),'artist':candidate.get('artist',''),'album':candidate.get('album',''),'shift_ms':shift_ms,'shift_min_ms':result.get('shift_min_ms'),'shift_max_ms':result.get('shift_max_ms'),'shift_range_ms':result.get('shift_range_ms'),'anchor_count':len(core_anchors),'evidence_anchor_count':len(evidence_anchors),'evidence_added_count':len(evidence_anchors)-len(core_anchors),'anchor_span_ms':result.get('anchor_span_ms',0),'core_span_ms':result.get('core_span_ms',0),'residual_p90_ms':result.get('residual_p90_ms'),'median_abs_residual_ms':result.get('median_abs_residual_ms'),'mad_ms':result.get('mad_ms'),'max_anchor_drift_ms':result.get('max_anchor_drift_ms'),'long_baseline_pairs':result.get('long_baseline_pairs'),'drift_over_span_ms':result.get('drift_over_span_ms'),'direction_support':result.get('direction_support'),'affine_mad_ms':result.get('affine_mad_ms'),'mad_improvement_ratio':result.get('mad_improvement_ratio'),'suspect_regions':suspect_regions,'suspect_region_reasons':sorted({str(r.get('reason','')) for r in suspect_regions}),'shazam':shazam_hit,'confidence_tier':confidence_tier,'full_realign_used':full_realign_used,'word_anchor_count':int(result.get('word_anchor_count',0)),'word_anchor_raw_count':int(result.get('word_anchor_raw_count',0)),'word_anchor_rejected_count':int(result.get('word_anchor_rejected_count',0)),'word_anchor_lines':int(result.get('word_anchor_lines',0)),'word_anchor_span_ms':int(result.get('word_anchor_span_ms',0)),'word_residual_p90_ms':result.get('word_residual_p90_ms'),'word_timing_counts':word_counts,'confidence':'low' if low_confidence else 'high','low_confidence':low_confidence,'reason':result.get('reason',''),'core_anchors':core_anchors,'evidence_anchors':evidence_anchors,'candidates':summaries,'finished_at':time.time()}
         update(jid,status='alignment_review',title=candidate.get('title') or j.get('title',''),artist=candidate.get('artist',''),lyrics='\n'.join(lyrics),alignment={'asr_segments':asr,'lines':lines,'offset_ms':0,'timeline_match':report},error='')
     except Exception as exc:
         progress.update({'status':'failed','phase':'标准歌词时间轴匹配失败','error':str(exc)[:1000],'finished_at':time.time()})

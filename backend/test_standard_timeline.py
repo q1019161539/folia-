@@ -2,6 +2,7 @@
 
 from standard_timeline import (
     anchor_residual_stats,
+    anchor_trend_stats,
     build_shifted_timeline,
     choose_best_timeline_candidate,
     clamp_forced_words,
@@ -166,6 +167,44 @@ class StandardTimelineTests(unittest.TestCase):
         self.assertEqual(len(result["core_anchors"]), 5)
         self.assertGreater(result["residual_p90_ms"], 1500)
         self.assertFalse(result["low_confidence"])
+
+    def test_trend_stats_separate_a_steady_drift_from_plain_scatter(self):
+        # Same MAD, opposite meanings. A performance running steadily late gives
+        # long baselines that agree on direction and a slope that absorbs most of
+        # the spread; mis-matched anchors give neither, and no amount of
+        # stretching would help them.
+        ramp = [{"lrc_start_ms": t, "delta_ms": d} for t, d in
+                zip(range(10_000, 190_000, 30_000), (-1500, -900, -300, 300, 900, 1500))]
+        jitter = [{"lrc_start_ms": t, "delta_ms": d} for t, d in
+                  zip(range(10_000, 190_000, 30_000), (1300, -1600, 800, -1400, 1700, -900))]
+        drifting = anchor_trend_stats(ramp, 0)
+        scattered = anchor_trend_stats(jitter, 0)
+        self.assertEqual(drifting["direction_support"], 1.0)
+        self.assertGreater(drifting["drift_over_span_ms"], 2500)
+        self.assertGreater(drifting["mad_improvement_ratio"], 0.9)
+        self.assertLess(scattered["direction_support"], 0.75)
+        self.assertLess(scattered["mad_improvement_ratio"], 0.3)
+
+    def test_trend_stats_ignore_short_baselines_and_tiny_chains(self):
+        # Two anchors three seconds apart differing by 400ms imply an absurd rate;
+        # only baselines of at least max(20s, 20% of span) may vote on the slope.
+        close = [{"lrc_start_ms": t, "delta_ms": d} for t, d in ((10_000, 0), (13_000, 400), (16_000, -300))]
+        self.assertEqual(anchor_trend_stats(close, 0)["long_baseline_pairs"], 0)
+        self.assertEqual(anchor_trend_stats([{"lrc_start_ms": 0, "delta_ms": 0}], 0)["long_baseline_pairs"], 0)
+        self.assertEqual(anchor_trend_stats(None, 0)["drift_over_span_ms"], 0)
+
+    def test_sparse_anchors_still_report_regions_without_condemning_the_song(self):
+        # A normally sparse match -- anchors on the 1st and 8th line of a 9-line
+        # sheet -- still raises sparse_gap. That is why the caller may only log
+        # it: the song itself is perfectly well aligned.
+        lrc = parse_lrc("".join("[00:%02d.00]第%d句独特的歌词内容\n" % (10 + i * 5, i) for i in range(9)))
+        anchors = [
+            {"lyric_index": 0, "asr_index": 0, "asr_start_ms": 10_000, "asr_end_ms": 13_000, "lyric_text": lrc[0]["text"]},
+            {"lyric_index": 7, "asr_index": 7, "asr_start_ms": 45_000, "asr_end_ms": 48_000, "lyric_text": lrc[7]["text"]},
+        ]
+        segments = [asr(row["text"], 10_000 + i * 5000, i) for i, row in enumerate(lrc)]
+        regions = find_suspect_anchor_regions(anchors, lrc, segments)
+        self.assertEqual([r["reason"] for r in regions], ["sparse_gap"])
 
     def test_core_and_evidence_anchors_are_returned_separately(self):
         lrc = parse_lrc("[00:10.00]甲乙丙丁戊己\n[00:20.00]庚辛壬癸子丑\n[00:30.00]寅卯辰巳午未")

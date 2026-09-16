@@ -177,6 +177,12 @@ def score_provider_timeline(
         )
         if abs(delta - expected) <= 1800:
             accepted_word_anchors.append({**item, "delta_ms": delta})
+    # Watch the accept/reject split across runs. `expected` comes from a piecewise
+    # interpolation over the evidence chain, so if that chain ever starts admitting
+    # many extra anchors, a wrong one could bend the expected offset around it and
+    # silently reject good word anchors. Today evidence == core on most songs and
+    # the split is stable; these counts are how that would become visible.
+    raw_word_anchor_count = len(word_anchors)
     word_anchors = accepted_word_anchors
     exact = [item for item in word_anchors if item["kind"] == "exact"]
     word_lines = {item["lyric_index"] for item in exact}
@@ -207,6 +213,9 @@ def score_provider_timeline(
         "shift_ms": shift_ms,
         "word_anchors": word_anchors,
         "word_anchor_count": len(exact),
+        "word_anchor_raw_count": raw_word_anchor_count,
+        "word_anchor_accepted_count": len(word_anchors),
+        "word_anchor_rejected_count": raw_word_anchor_count - len(word_anchors),
         "word_anchor_lines": len(word_lines),
         "word_anchor_span_ms": span_ms,
         "word_residual_p90_ms": p90,

@@ -55,15 +55,23 @@ def find_suspect_anchor_regions(
     gap_line_threshold: int = 4,
     max_regions: int = 5,
 ) -> list[dict[str, Any]]:
-    """Locally flag the few spots worth a DeepSeek look, at zero API cost.
+    """Flag spots worth a human look. Reporting only -- it must not judge a song.
 
-    Most songs are already aligned fine end to end; sending the whole ASR
-    transcript and lyric sheet to an LLM for every single line would pay for
-    reviewing lines nobody needs reviewed. Two cheap local symptoms catch the
-    same handful of real problems: an anchor whose matched span implies an
-    implausible singing pace (a merged/garbled ASR segment, see the original
-    "啦啦啦啦" bug), and a long run of lyric lines with no anchor at all
-    between two confident ones. An empty result means skip DeepSeek entirely.
+    This was a veto on the whole song and could not carry that weight. The
+    `sparse_gap` rule measures whether anchors happen to cover every four lyric
+    lines, not whether those four lines are timed wrong -- and a 40-line song
+    matched by 6~16 core anchors is normally sparse, so it fired on essentially
+    every song and became a second blanket "low confidence" switch after the
+    residual threshold was removed. `long_duration` has the same weakness for a
+    different reason: it divides the whole ASR *segment* span by the lyric's
+    character count, and a segment padded with filler words, breaths or a merged
+    neighbouring line inflates that number without anything being misaligned.
+
+    Both are still worth surfacing as warnings, and `long_duration` may earn a
+    verdict back once anchors carry real word-level spans instead of segment
+    boundaries. Until then callers log these regions and route on confidence
+    alone. Reviving "a local anomaly downgrades the song" should mean designing
+    that judgement deliberately, not re-reading this function.
     """
     ordered = sorted(local_anchors, key=lambda a: int(a["lyric_index"]))
     regions: list[dict[str, Any]] = []
@@ -126,6 +134,14 @@ def max_anchor_drift_ms(anchors: list[dict[str, Any]] | None, shift_ms: int) -> 
     return max((abs(delta - int(shift_ms)) for delta in deltas), default=0)
 
 
+def _mad_ms(values: list[float]) -> int:
+    """Median absolute deviation, scaled to compare with a standard deviation."""
+    if not values:
+        return 0
+    center = statistics.median(values)
+    return round(1.4826 * statistics.median([abs(value - center) for value in values]))
+
+
 def anchor_residual_stats(anchors: list[dict[str, Any]] | None, shift_ms: int) -> dict[str, int]:
     """Robust spread of the anchor residuals around one whole-song shift.
 
@@ -138,11 +154,72 @@ def anchor_residual_stats(anchors: list[dict[str, Any]] | None, shift_ms: int) -
     if not signed:
         return {"median_abs_residual_ms": 0, "mad_ms": 0, "residual_p90_ms": 0}
     absolute = sorted(abs(value) for value in signed)
-    center = statistics.median(signed)
     return {
         "median_abs_residual_ms": round(statistics.median(absolute)),
-        "mad_ms": round(1.4826 * statistics.median([abs(value - center) for value in signed])),
+        "mad_ms": _mad_ms(signed),
         "residual_p90_ms": absolute[min(len(absolute) - 1, math.ceil(len(absolute) * 0.9) - 1)],
+    }
+
+
+def anchor_trend_stats(anchors: list[dict[str, Any]] | None, shift_ms: int) -> dict[str, Any]:
+    """Whether the residual spread is a steady drift or just scatter. Diagnostic only.
+
+    MAD says how scattered the residuals are; it cannot say why, because it does
+    not look at their order in time. A clean ramp (-1500 .. +1500 across a song)
+    and a jitter (+1300, -1600, +800, -1400) give the same MAD and mean opposite
+    things -- the first is a performance drifting steadily against the studio
+    master, which one stretch factor would absorb; the second is anchors that are
+    simply mis-matched, which no amount of stretching will fix. So fit a robust
+    slope and report how much of the spread it actually explains
+    (`mad_improvement_ratio`), alongside how consistently the long baselines agree
+    on its direction (`direction_support`).
+
+    Only pairs at least `max(20s, 20% of span)` apart contribute a slope: two
+    anchors three seconds apart with a 400ms difference imply an absurd rate.
+
+    Nothing may branch on these numbers yet, and `drift_over_span_ms` must never
+    gate anything on its own -- a drift figure used as a threshold is exactly how
+    max_anchor_drift_ms went wrong. Anchors here are still ASR segment starts,
+    which carry a lead-in of their own, so part of any trend measured now is an
+    artefact of segmentation rather than of the singing.
+    """
+    empty: dict[str, Any] = {
+        "long_baseline_pairs": 0,
+        "drift_over_span_ms": 0,
+        "direction_support": 0.0,
+        "affine_mad_ms": 0,
+        "mad_improvement_ratio": 0.0,
+    }
+    points = sorted(
+        (int(item["lrc_start_ms"]), int(item["delta_ms"]))
+        for item in anchors or []
+        if item.get("lrc_start_ms") is not None and item.get("delta_ms") is not None
+    )
+    if len(points) < 3:
+        return empty
+    span_ms = points[-1][0] - points[0][0]
+    min_baseline_ms = max(20_000, round(span_ms * 0.20))
+    slopes = [
+        (later_delta - delta) / (later_time - time_ms)
+        for index, (time_ms, delta) in enumerate(points)
+        for later_time, later_delta in points[index + 1:]
+        if later_time - time_ms >= min_baseline_ms
+    ]
+    if not slopes:
+        return empty
+    slope = statistics.median(slopes)
+    agreeing = sum(1 for value in slopes if (value >= 0) == (slope >= 0))
+    center_ms = statistics.median(time_ms for time_ms, _ in points)
+    intercept = statistics.median(delta - slope * (time_ms - center_ms) for time_ms, delta in points)
+    trend_residuals = [delta - (intercept + slope * (time_ms - center_ms)) for time_ms, delta in points]
+    shift_mad = _mad_ms([delta - int(shift_ms) for _, delta in points])
+    affine_mad = _mad_ms(trend_residuals)
+    return {
+        "long_baseline_pairs": len(slopes),
+        "drift_over_span_ms": round(slope * span_ms),
+        "direction_support": round(agreeing / len(slopes), 3),
+        "affine_mad_ms": affine_mad,
+        "mad_improvement_ratio": round((shift_mad - affine_mad) / shift_mad, 3) if shift_mad else 0.0,
     }
 
 
@@ -397,6 +474,7 @@ def score_timeline(
     )
     evidence_chain = expanded_chain if len(expanded_chain) >= len(core_chain) else list(core_chain)
     stats = anchor_residual_stats(core_chain, shift_ms)
+    trend = anchor_trend_stats(core_chain, shift_ms)
     span_ms = evidence_chain[-1]["asr_start_ms"] - evidence_chain[0]["asr_start_ms"]
     confidence_span_ms = core_chain[-1]["asr_start_ms"] - core_chain[0]["asr_start_ms"]
     # The residual thresholds are deliberately absent. A live cover sits 1500~2700ms
@@ -416,10 +494,12 @@ def score_timeline(
         "evidence_anchors": evidence_chain,
         "core_anchor_count": len(core_chain),
         "evidence_anchor_count": len(evidence_chain),
+        "evidence_added_count": len(evidence_chain) - len(core_chain),
         "core_span_ms": confidence_span_ms,
         "anchor_span_ms": span_ms,
         "max_anchor_drift_ms": max_anchor_drift_ms(core_chain, shift_ms),
         **stats,
+        **trend,
         "low_confidence": low_confidence,
         "confidence": "low" if low_confidence else "high",
         "reason": "核心锚点太少或跨度太短" if low_confidence else "多个歌词锚点支持同一整体偏移",
