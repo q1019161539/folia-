@@ -8,7 +8,7 @@ from opencc import OpenCC
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from standard_timeline import build_shifted_timeline, choose_best_timeline_candidate, clamp_forced_words, estimate_untimed_timeline, find_suspect_anchor_regions, is_high_confidence, is_lyric_metadata, lyric_render_window, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline
+from standard_timeline import build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, clamp_forced_words, estimate_untimed_timeline, find_suspect_anchor_regions, is_high_confidence, is_lyric_metadata, lyric_render_window, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, song_identity_suspicious
 from word_timeline import apply_hybrid_words, normalize_provider_rows, score_provider_timeline, timed_rows
 from automation import MIN_RECORDING_BYTES, automation_transcriber_payload, broadcaster_directories, eligible_recording, parse_ai_json, project_transcript, recording_choices, restore_completed_clip_paths, transcript_for_ai, transcript_segments, validate_detected_songs
 from folia_native import FOLIA_EFFECTS, FOLIA_RENDERER_REVISION, apply_folia_preview_profile, build_folia_config, normalized_folia_settings
@@ -26,6 +26,16 @@ OUTPUT_HOST=Path(os.getenv('OUTPUT_HOST_PATH','/vol1/1000/video/Folia成片')); 
 NETEASE_HEADERS={'User-Agent':'Mozilla/5.0','Referer':'https://music.163.com/'}
 BEIJING_TZ=ZoneInfo('Asia/Shanghai')
 MIN_SONG_DURATION_MS=90_000
+SHAZAM_PROBE_MS=30_000; SHAZAM_STEP_MS=25_000
+# A fingerprint hit's title is trusted outright unless the candidate pool it leads
+# to gives strong reason not to: real case, a clip fingerprinted as 《值得
+# (Dj版)》when it was actually 云汐's 《离人赋》, and the giveaway was already
+# sitting in the lyric search results -- 8 of 12 candidates scored zero and the
+# "winning" one barely cleared a single anchor. A wrong song poisons the whole
+# candidate pool (every version of the wrong title gets searched, none of them
+# is the real song), which reads differently from "the right song, a mediocre
+# lyric version" (one weak candidate among otherwise-reasonable ones).
+SONG_IDENTITY_MIN_ANCHOR_COUNT=3; SONG_IDENTITY_MAX_ZERO_SCORE_RATIO=0.5
 # 全曲交给 DeepSeek 重排时间轴的总开关。实测它交回来的字幕整体偏移、对不上唱的位置，
 # 比本地整首平移还差；而把整批歌推给它的又是两个已修掉的判定错误（见
 # standard_timeline.max_anchor_drift_ms）。先全部走本地对齐跑真实数据，看清本地
@@ -842,12 +852,42 @@ def auto_standard_timeline_task(jid:str):
         # 直接认原曲，不受识别错字影响，认出来就直接采用、连切片文件名一起改正。
         # 识别不出来时保持原歌名，流程照常。
         shazam_hit=identify_song_shazam(MEDIA/j['source'],duration_ms,progress,jid,old)
-        if shazam_hit and norm_text(shazam_hit['title'])!=norm_text(str(j.get('title') or '')):
+        identified_by_fingerprint=bool(shazam_hit and norm_text(shazam_hit['title'])!=norm_text(str(j.get('title') or '')))
+        if identified_by_fingerprint:
             progress.update({'phase':f'指纹识别到《{shazam_hit["title"][:20]}》，改用这个歌名'})
             update(jid,status='timeline_matching',alignment={**old,'timeline_match':progress},error='')
             j=adopt_identified_song(jid,j,shazam_hit)
         scored=asyncio.run(collect_standard_timeline_candidates(j,asr,progress))
         if not scored: raise RuntimeError('没有搜索到可比较的标准歌词版本')
+        pool_quality=candidate_pool_quality(scored)
+        # Checked whenever this run had a fingerprint opinion at all, not only when
+        # it just renamed the job -- a job whose title was adopted from a *prior*
+        # run's (wrong) fingerprint hit re-identifies the same wrong title on every
+        # rerun, so gating on "changed this run" would never catch it again.
+        identity_suspicious=bool(shazam_hit) and song_identity_suspicious(pool_quality,min_anchor_count=SONG_IDENTITY_MIN_ANCHOR_COUNT,max_zero_score_ratio=SONG_IDENTITY_MAX_ZERO_SCORE_RATIO)
+        identity_rescanned=False
+        # 一个"命中"不等于"歌曲身份已确认"：真实案例，指纹把一段切片认成《值得
+        # (Dj版)》，实际是云汐《离人赋》，而这一步的搜索结果早就暴露了异常——12 个
+        # 候选里 8 个零分零锚点，"赢家"也只挂了 1 个锚点。这种"候选池整体崩溃"是歌曲
+        # 身份本身搞错的信号，跟"歌是对的、只是这版歌词质量一般"完全不同，不该被
+        # 当成普通的低置信歌词就此了事。命中质量存疑时，从命中窗口之后继续扫描当
+        # 一次独立的第二意见；扫描成本只在存疑时才多付，首中即准的常见情况完全不受
+        # 影响。第二次也没能给出更强证据时，保留原候选池继续往下走——现有 low_confidence
+        # /本地对齐兜底已经不会把它当高置信输出，这里只负责把"很可能歌曲身份错了"
+        # 这个事实如实报出来，不在这一步做阻断式的人工复核。
+        if identity_suspicious:
+            progress.update({'phase':'指纹候选歌词证据薄弱，正在重新扫描确认歌曲身份'})
+            update(jid,status='timeline_matching',alignment={**old,'timeline_match':progress},error='')
+            resume_from_ms=int(shazam_hit['matched_at_ms'])+SHAZAM_STEP_MS
+            rescan_hit=identify_song_shazam(MEDIA/j['source'],duration_ms,progress,jid,old,min_offset_ms=resume_from_ms)
+            identity_rescanned=True
+            if rescan_hit and norm_text(rescan_hit['title'])!=norm_text(str(j.get('title') or '')):
+                rescan_j=adopt_identified_song(jid,j,rescan_hit)
+                rescan_scored=asyncio.run(collect_standard_timeline_candidates(rescan_j,asr,progress))
+                rescan_quality=candidate_pool_quality(rescan_scored)
+                if rescan_scored and rescan_quality['best_anchor_count']>pool_quality['best_anchor_count']:
+                    j,scored,pool_quality,shazam_hit=rescan_j,rescan_scored,rescan_quality,rescan_hit
+                    identity_suspicious=song_identity_suspicious(pool_quality,min_anchor_count=SONG_IDENTITY_MIN_ANCHOR_COUNT,max_zero_score_ratio=SONG_IDENTITY_MAX_ZERO_SCORE_RATIO)
         timed=[item for item in scored if item['timed'] and item['result'].get('core_anchors')]
         usable=timed or [item for item in scored if item['plain'] and item['result'].get('core_anchors')]
         # 零锚点候选不再直接判定硬失败：取综合分最高的候选（哪怕零锚点）继续往下走；
@@ -905,7 +945,7 @@ def auto_standard_timeline_task(jid:str):
             meta=item['candidate']; scored_result=item['result']
             summaries.append({'candidate_id':meta['candidate_id'],'platform':meta.get('platform','netease'),'title':meta.get('title',''),'artist':meta.get('artist',''),'album':meta.get('album',''),'timing_type':meta.get('timing_type','line'),'word_coverage':meta.get('word_coverage',0),'timed':bool(item['timed']),'score':round(float(scored_result.get('score',0)),3),'anchor_count':len(scored_result.get('core_anchors') or []),'word_anchor_count':int(scored_result.get('word_anchor_count',0)),'word_residual_p90_ms':scored_result.get('word_residual_p90_ms'),'low_confidence':bool(scored_result.get('low_confidence',True))})
         low_confidence=confidence_tier!='high'
-        report={'status':'completed','mode':mode,'platform':candidate.get('platform','netease'),'candidate_id':candidate['candidate_id'],'song_id':candidate.get('song_id',''),'lddc_ref':chosen.get('lddc_ref',''),'timing_type':candidate.get('timing_type','line'),'word_coverage':candidate.get('word_coverage',0),'title':candidate.get('title',''),'artist':candidate.get('artist',''),'album':candidate.get('album',''),'shift_ms':shift_ms,'shift_min_ms':result.get('shift_min_ms'),'shift_max_ms':result.get('shift_max_ms'),'shift_range_ms':result.get('shift_range_ms'),'anchor_count':len(core_anchors),'evidence_anchor_count':len(evidence_anchors),'evidence_added_count':len(evidence_anchors)-len(core_anchors),'anchor_span_ms':result.get('anchor_span_ms',0),'core_span_ms':result.get('core_span_ms',0),'residual_p90_ms':result.get('residual_p90_ms'),'median_abs_residual_ms':result.get('median_abs_residual_ms'),'mad_ms':result.get('mad_ms'),'max_anchor_drift_ms':result.get('max_anchor_drift_ms'),'long_baseline_pairs':result.get('long_baseline_pairs'),'drift_over_span_ms':result.get('drift_over_span_ms'),'direction_support':result.get('direction_support'),'affine_mad_ms':result.get('affine_mad_ms'),'mad_improvement_ratio':result.get('mad_improvement_ratio'),'suspect_regions':suspect_regions,'suspect_region_reasons':sorted({str(r.get('reason','')) for r in suspect_regions}),'shazam':shazam_hit,'confidence_tier':confidence_tier,'full_realign_used':full_realign_used,'line_shift_ms':result.get('line_shift_ms',shift_ms),'effective_shift_ms':result.get('effective_shift_ms',shift_ms),'shift_source':result.get('shift_source','line'),'timing_model':result.get('timing_model','line_global'),'word_bootstrap_status':result.get('word_bootstrap_status'),'word_eligible_line_count':int(result.get('word_eligible_line_count',0)),'word_dominant_cluster_line_count':int(result.get('word_dominant_cluster_line_count',0)),'word_local_shift_line_count':int(result.get('word_local_shift_line_count',0)),'word_anchor_count':int(result.get('word_anchor_count',0)),'word_anchor_raw_count':int(result.get('word_anchor_raw_count',0)),'word_anchor_rejected_count':int(result.get('word_anchor_rejected_count',0)),'word_anchor_lines':int(result.get('word_anchor_lines',0)),'word_anchor_span_ms':int(result.get('word_anchor_span_ms',0)),'word_residual_p90_ms':result.get('word_residual_p90_ms'),'word_median_abs_residual_ms':result.get('word_median_abs_residual_ms'),'word_mad_ms':result.get('word_mad_ms'),'word_model_shift_ms':result.get('word_model_shift_ms'),'word_model_median_abs_residual_ms':result.get('word_model_median_abs_residual_ms'),'word_model_mad_ms':result.get('word_model_mad_ms'),'word_model_inlier_ratio_500':result.get('word_model_inlier_ratio_500'),'word_model_coverage_ratio':result.get('word_model_coverage_ratio'),'word_vs_line_shift_diff_ms':result.get('word_vs_line_shift_diff_ms'),'cross_model_conflict':bool(result.get('cross_model_conflict',False)),'match_confidence':result.get('match_confidence','low' if low_confidence else 'high'),'timing_confidence':result.get('timing_confidence','unavailable'),'word_timing_counts':word_counts,'confidence':'low' if low_confidence else 'high','low_confidence':low_confidence,'reason':result.get('reason',''),'core_anchors':core_anchors,'evidence_anchors':evidence_anchors,'candidates':summaries,'finished_at':time.time()}
+        report={'status':'completed','mode':mode,'platform':candidate.get('platform','netease'),'candidate_id':candidate['candidate_id'],'song_id':candidate.get('song_id',''),'lddc_ref':chosen.get('lddc_ref',''),'timing_type':candidate.get('timing_type','line'),'word_coverage':candidate.get('word_coverage',0),'title':candidate.get('title',''),'artist':candidate.get('artist',''),'album':candidate.get('album',''),'shift_ms':shift_ms,'shift_min_ms':result.get('shift_min_ms'),'shift_max_ms':result.get('shift_max_ms'),'shift_range_ms':result.get('shift_range_ms'),'anchor_count':len(core_anchors),'evidence_anchor_count':len(evidence_anchors),'evidence_added_count':len(evidence_anchors)-len(core_anchors),'anchor_span_ms':result.get('anchor_span_ms',0),'core_span_ms':result.get('core_span_ms',0),'residual_p90_ms':result.get('residual_p90_ms'),'median_abs_residual_ms':result.get('median_abs_residual_ms'),'mad_ms':result.get('mad_ms'),'max_anchor_drift_ms':result.get('max_anchor_drift_ms'),'long_baseline_pairs':result.get('long_baseline_pairs'),'drift_over_span_ms':result.get('drift_over_span_ms'),'direction_support':result.get('direction_support'),'affine_mad_ms':result.get('affine_mad_ms'),'mad_improvement_ratio':result.get('mad_improvement_ratio'),'suspect_regions':suspect_regions,'suspect_region_reasons':sorted({str(r.get('reason','')) for r in suspect_regions}),'shazam':shazam_hit,'song_identity_suspicious':identity_suspicious,'song_identity_rescanned':identity_rescanned,'song_identity_pool_size':pool_quality['candidate_count'],'song_identity_zero_score_ratio':pool_quality['zero_score_ratio'],'song_identity_best_anchor_count':pool_quality['best_anchor_count'],'confidence_tier':confidence_tier,'full_realign_used':full_realign_used,'line_shift_ms':result.get('line_shift_ms',shift_ms),'effective_shift_ms':result.get('effective_shift_ms',shift_ms),'shift_source':result.get('shift_source','line'),'timing_model':result.get('timing_model','line_global'),'word_bootstrap_status':result.get('word_bootstrap_status'),'word_eligible_line_count':int(result.get('word_eligible_line_count',0)),'word_dominant_cluster_line_count':int(result.get('word_dominant_cluster_line_count',0)),'word_local_shift_line_count':int(result.get('word_local_shift_line_count',0)),'word_anchor_count':int(result.get('word_anchor_count',0)),'word_anchor_raw_count':int(result.get('word_anchor_raw_count',0)),'word_anchor_rejected_count':int(result.get('word_anchor_rejected_count',0)),'word_anchor_lines':int(result.get('word_anchor_lines',0)),'word_anchor_span_ms':int(result.get('word_anchor_span_ms',0)),'word_residual_p90_ms':result.get('word_residual_p90_ms'),'word_median_abs_residual_ms':result.get('word_median_abs_residual_ms'),'word_mad_ms':result.get('word_mad_ms'),'word_model_shift_ms':result.get('word_model_shift_ms'),'word_model_median_abs_residual_ms':result.get('word_model_median_abs_residual_ms'),'word_model_mad_ms':result.get('word_model_mad_ms'),'word_model_inlier_ratio_500':result.get('word_model_inlier_ratio_500'),'word_model_coverage_ratio':result.get('word_model_coverage_ratio'),'word_vs_line_shift_diff_ms':result.get('word_vs_line_shift_diff_ms'),'cross_model_conflict':bool(result.get('cross_model_conflict',False)),'match_confidence':result.get('match_confidence','low' if low_confidence else 'high'),'timing_confidence':result.get('timing_confidence','unavailable'),'word_timing_counts':word_counts,'confidence':'low' if low_confidence else 'high','low_confidence':low_confidence,'reason':result.get('reason',''),'core_anchors':core_anchors,'evidence_anchors':evidence_anchors,'candidates':summaries,'finished_at':time.time()}
         update(jid,status='alignment_review',title=candidate.get('title') or j.get('title',''),artist=candidate.get('artist',''),lyrics='\n'.join(lyrics),alignment={'asr_segments':asr,'lines':lines,'offset_ms':0,'timeline_match':report},error='')
     except Exception as exc:
         progress.update({'status':'failed','phase':'标准歌词时间轴匹配失败','error':str(exc)[:1000],'finished_at':time.time()})
@@ -1073,7 +1113,7 @@ def adopt_identified_song(jid:str,j:dict[str,Any],hit:dict[str,Any])->dict[str,A
     update(jid,**updates)
     return {**j,**updates}
 
-def identify_song_shazam(source:Path,duration_ms:int,progress:dict[str,Any],jid:str='',old:dict[str,Any]|None=None)->dict[str,Any]|None:
+def identify_song_shazam(source:Path,duration_ms:int,progress:dict[str,Any],jid:str='',old:dict[str,Any]|None=None,min_offset_ms:int=0)->dict[str,Any]|None:
     """Identify the performed song by audio fingerprint instead of guessing from text.
 
     A clip's filename comes from the automation stage guessing a title out of the
@@ -1083,6 +1123,12 @@ def identify_song_shazam(source:Path,duration_ms:int,progress:dict[str,Any],jid:
     Fingerprinting matches the actual audio, so homophone damage is irrelevant.
     Best effort by design: several windows spread across the clip are tried and
     the first hit wins; no hit at all just leaves the existing title in place.
+
+    min_offset_ms skips ahead to resume scanning past a window whose hit already
+    turned out wrong (see SONG_IDENTITY_MIN_ANCHOR_COUNT) rather than starting
+    over from the clip's beginning -- a fresh, independent opinion from the rest
+    of the clip, at the cost of one more scan only when the first one was
+    actually in doubt.
     """
     # A cover only fingerprints where the performance tracks the release closely
     # enough, which can be a single stretch of one chorus: spreading a handful of
@@ -1091,8 +1137,7 @@ def identify_song_shazam(source:Path,duration_ms:int,progress:dict[str,Any],jid:
     # that matches). Walk consecutive windows instead so the whole clip is
     # covered, overlapping a little so a match straddling a cut still lands
     # whole inside one window. First hit wins.
-    probe_ms,step_ms=30000,25000
-    offsets=[offset//1000 for offset in range(0,max(1,duration_ms-10000),step_ms)][:24]
+    offsets=[offset//1000 for offset in range(min_offset_ms,max(min_offset_ms+1,duration_ms-10000),SHAZAM_STEP_MS)][:24]
     if not offsets: return None
     progress.update({'phase':'正在用音频指纹识别歌曲'})
     if jid:
@@ -1103,7 +1148,7 @@ def identify_song_shazam(source:Path,duration_ms:int,progress:dict[str,Any],jid:
     # the candidate search hanging with no network activity at all. A subprocess
     # also gives a single hard kill switch for a flaky unofficial endpoint.
     try:
-        finished=subprocess.run([sys.executable,'-c',SHAZAM_PROBE_SCRIPT,str(source),json.dumps(offsets),str(probe_ms)],capture_output=True,timeout=240)
+        finished=subprocess.run([sys.executable,'-c',SHAZAM_PROBE_SCRIPT,str(source),json.dumps(offsets),str(SHAZAM_PROBE_MS)],capture_output=True,timeout=240)
         payload=json.loads((finished.stdout or b'').decode('utf-8','replace').strip() or 'null')
     except Exception:
         return None
@@ -1963,8 +2008,9 @@ def process_automation_song(run:dict[str,Any],profile:dict[str,Any],segments:lis
             song.update({'status':'skipped','skip_reason':'clip_too_short','error':f'切片时长 {duration_ms/1000:.1f} 秒，低于 90 秒阈值，已跳过歌词渲染'}); update_automation_run(run['id'],songs=songs); return
         if project.get('status')=='failed':
             song.update({'status':'skipped','error':'标准歌词零锚点或匹配失败：'+project.get('error','')}); update_automation_run(run['id'],songs=songs); return
-        confidence_tier=((project.get('alignment') or {}).get('timeline_match') or {}).get('confidence_tier','high')
-        song.update({'status':'timeline_ready','timeline_confidence':((project.get('alignment') or {}).get('timeline_match') or {}).get('confidence','low'),'confidence_tier':confidence_tier}); update_automation_run(run['id'],songs=songs,stage='song_aligning')
+        match_result=(project.get('alignment') or {}).get('timeline_match') or {}
+        confidence_tier=match_result.get('confidence_tier','high')
+        song.update({'status':'timeline_ready','timeline_confidence':match_result.get('confidence','low'),'confidence_tier':confidence_tier,'song_identity_suspicious':bool(match_result.get('song_identity_suspicious'))}); update_automation_run(run['id'],songs=songs,stage='song_aligning')
         progress=((project.get('alignment') or {}).get('aligner_progress') or {})
         if progress.get('status')!='completed': force_align_task(project['id']); project=getjob(project['id'])
         if project.get('status')=='failed': raise RuntimeError('Qwen 逐字失败：'+project.get('error',''))
@@ -2018,6 +2064,7 @@ def process_automation_run(run_id:str):
         skipped_count=sum(song.get('status')=='skipped' for song in songs)
         deepseek_titles=[str(song.get('title') or '') for song in songs if song.get('status')=='completed' and song.get('confidence_tier')=='deepseek']
         local_titles=[str(song.get('title') or '') for song in songs if song.get('status')=='completed' and song.get('confidence_tier')=='local']
+        suspicious_identity_titles=[str(song.get('title') or '') for song in songs if song.get('status')=='completed' and song.get('song_identity_suspicious')]
         short_clip_titles=[str(song.get('title') or '') for song in songs if song.get('status')=='skipped' and song.get('skip_reason')=='clip_too_short']
         notify_automation_stage(
             'outputs_completed',finished,
@@ -2028,6 +2075,7 @@ def process_automation_run(run_id:str):
             output_path=output_dir,
             deepseek_titles=deepseek_titles,
             local_titles=local_titles,
+            suspicious_identity_titles=suspicious_identity_titles,
             short_clip_titles=short_clip_titles,
         )
     except Exception as exc:

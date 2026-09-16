@@ -4,6 +4,7 @@ from standard_timeline import (
     anchor_residual_stats,
     anchor_trend_stats,
     build_shifted_timeline,
+    candidate_pool_quality,
     choose_best_timeline_candidate,
     clamp_forced_words,
     estimate_untimed_timeline,
@@ -16,6 +17,7 @@ from standard_timeline import (
     is_lyric_metadata,
     resolve_deepseek_full_realign,
     score_timeline,
+    song_identity_suspicious,
 )
 
 
@@ -208,6 +210,43 @@ class StandardTimelineTests(unittest.TestCase):
         self.assertEqual(anchor_trend_stats(close, 0)["long_baseline_pairs"], 0)
         self.assertEqual(anchor_trend_stats([{"lrc_start_ms": 0, "delta_ms": 0}], 0)["long_baseline_pairs"], 0)
         self.assertEqual(anchor_trend_stats(None, 0)["drift_over_span_ms"], 0)
+
+    def _pool_item(self, anchor_count):
+        return {"result": {"core_anchors": [{"lyric_index": 0}] * anchor_count}}
+
+    def test_candidate_pool_quality_matches_the_real_zhide_lirenfu_case(self):
+        # 12 candidates searched under a fingerprint-misidentified title: 8 score
+        # zero, the best of the rest clears exactly one anchor -- the real
+        # 《值得 (Dj版)》/《离人赋》 case.
+        pool = [self._pool_item(1)] * 4 + [self._pool_item(0)] * 8
+        quality = candidate_pool_quality(pool)
+        self.assertEqual(quality, {"candidate_count": 12, "zero_score_count": 8, "zero_score_ratio": round(2 / 3, 4), "best_anchor_count": 1})
+        self.assertTrue(song_identity_suspicious(quality))
+
+    def test_candidate_pool_quality_handles_the_untimed_anchor_count_shape(self):
+        # align_standard_lyrics's fallback result carries "anchor_count", not
+        # "core_anchors" -- the pool quality helper has to read both shapes.
+        pool = [{"result": {"anchor_count": 0}}, {"result": {"anchor_count": 2}}, {"result": {"anchor_count": 0}}]
+        quality = candidate_pool_quality(pool)
+        self.assertEqual(quality["best_anchor_count"], 2)
+        self.assertEqual(quality["zero_score_count"], 2)
+
+    def test_song_identity_suspicious_needs_both_a_weak_winner_and_a_mostly_dead_pool(self):
+        # A single weak candidate among otherwise-reasonable ones is "a mediocre
+        # lyric version", not "the wrong song" -- suspicion needs the whole pool
+        # to have collapsed together, not just the winner to be unimpressive.
+        weak_winner_healthy_pool = candidate_pool_quality([self._pool_item(2), self._pool_item(8), self._pool_item(6)])
+        self.assertFalse(song_identity_suspicious(weak_winner_healthy_pool))
+        strong_winner_dead_pool = candidate_pool_quality([self._pool_item(5)] + [self._pool_item(0)] * 9)
+        self.assertFalse(song_identity_suspicious(strong_winner_dead_pool))
+        self.assertFalse(song_identity_suspicious(candidate_pool_quality([])))
+
+    def test_song_identity_suspicious_thresholds_are_configurable(self):
+        quality = candidate_pool_quality([self._pool_item(3)] + [self._pool_item(0)] * 3)
+        self.assertEqual(quality["zero_score_ratio"], 0.75)
+        self.assertFalse(song_identity_suspicious(quality))  # best_anchor_count == 3, not < 3
+        self.assertTrue(song_identity_suspicious(quality, min_anchor_count=4))
+        self.assertFalse(song_identity_suspicious(quality, max_zero_score_ratio=0.9))
 
     def test_sparse_anchors_still_report_regions_without_condemning_the_song(self):
         # A normally sparse match -- anchors on the 1st and 8th line of a 9-line

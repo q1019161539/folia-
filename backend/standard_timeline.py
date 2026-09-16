@@ -518,6 +518,55 @@ def score_timeline(
     }
 
 
+def candidate_pool_quality(scored: list[dict[str, Any]]) -> dict[str, Any]:
+    """How much independent lyric-text evidence the whole candidate pool found.
+
+    A wrong upstream song identity (fingerprint false positive, or a stale
+    automation guess) poisons every candidate before this point -- every
+    searched version of the wrong title gets scored, and none of them is the
+    real song, so the whole pool tends to score badly together. That reads
+    differently from "the right song, a mediocre lyric version" (one weak
+    candidate among otherwise-reasonable ones): it shows up as most of the pool
+    matching nothing at all -- real case, 8 of 12 -- and even the best of that
+    bad lot barely clearing a handful of anchors -- real case, 1.
+
+    Each `scored` item is expected to carry a "result" dict shaped like
+    score_timeline's or score_provider_timeline's output (a "core_anchors" list)
+    or, for an untimed lyric sheet, align_standard_lyrics's own shape (an
+    "anchor_count" int and no "core_anchors" key).
+    """
+    if not scored:
+        return {"candidate_count": 0, "zero_score_count": 0, "zero_score_ratio": 0.0, "best_anchor_count": 0}
+    counts = [
+        len(item["result"]["core_anchors"]) if item["result"].get("core_anchors") is not None
+        else int(item["result"].get("anchor_count", 0) or 0)
+        for item in scored
+    ]
+    zero = sum(1 for count in counts if count == 0)
+    return {
+        "candidate_count": len(scored),
+        "zero_score_count": zero,
+        "zero_score_ratio": round(zero / len(scored), 4),
+        "best_anchor_count": max(counts),
+    }
+
+
+def song_identity_suspicious(
+    pool_quality: dict[str, Any],
+    *,
+    min_anchor_count: int = 3,
+    max_zero_score_ratio: float = 0.5,
+) -> bool:
+    """Flag a candidate pool that looks like it was searched under the wrong
+    song title entirely, distinct from "the right song, weak lyric evidence".
+    """
+    return (
+        pool_quality["candidate_count"] > 0
+        and pool_quality["best_anchor_count"] < min_anchor_count
+        and pool_quality["zero_score_ratio"] >= max_zero_score_ratio
+    )
+
+
 def interpolated_shift_ms(
     standard_ms: int,
     anchors: list[dict[str, Any]] | None,
