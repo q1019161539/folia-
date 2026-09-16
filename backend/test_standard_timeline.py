@@ -168,6 +168,22 @@ class StandardTimelineTests(unittest.TestCase):
         self.assertGreater(result["residual_p90_ms"], 1500)
         self.assertFalse(result["low_confidence"])
 
+    def test_verbatim_end_is_not_held_through_an_instrumental_break(self):
+        # A verbatim release publishes the last line before an interlude with an
+        # end that runs to the next sung line. Taken at face value it parked one
+        # line of 《坏女孩》on screen for 32 seconds across the break.
+        lrc = [
+            {"text": "第一句", "start_ms": 10_000, "end_ms": 13_000},
+            {"text": "第二句", "start_ms": 13_000, "end_ms": 16_000},
+            {"text": "间奏前最后一句", "start_ms": 16_000, "end_ms": 49_000},
+            {"text": "间奏后第一句", "start_ms": 49_000, "end_ms": 52_000},
+        ]
+        rows = build_shifted_timeline(lrc, 0, 60_000)
+        durations = [row["end_ms"] - row["start_ms"] for row in rows]
+        self.assertEqual(durations[:2], [3000, 3000])
+        self.assertLessEqual(durations[2], 4500)
+        self.assertEqual(durations[3], 3000)
+
     def test_trend_stats_separate_a_steady_drift_from_plain_scatter(self):
         # Same MAD, opposite meanings. A performance running steadily late gives
         # long baselines that agree on direction and a slope that absorbs most of

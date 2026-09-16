@@ -569,12 +569,16 @@ def build_shifted_timeline(
         if explicit_end is not None and int(explicit_end) > standard_start:
             standard_end = int(explicit_end)
         elif index + 1 < len(lrc_lines):
-            next_start = int(lrc_lines[index + 1]["start_ms"])
-            # LRC normally supplies starts only. Do not hold a line through a
-            # clearly exceptional instrumental gap; use this version's typical
-            # row interval as the inferred display duration in that case.
-            standard_end = standard_start + tail if next_start - standard_start > tail * 1.5 else next_start
+            standard_end = int(lrc_lines[index + 1]["start_ms"])
         else:
+            standard_end = standard_start + tail
+        # Do not hold a line through a clearly exceptional instrumental gap; use
+        # this version's typical row interval as the inferred display duration.
+        # This has to cover a verbatim release's own end_ms too, not just the
+        # inferred one: the last line before an interlude is routinely published
+        # with an end that runs to the next sung line, which left one line of
+        # 《坏女孩》on screen for 32 seconds straight through the break.
+        if standard_end - standard_start > tail * 1.5:
             standard_end = standard_start + tail
         shifted_start, shifted_end = standard_start + shift_ms, standard_end + shift_ms
         start, end = max(0, shifted_start), min(duration_ms, shifted_end)
