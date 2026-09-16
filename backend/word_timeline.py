@@ -8,6 +8,16 @@ from typing import Any, Callable
 
 from standard_timeline import clamp_forced_words, interpolated_shift_ms, mad_ms, normalized, score_timeline
 
+# A word-vs-line disagreement past this point is only ever a warning: it is a
+# *consistency* signal (do the two models even agree?), not a *quality* one --
+# see cross_model_conflict below. It is deliberately far more sensitive than
+# MAX_WORD_VS_LINE_SHIFT_DIFF_MS, which stays the hard veto on promoting a word
+# cluster to the global shift. The two must not be merged: a real segmentation
+# bias (~2600-4000ms, see the bootstrap docstring) should warn without being
+# vetoed, and 1500ms was considered and rejected as too eager with no bad
+# sample yet to justify it.
+WORD_LINE_CONFLICT_WARN_MS = 2000
+
 
 def normalize_provider_rows(
     rows: list[dict[str, Any]],
@@ -252,6 +262,38 @@ def _bootstrap_word_shift(exact_anchors: list[dict[str, Any]], center: int) -> d
     return result
 
 
+def _timing_confidence(
+    eligible: int, dominant: int, coverage: float | None, model_medabs: int | None, model_mad: int | None, inlier500: float | None
+) -> str:
+    """How much to trust the word-level timing model on its own -- deliberately
+    orthogonal to match_confidence (see standard_timeline.score_timeline): a
+    wrong lyric match can still produce a perfectly self-consistent local timing
+    model on a repeated phrase ("我爱你我爱你", "以为自己"), so a clean word model
+    must never be read as evidence the lyrics were the right ones.
+
+    Structural gates (eligible/dominant/coverage) need no bad sample to justify
+    them; the numeric guardrails below do, and are provisional on purpose --
+    see the module-level comment on WORD_LINE_CONFLICT_WARN_MS. Only eligible<3
+    or an uncomputable model means *no evidence*: eligible>=3 with a scattered
+    or low-coverage result is a real, informative negative (there is data, it
+    just does not agree with itself), so that reads "low", not "unavailable".
+    """
+    if eligible < 3 or model_medabs is None or coverage is None:
+        return "unavailable"
+    inlier = inlier500 or 0.0
+    if (
+        eligible >= 4 and dominant >= 4 and coverage >= 0.75
+        and model_medabs <= 250 and (model_mad or 0) <= 400 and inlier >= 0.80
+    ):
+        return "high"
+    if (
+        eligible >= 3 and dominant >= 3 and coverage >= 0.60
+        and model_medabs <= 500 and (model_mad or 0) <= 800 and inlier >= 0.60
+    ):
+        return "medium"
+    return "low"
+
+
 def score_provider_timeline(
     rows: list[dict[str, Any]],
     asr_segments: list[dict[str, Any]],
@@ -261,7 +303,7 @@ def score_provider_timeline(
     timed = timed_rows(rows)
     line_result = score_timeline(timed, asr_segments, title_score=title_score)
     if not line_result.get("core_anchors"):
-        return {**line_result, "word_anchors": [], "word_anchor_count": 0, "word_coverage": 0.0}
+        return {**line_result, "word_anchors": [], "word_anchor_count": 0, "word_coverage": 0.0, "timing_confidence": "unavailable"}
     # Harvesting is evidence work, so it reads the evidence chain -- every extra
     # lyric line it reaches is more per-character material to vote with below.
     # (Confidence and drift read core_anchors alone -- see standard_timeline.)
@@ -326,10 +368,10 @@ def score_provider_timeline(
     # word anchors were tightly self-consistent around their own candidate -- two
     # very different facts the old single field could not tell apart.
     word_vs_line_shift_diff_ms = abs(word_model_shift_ms - center) if word_model_shift_ms is not None else None
+    cross_model_conflict = word_vs_line_shift_diff_ms is not None and word_vs_line_shift_diff_ms > WORD_LINE_CONFLICT_WARN_MS
     p90 = None
     span_ms = 0
     word_median_abs, word_mad = 0, 0
-    word_model_median_abs, word_model_mad = 0, 0
     if exact:
         residuals_signed = [item["delta_ms"] - shift_ms for item in exact]
         residuals = sorted(abs(value) for value in residuals_signed)
@@ -337,10 +379,26 @@ def score_provider_timeline(
         span_ms = max(item["qwen_start_ms"] for item in exact) - min(item["qwen_start_ms"] for item in exact)
         word_median_abs = round(statistics.median(residuals))
         word_mad = mad_ms(residuals_signed)
-        model_reference = word_model_shift_ms if word_model_shift_ms is not None else shift_ms
-        model_residuals_signed = [item["delta_ms"] - model_reference for item in exact]
-        word_model_median_abs = round(statistics.median(sorted(abs(value) for value in model_residuals_signed)))
+    # word_model_median_abs_residual_ms/mad/inlier_ratio_500 are the *confidence*
+    # signals, so they read structural_word_anchors -- every raw exact character
+    # harvested from a line with enough of its own to vouch for itself (>=2),
+    # deliberately *before* the +-window residual filter above runs. Computing a
+    # quality signal from anchors that filter already kept would be circular:
+    # reject the bad points, then point at how clean what is left looks.
+    structural_word_anchors = [item for item in raw_exact if int(item["lyric_index"]) in line_stats]
+    word_model_median_abs, word_model_mad, word_model_inlier_ratio_500 = None, None, None
+    if word_model_shift_ms is not None and structural_word_anchors:
+        model_deltas = [item["qwen_start_ms"] - item["provider_start_ms"] for item in structural_word_anchors]
+        model_residuals_signed = [delta - word_model_shift_ms for delta in model_deltas]
+        model_residuals_abs = sorted(abs(value) for value in model_residuals_signed)
+        word_model_median_abs = round(statistics.median(model_residuals_abs))
         word_model_mad = mad_ms(model_residuals_signed)
+        word_model_inlier_ratio_500 = round(sum(1 for value in model_residuals_abs if value <= 500) / len(model_residuals_abs), 4)
+    word_model_coverage_ratio = round(len(cluster_lines) / len(line_stats), 4) if line_stats else None
+    timing_confidence = _timing_confidence(
+        len(line_stats), len(cluster_lines), word_model_coverage_ratio,
+        word_model_median_abs, word_model_mad, word_model_inlier_ratio_500,
+    )
     lyric_characters = sum(len(normalized(row.get("text", ""))) for row in timed)
     coverage = len({(item["lyric_index"], item["standard_char_index"]) for item in exact}) / max(1, lyric_characters)
     timing_model = "word_local_hybrid" if local_shift_lines else f"{shift_source}_global"
@@ -380,7 +438,11 @@ def score_provider_timeline(
         "word_model_shift_ms": word_model_shift_ms,
         "word_model_median_abs_residual_ms": word_model_median_abs,
         "word_model_mad_ms": word_model_mad,
+        "word_model_inlier_ratio_500": word_model_inlier_ratio_500,
+        "word_model_coverage_ratio": word_model_coverage_ratio,
         "word_vs_line_shift_diff_ms": word_vs_line_shift_diff_ms,
+        "cross_model_conflict": cross_model_conflict,
+        "timing_confidence": timing_confidence,
         "word_coverage": round(coverage, 4),
         "low_confidence": low_confidence,
         "confidence": "low" if low_confidence else "high",

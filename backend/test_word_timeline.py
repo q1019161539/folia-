@@ -33,6 +33,30 @@ def live_segment(text, start, shift=5000):
     }
 
 
+def jittered_segment(text, start, shift, jitters):
+    """Like live_segment, but each character's time additionally carries its own
+    jitters[i] offset -- for corrupting a subset of characters within an
+    otherwise clean line without moving the line's own median far."""
+    return {
+        "text": text,
+        "start_ms": start + shift + jitters[0],
+        "end_ms": start + shift + jitters[-1] + 3000,
+        "words": [
+            {
+                "text": character,
+                "start_ms": start + shift + jitters[index] + index * 400,
+                "end_ms": start + shift + jitters[index] + (index + 1) * 400,
+                "timing_source": "qwen-forced-aligner",
+            }
+            for index, character in enumerate(text)
+        ],
+    }
+
+
+SIX_CLEAN_LINES = ["春夏秋冬轮回", "东南西北方向", "喜怒哀乐情绪", "柴米油盐酱醋", "琴棋书画诗词", "梅兰竹菊四君"]
+SIX_CLEAN_STARTS = [0, 20000, 40000, 60000, 80000, 100000]
+
+
 class WordTimelineTests(unittest.TestCase):
     def test_qwen_words_refine_global_shift_and_raise_confidence(self):
         rows = [
@@ -170,6 +194,10 @@ class WordTimelineTests(unittest.TestCase):
         self.assertEqual(result["word_bootstrap_status"], "insufficient_lines")
         self.assertEqual(result["shift_source"], "line")
         self.assertEqual(result["word_anchor_rejected_count"], 0)
+        # Corruption test 3: too little evidence to evaluate the word model at
+        # all reads as "unavailable", not "low" -- there is no data to judge, as
+        # opposed to data that disagrees with itself.
+        self.assertEqual(result["timing_confidence"], "unavailable")
 
     def test_bootstrap_accepts_a_cluster_within_the_safety_margin(self):
         # A genuine segmentation-bias case (like the ~2600ms one on 《和你一样》)
@@ -214,6 +242,104 @@ class WordTimelineTests(unittest.TestCase):
         self.assertEqual(result["word_vs_line_shift_diff_ms"], 10000)
         self.assertEqual(result["word_model_median_abs_residual_ms"], 0)
         self.assertGreater(result["word_median_abs_residual_ms"], 9000)
+        # Corruption test 4 (real-world instance): a whole-song offset between the
+        # word and line models must never by itself read as a word quality problem.
+        # The word model here is perfectly self-consistent, so timing_confidence
+        # must stay high; only the orthogonal conflict flag may fire.
+        self.assertEqual(result["timing_confidence"], "high")
+        self.assertTrue(result["cross_model_conflict"])
+
+    def _six_clean_lines(self, shift=5000):
+        rows = [provider_row(text, start) for text, start in zip(SIX_CLEAN_LINES, SIX_CLEAN_STARTS)]
+        asr = [live_segment(text, start, shift) for text, start in zip(SIX_CLEAN_LINES, SIX_CLEAN_STARTS)]
+        return rows, asr
+
+    def test_timing_confidence_is_high_on_six_clean_uniformly_shifted_lines(self):
+        # The clean baseline the other corruption tests below are measured against.
+        rows, asr = self._six_clean_lines()
+        result = score_provider_timeline(rows, asr, title_score=1)
+        self.assertEqual(result["timing_confidence"], "high")
+        self.assertEqual(result["word_model_coverage_ratio"], 1.0)
+        self.assertEqual(result["word_model_inlier_ratio_500"], 1.0)
+        self.assertFalse(result["cross_model_conflict"])
+
+    def test_corruption_1_scattered_character_jitter_degrades_confidence(self):
+        # +-1200~1800ms jitter on a third of the characters, confined to two of
+        # six otherwise-clean lines. Each jittered line's own *median* still
+        # lands near the true shift (jitter is roughly balanced positive/
+        # negative), so this specifically exercises spread (MAD/inlier), not
+        # the cluster vote itself.
+        rows = [provider_row(text, start) for text, start in zip(SIX_CLEAN_LINES, SIX_CLEAN_STARTS)]
+        clean = [0, 0, 0, 0, 0, 0]
+        jitter_a = [1500, -1800, 1200, -900, 1600, -1400]
+        jitter_b = [-1300, 1700, -1100, 1400, -1600, 900]
+        jitter_sets = [jitter_a, jitter_b, clean, clean, clean, clean]
+        asr = [
+            jittered_segment(text, start, 5000, jitters)
+            for text, start, jitters in zip(SIX_CLEAN_LINES, SIX_CLEAN_STARTS, jitter_sets)
+        ]
+        result = score_provider_timeline(rows, asr, title_score=1)
+        # MAD's own robustness (its breakdown point is 50%) means a third of the
+        # population jittering does not have to move it off zero -- that is
+        # correct behavior, not a blind spot, because inlier_ratio_500 exists
+        # precisely to catch what a robust spread statistic is designed to
+        # shrug off. Assert what actually has to change.
+        self.assertLess(result["word_model_inlier_ratio_500"], 0.8)
+        self.assertNotEqual(result["timing_confidence"], "high")
+
+    def test_corruption_2_an_even_split_leaves_no_dominant_cluster(self):
+        # Three lines genuinely shifted one way, three genuinely shifted another
+        # (not a single outlier -- an even split). No cluster can cover >=60% of
+        # six eligible lines, so this must read as a real disagreement (low),
+        # not as insufficient evidence (unavailable): there is plenty of data,
+        # it simply never agrees with itself.
+        rows = [provider_row(text, start) for text, start in zip(SIX_CLEAN_LINES, SIX_CLEAN_STARTS)]
+        shifts = [5000, 5000, 5000, 11000, 11000, 11000]
+        asr = [
+            live_segment(text, start, shift)
+            for text, start, shift in zip(SIX_CLEAN_LINES, SIX_CLEAN_STARTS, shifts)
+        ]
+        result = score_provider_timeline(rows, asr, title_score=1)
+        self.assertEqual(result["word_bootstrap_status"], "no_dominant_cluster")
+        self.assertEqual(result["word_model_coverage_ratio"], 0.5)
+        self.assertEqual(result["timing_confidence"], "low")
+
+    def test_corruption_5_anchors_borrowed_from_the_wrong_occurrence(self):
+        # Two of one line's six characters are swapped for times lifted from a
+        # position 6000ms away (as if a repeated phrase pulled in the wrong
+        # occurrence's timing for part of the line), the other four characters
+        # and all other lines stay clean. A partial, localized corruption like
+        # this should still show up in the aggregate spread/inlier numbers even
+        # though it never dominates the vote.
+        rows = [provider_row(text, start) for text, start in zip(SIX_CLEAN_LINES, SIX_CLEAN_STARTS)]
+        swapped = [0, 0, 6000, 6000, 0, 0]
+        jitter_sets = [swapped, [0] * 6, [0] * 6, [0] * 6, [0] * 6, [0] * 6]
+        asr = [
+            jittered_segment(text, start, 5000, jitters)
+            for text, start, jitters in zip(SIX_CLEAN_LINES, SIX_CLEAN_STARTS, jitter_sets)
+        ]
+        result = score_provider_timeline(rows, asr, title_score=1)
+        clean_result = score_provider_timeline(*self._six_clean_lines())
+        # A 2-of-36-character corruption is a small minority, so a robust spread
+        # statistic (MAD) is not expected to move -- inlier_ratio_500 is the one
+        # built to notice a handful of anchors quietly missing their mark.
+        self.assertLess(result["word_model_inlier_ratio_500"], clean_result["word_model_inlier_ratio_500"])
+        self.assertGreaterEqual(result["word_model_mad_ms"], clean_result["word_model_mad_ms"])
+
+    def test_new_confidence_fields_appear_without_changing_existing_routing(self):
+        # Thin contract test: the new fields show up, and confidence_tier's
+        # existing inputs (low_confidence/confidence) are untouched by any of
+        # this -- match_confidence and timing_confidence are additions, not
+        # replacements.
+        rows, asr = self._six_clean_lines()
+        result = score_provider_timeline(rows, asr, title_score=1)
+        for field in (
+            "word_model_inlier_ratio_500", "word_model_coverage_ratio",
+            "timing_confidence", "match_confidence", "cross_model_conflict",
+        ):
+            self.assertIn(field, result)
+        self.assertEqual(result["match_confidence"], "low" if result["low_confidence"] else "high")
+        self.assertEqual(result["confidence"], "low" if result["low_confidence"] else "high")
 
     def test_line_level_evidence_alone_yields_high_confidence(self):
         lines = ["春风吹过山岗", "我们一起歌唱", "直到夜色散场"]

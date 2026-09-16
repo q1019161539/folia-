@@ -506,6 +506,14 @@ def score_timeline(
         **trend,
         "low_confidence": low_confidence,
         "confidence": "low" if low_confidence else "high",
+        # match_confidence names the same line/core-evidence judgement under a
+        # name that says what it actually measures: whether the standard lyric
+        # text matched well enough, structurally, to trust which song and which
+        # lines this is. It says nothing about word-level timing quality (see
+        # word_timeline.score_provider_timeline's timing_confidence for that) --
+        # deliberately kept orthogonal, since a wrong lyric can still produce a
+        # perfectly self-consistent local timing model on repeated phrases.
+        "match_confidence": "low" if low_confidence else "high",
         "reason": "核心锚点太少或跨度太短" if low_confidence else "多个歌词锚点支持同一整体偏移",
     }
 
