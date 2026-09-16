@@ -203,6 +203,17 @@ class WordTimelineTests(unittest.TestCase):
         self.assertEqual(result["word_dominant_cluster_line_count"], 4)
         self.assertEqual(result["shift_source"], "line")
         self.assertEqual(result["word_anchor_rejected_count"], 0)
+        # This is the exact shape found on a real chorus-repeated-three-times song:
+        # the word model's own candidate is reported (not hidden just because it
+        # wasn't promoted), it disagrees with the line shift by the full 10000ms,
+        # and yet the word anchors are perfectly self-consistent against their own
+        # candidate -- "the word model disagrees with the line model" and "the word
+        # model is unreliable" are different facts, and only the old single
+        # effective-residual field could not tell them apart.
+        self.assertEqual(result["word_model_shift_ms"], 13000)
+        self.assertEqual(result["word_vs_line_shift_diff_ms"], 10000)
+        self.assertEqual(result["word_model_median_abs_residual_ms"], 0)
+        self.assertGreater(result["word_median_abs_residual_ms"], 9000)
 
     def test_line_level_evidence_alone_yields_high_confidence(self):
         lines = ["春风吹过山岗", "我们一起歌唱", "直到夜色散场"]

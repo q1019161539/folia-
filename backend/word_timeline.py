@@ -217,6 +217,21 @@ def _bootstrap_word_shift(exact_anchors: list[dict[str, Any]], center: int) -> d
     result: dict[str, Any] = {
         "line_stats": line_stats,
         "cluster_lines": [],
+        # word_model_shift_ms is the word level's own candidate -- reported whenever
+        # a dominant cluster exists, whether or not it clears the safety valves below.
+        # word_shift_ms is that same candidate promoted to the *global* shift, which
+        # only happens once it does. Keeping both lets a caller tell "the word model
+        # disagreed with the line shift" apart from "the word model itself is no
+        # good": on a real song a chorus repeated three times inside one oversized,
+        # ASR-garbled segment produced a word_model_shift_ms tight and self-consistent
+        # across four lines, sitting ~9000ms from the line shift -- and it was likely
+        # the *line* shift that was wrong there (see standard_timeline's
+        # anchor_trend_stats docstring for the segment-boundary mechanism, at an
+        # extreme most segments never reach). The valve below still refuses to
+        # promote a cluster that far away, because nothing here can tell that case
+        # apart from a genuinely bad one automatically -- but the candidate itself
+        # is worth keeping visible either way.
+        "word_model_shift_ms": None,
         "word_shift_ms": None,
         "status": "insufficient_lines",
     }
@@ -226,17 +241,11 @@ def _bootstrap_word_shift(exact_anchors: list[dict[str, Any]], center: int) -> d
     result["cluster_lines"] = cluster
     coverage = len(cluster) / len(line_stats)
     cluster_median = statistics.median(line_stats[line]["median"] for line in cluster)
+    result["word_model_shift_ms"] = round(cluster_median)
     if coverage < 0.6:
         result["status"] = "no_dominant_cluster"
         return result
     if abs(cluster_median - center) > MAX_WORD_VS_LINE_SHIFT_DIFF_MS:
-        # Seen on a song with a chorus repeated three times: four lines' char-level
-        # consensus sat ~9000ms away from -- and opposite in sign to -- the
-        # line-level shift, while the fifth line's two levels agreed almost
-        # exactly. That pattern points at a timestamp base mismatch between
-        # segment-level and word-level times on that job, not at a real 9-second
-        # performance offset. This valve exists precisely to refuse to let such a
-        # cluster take over the global shift; it does not diagnose the mismatch.
         result["status"] = "far_from_line_shift"
         return result
     result.update(word_shift_ms=round(cluster_median), status="accepted")
@@ -303,9 +312,24 @@ def score_provider_timeline(
     local_shift_lines = {line for line, count in accepted_exact_counts.items() if count >= 2}
     shift_source = "word" if bootstrap["status"] == "accepted" else "line"
     shift_ms = bootstrap["word_shift_ms"] if shift_source == "word" else center
+    word_model_shift_ms = bootstrap["word_model_shift_ms"]
+    # word_vs_line_shift_diff_ms is a *safety/consistency* signal, not a quality one:
+    # how much the word model disagrees with the line model, regardless of who is
+    # right. word_median_abs_residual_ms/word_mad_ms stay the pre-existing *effective*
+    # residual (against whatever shift actually ends up used -- unchanged meaning,
+    # what the score penalty below and existing callers already rely on).
+    # word_model_median_abs_residual_ms/word_model_mad_ms are new: the word anchors'
+    # residual against the word model's *own* candidate, which is what a future
+    # confidence stage should read as *word quality*. On a chorus repeated three
+    # times inside one oversized ASR segment, effective residual read ~9000ms (it
+    # was compared against the line shift the safety valve fell back to) while the
+    # word anchors were tightly self-consistent around their own candidate -- two
+    # very different facts the old single field could not tell apart.
+    word_vs_line_shift_diff_ms = abs(word_model_shift_ms - center) if word_model_shift_ms is not None else None
     p90 = None
     span_ms = 0
     word_median_abs, word_mad = 0, 0
+    word_model_median_abs, word_model_mad = 0, 0
     if exact:
         residuals_signed = [item["delta_ms"] - shift_ms for item in exact]
         residuals = sorted(abs(value) for value in residuals_signed)
@@ -313,6 +337,10 @@ def score_provider_timeline(
         span_ms = max(item["qwen_start_ms"] for item in exact) - min(item["qwen_start_ms"] for item in exact)
         word_median_abs = round(statistics.median(residuals))
         word_mad = mad_ms(residuals_signed)
+        model_reference = word_model_shift_ms if word_model_shift_ms is not None else shift_ms
+        model_residuals_signed = [item["delta_ms"] - model_reference for item in exact]
+        word_model_median_abs = round(statistics.median(sorted(abs(value) for value in model_residuals_signed)))
+        word_model_mad = mad_ms(model_residuals_signed)
     lyric_characters = sum(len(normalized(row.get("text", ""))) for row in timed)
     coverage = len({(item["lyric_index"], item["standard_char_index"]) for item in exact}) / max(1, lyric_characters)
     timing_model = "word_local_hybrid" if local_shift_lines else f"{shift_source}_global"
@@ -349,6 +377,10 @@ def score_provider_timeline(
         "word_residual_p90_ms": p90,
         "word_median_abs_residual_ms": word_median_abs,
         "word_mad_ms": word_mad,
+        "word_model_shift_ms": word_model_shift_ms,
+        "word_model_median_abs_residual_ms": word_model_median_abs,
+        "word_model_mad_ms": word_model_mad,
+        "word_vs_line_shift_diff_ms": word_vs_line_shift_diff_ms,
         "word_coverage": round(coverage, 4),
         "low_confidence": low_confidence,
         "confidence": "low" if low_confidence else "high",
