@@ -1,6 +1,7 @@
-import unittest
+﻿import unittest
 
 from standard_timeline import (
+    anchor_residual_stats,
     build_shifted_timeline,
     choose_best_timeline_candidate,
     clamp_forced_words,
@@ -74,20 +75,21 @@ class StandardTimelineTests(unittest.TestCase):
         lrc = parse_lrc("[00:10.00]一起看海\n[00:14.00]等风吹来\n[01:10.00]一起看海\n[01:14.00]等风吹来\n[01:20.00]只有这次结尾")
         result = score_timeline(lrc, [asr("一起看海", 5000, 0), asr("等风吹来", 9000, 1), asr("只有这次结尾", 15000, 2)])
         self.assertEqual(result["shift_ms"], -65000)
-        self.assertEqual([x["lyric_index"] for x in result["anchors"]], [2, 3, 4])
+        self.assertEqual([x["lyric_index"] for x in result["evidence_anchors"]], [2, 3, 4])
 
     def test_shifted_timeline_keeps_unrecognized_rows(self):
         lrc = parse_lrc("[00:10.00]甲乙丙丁\n[00:14.00]漏识别的一句\n[00:18.00]戊己庚辛")
         result = score_timeline(lrc, [asr("甲乙丙丁", 5000, 0), asr("戊己庚辛", 13000, 1)])
-        rows = build_shifted_timeline(lrc, result["shift_ms"], 20000, anchors=result["anchors"])
+        rows = build_shifted_timeline(lrc, result["shift_ms"], 20000, anchors=result["evidence_anchors"])
         self.assertEqual([x["text"] for x in rows], ["甲乙丙丁", "漏识别的一句", "戊己庚辛"])
         self.assertTrue(all(a["end_ms"] <= b["start_ms"] for a, b in zip(rows, rows[1:])))
 
     def test_shifted_timeline_moves_every_line_by_one_shift(self):
         # A performance that drifts (5s / 7s / 9s late) keeps the release's own
         # rhythm: every line moves by the median shift, nobody gets bent toward a
-        # neighbouring anchor. The drift itself is what max_anchor_drift_ms reports
-        # so the caller can hand the song to DeepSeek.
+        # neighbouring anchor. Note the core chain here holds a single anchor --
+        # a 1800ms tolerance cannot span 5s..9s of drift -- while the evidence
+        # chain reaches all three lines and hangs their ASR rows on them.
         lrc = parse_lrc(
             "[00:10.00]第一段独特歌词\n"
             "[00:20.00]中间一句歌词\n"
@@ -98,12 +100,13 @@ class StandardTimelineTests(unittest.TestCase):
             asr("中间一句歌词", 27000, 1),
             asr("最后一段独特歌词", 39000, 2),
         ])
-        rows = build_shifted_timeline(lrc, result["shift_ms"], 50000, anchors=result["anchors"])
+        rows = build_shifted_timeline(lrc, result["shift_ms"], 50000, anchors=result["evidence_anchors"])
         shift = result["shift_ms"]
         self.assertEqual([row["start_ms"] - row["standard_start_ms"] for row in rows], [shift] * 3)
         self.assertEqual([row["local_shift_ms"] for row in rows], [shift] * 3)
         self.assertEqual([row.get("asr_start_ms") for row in rows], [15000, 27000, 39000])
-        self.assertGreater(max_anchor_drift_ms(result["anchors"], shift), 0)
+        self.assertEqual(len(result["core_anchors"]), 1)
+        self.assertEqual(len(result["evidence_anchors"]), 3)
 
     def test_unrecognized_line_keeps_its_place_in_the_shifted_sheet(self):
         lrc = parse_lrc(
@@ -115,7 +118,7 @@ class StandardTimelineTests(unittest.TestCase):
             asr("开头锚点歌词", 15000, 0),
             asr("结尾锚点歌词", 39000, 1),
         ])
-        rows = build_shifted_timeline(lrc, result["shift_ms"], 50000, anchors=result["anchors"])
+        rows = build_shifted_timeline(lrc, result["shift_ms"], 50000, anchors=result["evidence_anchors"])
         self.assertEqual([row["start_ms"] - row["standard_start_ms"] for row in rows], [result["shift_ms"]] * 3)
         self.assertEqual(rows[1]["segment_ids"], [])
 
@@ -124,6 +127,57 @@ class StandardTimelineTests(unittest.TestCase):
         self.assertEqual(max_anchor_drift_ms(anchors, 7000), 5000)
         self.assertEqual(max_anchor_drift_ms([], 7000), 0)
         self.assertEqual(max_anchor_drift_ms(None, 7000), 0)
+
+    def test_one_outlier_anchor_does_not_spoil_the_robust_statistics(self):
+        # The exact shape that used to cost a well-aligned song: nine anchors tight
+        # around the shift, one mis-matched 4300ms away. median_abs and MAD stay
+        # small; only the maximum blows up, which is why nothing may judge on it.
+        anchors = [{"delta_ms": 7000 + d} for d in (-400, -200, -100, 0, 100, 150, 250, 300, 400, 4300)]
+        stats = anchor_residual_stats(anchors, 7000)
+        self.assertLess(stats["median_abs_residual_ms"], 300)
+        self.assertLess(stats["mad_ms"], 500)
+        self.assertEqual(max_anchor_drift_ms(anchors, 7000), 4300)
+
+    def test_residual_p90_is_the_worst_anchor_below_ten_anchors(self):
+        # Documents the trap rather than endorsing it: for n <= 9 the p90 index
+        # lands on the last element, so p90 *is* the maximum. Nothing may gate on
+        # it; it is reported so runs can be compared.
+        for count in (6, 9):
+            anchors = [{"delta_ms": 7000} for _ in range(count - 1)] + [{"delta_ms": 9500}]
+            self.assertEqual(anchor_residual_stats(anchors, 7000)["residual_p90_ms"], 2500)
+        ten = [{"delta_ms": 7000} for _ in range(9)] + [{"delta_ms": 9500}]
+        self.assertEqual(anchor_residual_stats(ten, 7000)["residual_p90_ms"], 0)
+
+    def test_live_cover_residuals_no_longer_force_low_confidence(self):
+        # A live cover sitting ~2s off the studio release across a long span is a
+        # normal performance difference, not a failed match. It used to trip
+        # `p90 > 1500` and hand the whole batch to DeepSeek.
+        lrc = parse_lrc(
+            "[00:10.00]第一段独特的歌词\n[00:40.00]第二段另外的歌词\n[01:10.00]第三段再换一句词\n"
+            "[01:40.00]第四段接着往下唱\n[02:10.00]第五段结尾的歌词"
+        )
+        result = score_timeline(lrc, [
+            asr("第一段独特的歌词", 8300, 0),
+            asr("第二段另外的歌词", 38400, 1),
+            asr("第三段再换一句词", 70000, 2),
+            asr("第四段接着往下唱", 101700, 3),
+            asr("第五段结尾的歌词", 131750, 4),
+        ])
+        self.assertEqual(len(result["core_anchors"]), 5)
+        self.assertGreater(result["residual_p90_ms"], 1500)
+        self.assertFalse(result["low_confidence"])
+
+    def test_core_and_evidence_anchors_are_returned_separately(self):
+        lrc = parse_lrc("[00:10.00]甲乙丙丁戊己\n[00:20.00]庚辛壬癸子丑\n[00:30.00]寅卯辰巳午未")
+        result = score_timeline(lrc, [
+            asr("甲乙丙丁戊己", 15000, 0),
+            asr("庚辛壬癸子丑", 25000, 1),
+            asr("寅卯辰巳午未", 35000, 2),
+        ])
+        self.assertNotIn("anchors", result)
+        self.assertGreaterEqual(len(result["evidence_anchors"]), len(result["core_anchors"]))
+        self.assertEqual(result["core_anchor_count"], len(result["core_anchors"]))
+        self.assertEqual(result["evidence_anchor_count"], len(result["evidence_anchors"]))
 
     def test_shifted_timeline_does_not_hold_line_through_long_instrumental_gap(self):
         lrc = parse_lrc(
@@ -138,12 +192,12 @@ class StandardTimelineTests(unittest.TestCase):
     def test_single_anchor_is_low_confidence(self):
         lrc = parse_lrc("[00:10.00]独特的一句话")
         result = score_timeline(lrc, [asr("独特的一句话", 3000, 0)])
-        self.assertEqual(result["anchor_count"], 1)
+        self.assertEqual(result["core_anchor_count"], 1)
         self.assertTrue(result["low_confidence"])
 
     def test_zero_anchor_is_rejected(self):
         result = score_timeline(parse_lrc("[00:10.00]歌词"), [asr("主播聊天", 3000, 0)])
-        self.assertEqual(result["anchors"], [])
+        self.assertEqual(result["evidence_anchors"], [])
 
     def test_untimed_interpolation_is_complete_and_monotonic(self):
         lyrics = plain_lyric_lines("第一句\n漏掉的第二句\n第三句\n结尾")

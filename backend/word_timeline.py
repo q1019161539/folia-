@@ -154,10 +154,16 @@ def score_provider_timeline(
 ) -> dict[str, Any]:
     timed = timed_rows(rows)
     line_result = score_timeline(timed, asr_segments, title_score=title_score)
-    if not line_result.get("anchors"):
+    if not line_result.get("core_anchors"):
         return {**line_result, "word_anchors": [], "word_anchor_count": 0, "word_coverage": 0.0}
+    # Both steps here are evidence work, not confidence judgement, so both read the
+    # evidence chain: harvesting word anchors from every lyric line it reaches, and
+    # then vetting each one against the local expected offset. That vetting wants
+    # the denser chain precisely because a live performance drifts locally, and the
+    # word anchor still has to land within 1800ms of it to be accepted at all.
+    # (Confidence and drift read core_anchors alone -- see standard_timeline.)
     word_anchors: list[dict[str, Any]] = []
-    for anchor in line_result["anchors"]:
+    for anchor in line_result.get("evidence_anchors") or line_result["core_anchors"]:
         lyric_index, asr_index = int(anchor["lyric_index"]), int(anchor["asr_index"])
         if lyric_index >= len(timed) or asr_index >= len(asr_segments):
             continue
@@ -167,7 +173,7 @@ def score_provider_timeline(
     for item in word_anchors:
         delta = item["qwen_start_ms"] - item["provider_start_ms"]
         expected = interpolated_shift_ms(
-            item["provider_start_ms"], line_result.get("anchors"), center
+            item["provider_start_ms"], line_result.get("evidence_anchors"), center
         )
         if abs(delta - expected) <= 1800:
             accepted_word_anchors.append({**item, "delta_ms": delta})

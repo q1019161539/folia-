@@ -1,4 +1,4 @@
-import unittest
+﻿import unittest
 
 from standard_timeline import build_shifted_timeline
 from word_timeline import apply_hybrid_words, normalize_provider_rows, score_provider_timeline
@@ -54,7 +54,7 @@ class WordTimelineTests(unittest.TestCase):
         row = provider_row("春风吹过", 10000)
         asr = live_segment("春风过", 10000)
         score = score_provider_timeline([row], [asr])
-        timeline = build_shifted_timeline([row], 5000, 30000, anchors=score.get("anchors"))
+        timeline = build_shifted_timeline([row], 5000, 30000, anchors=score.get("evidence_anchors"))
         counts = apply_hybrid_words(timeline, [row], score.get("word_anchors") or [], 5000)
         self.assertEqual("".join(word["text"] for word in timeline[0]["words"]), "春风吹过")
         self.assertGreater(counts["qwen_exact"], 0)
@@ -74,7 +74,7 @@ class WordTimelineTests(unittest.TestCase):
         ]
         result = score_provider_timeline(rows, asr, title_score=1)
         self.assertGreaterEqual(result["word_anchor_count"], 18)
-        timeline = build_shifted_timeline(rows, result["shift_ms"], 50000, anchors=result["anchors"])
+        timeline = build_shifted_timeline(rows, result["shift_ms"], 50000, anchors=result["evidence_anchors"])
         # The sheet is placed by one whole-song shift, then the real Qwen character
         # times pull each line onto where it was actually sung -- so a verbatim
         # candidate still follows a drifting performance line by line.

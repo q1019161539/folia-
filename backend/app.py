@@ -8,7 +8,7 @@ from opencc import OpenCC
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from standard_timeline import GLOBAL_SHIFT_DRIFT_LIMIT_MS, build_shifted_timeline, choose_best_timeline_candidate, clamp_forced_words, estimate_untimed_timeline, find_suspect_anchor_regions, is_high_confidence, is_lyric_metadata, lyric_render_window, max_anchor_drift_ms, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline
+from standard_timeline import build_shifted_timeline, choose_best_timeline_candidate, clamp_forced_words, estimate_untimed_timeline, find_suspect_anchor_regions, is_high_confidence, is_lyric_metadata, lyric_render_window, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline
 from word_timeline import apply_hybrid_words, normalize_provider_rows, score_provider_timeline, timed_rows
 from automation import MIN_RECORDING_BYTES, automation_transcriber_payload, broadcaster_directories, eligible_recording, parse_ai_json, project_transcript, recording_choices, restore_completed_clip_paths, transcript_for_ai, transcript_segments, validate_detected_songs
 from folia_native import FOLIA_EFFECTS, FOLIA_RENDERER_REVISION, apply_folia_preview_profile, build_folia_config, normalized_folia_settings
@@ -26,6 +26,11 @@ OUTPUT_HOST=Path(os.getenv('OUTPUT_HOST_PATH','/vol1/1000/video/Folia成片')); 
 NETEASE_HEADERS={'User-Agent':'Mozilla/5.0','Referer':'https://music.163.com/'}
 BEIJING_TZ=ZoneInfo('Asia/Shanghai')
 MIN_SONG_DURATION_MS=90_000
+# 全曲交给 DeepSeek 重排时间轴的总开关。实测它交回来的字幕整体偏移、对不上唱的位置，
+# 比本地整首平移还差；而把整批歌推给它的又是两个已修掉的判定错误（见
+# standard_timeline.max_anchor_drift_ms）。先全部走本地对齐跑真实数据，看清本地
+# 对齐本身的真实水平，再决定 AI 以什么身份回来。环境变量可以临时打开做对照。
+DEEPSEEK_FULL_REALIGN_ENABLED=os.getenv('DEEPSEEK_FULL_REALIGN','0').strip().lower() in ('1','true','yes','on')
 for p in (DATA,WORK,OUTPUT): p.mkdir(parents=True,exist_ok=True)
 app=FastAPI(title='Folia Video Studio API',version='0.1.0')
 render_lock=threading.Lock()
@@ -843,8 +848,8 @@ def auto_standard_timeline_task(jid:str):
             j=adopt_identified_song(jid,j,shazam_hit)
         scored=asyncio.run(collect_standard_timeline_candidates(j,asr,progress))
         if not scored: raise RuntimeError('没有搜索到可比较的标准歌词版本')
-        timed=[item for item in scored if item['timed'] and item['result'].get('anchors')]
-        usable=timed or [item for item in scored if item['plain'] and item['result'].get('anchors')]
+        timed=[item for item in scored if item['timed'] and item['result'].get('core_anchors')]
+        usable=timed or [item for item in scored if item['plain'] and item['result'].get('core_anchors')]
         # 零锚点候选不再直接判定硬失败：取综合分最高的候选（哪怕零锚点）继续往下走；
         # 真正的硬失败只剩"连一个候选都搜不到"或者补救链跑完仍然建不出任何时间轴
         # 这两种情况（下面 if not lines 那一行）。
@@ -853,14 +858,15 @@ def auto_standard_timeline_task(jid:str):
         candidate,result=chosen['candidate'],chosen['result']
         # 本地免费探测：即使本地整体判定已经是高置信，个别行也可能因为大段合并/
         # 长时间没有锚点等原因单独出问题；find_suspect_anchor_regions 没发现可疑
-        # 区域时直接返回空列表、不产生任何网络调用。只要本地判定为低置信，或者
-        # 探测到任何可疑区域，就需要 AI 介入——统一交给下面的全曲重排处理，不再用
-        # 逐区域打补丁再拼回本地时间轴的方案（那种方案在补丁边界处容易和未改动的
-        # 行产生时间重叠，真实案例中量出过 30 处重叠，而全曲重排是 0 重叠）。
+        # 区域时直接返回空列表、不产生任何网络调用。
+        # 判定一律只读 core_anchors——那是核心锚点链，是这首歌的时钟；evidence_anchors
+        # 是容忍窗宽达数秒的证据链，只负责把 ASR 行挂到歌词行上，拿它做任何质量判断
+        # 都是拿一把松尺子量紧公差（历史教训见 standard_timeline.max_anchor_drift_ms）。
         if chosen['timed']:
-            anchor_report=result.get('anchors') or []
-            need_ai_help=(not is_high_confidence(result)) or max_anchor_drift_ms(anchor_report,int(result['shift_ms']))>GLOBAL_SHIFT_DRIFT_LIMIT_MS or bool(find_suspect_anchor_regions(anchor_report,chosen['timed'],asr))
-            lines=build_shifted_timeline(chosen['timed'],int(result['shift_ms']),duration_ms,anchors=anchor_report)
+            core_anchors=result.get('core_anchors') or []
+            evidence_anchors=result.get('evidence_anchors') or core_anchors
+            need_ai_help=(not is_high_confidence(result)) or bool(find_suspect_anchor_regions(core_anchors,chosen['timed'],asr))
+            lines=build_shifted_timeline(chosen['timed'],int(result['shift_ms']),duration_ms,anchors=evidence_anchors)
             mode='standard-piecewise'; shift_ms=int(result['shift_ms']); lyrics=[row['text'] for row in chosen['timed']]
             word_counts={'qwen_exact':0,'qwen_corrected':0,'lddc_standard':0,'interpolated':0,'rejected':0}
             if chosen.get('provider_rows') and candidate.get('timing_type')=='verbatim':
@@ -868,17 +874,20 @@ def auto_standard_timeline_task(jid:str):
         else:
             need_ai_help=True
             lines=estimate_untimed_timeline(chosen['plain'],chosen['evidence'],duration_ms)
-            mode='estimated-full'; shift_ms=None; lyrics=chosen['plain']; anchor_report=[{'asr_index':(row.get('segment_ids') or [None])[0],'lyric_index':row.get('standard_line_index'),'asr_start_ms':row.get('asr_start_ms',row.get('start_ms')),'asr_text':row.get('recognized_text',''),'lyric_text':row.get('standard_text',row.get('text',''))} for row in chosen['evidence']]; word_counts={'qwen_exact':0,'qwen_corrected':0,'lddc_standard':0,'interpolated':0,'rejected':0}
+            mode='estimated-full'; shift_ms=None; lyrics=chosen['plain']; core_anchors=[{'asr_index':(row.get('segment_ids') or [None])[0],'lyric_index':row.get('standard_line_index'),'asr_start_ms':row.get('asr_start_ms',row.get('start_ms')),'asr_text':row.get('recognized_text',''),'lyric_text':row.get('standard_text',row.get('text',''))} for row in chosen['evidence']]; evidence_anchors=core_anchors; word_counts={'qwen_exact':0,'qwen_corrected':0,'lddc_standard':0,'interpolated':0,'rejected':0}
         if not lines: raise RuntimeError('标准歌词整体移动后不在当前视频时间范围内')
-        confidence_tier='deepseek' if need_ai_help else 'high'
-        # 终极补救：本地判定不够，或者本地探测到可疑区域，就把完整真实 ASR 逐字
-        # 时间轴和完整标准歌词一次性交给 DeepSeek，让它直接给出调整后的整份歌词
-        # 时间轴。按设计对它的结果不再做"整体偏移是否合理"这类内容层面的否决，只由
-        # resolve_deepseek_full_realign 做结构校验和真实 ASR 时间范围内的裁剪；
-        # AI 没能给出可用结果时保留本地时间轴，但 tier 仍然是 deepseek——本地证据
-        # 本来就不够，不能因为 AI 补救失败就回退成"高置信"。
+        confidence_tier='high' if not need_ai_help else ('deepseek' if DEEPSEEK_FULL_REALIGN_ENABLED else 'local')
+        # 全曲重排目前是关闭的（DEEPSEEK_FULL_REALIGN_ENABLED）。实测它交回来的字幕
+        # 整体偏移、对不上唱的位置，比本地整首平移还差，而当时把 13 首歌全判低置信
+        # 送进来的又是两个已经修掉的判定错误。先让所有歌都走本地对齐跑一批真实数据，
+        # 看清楚"光修判定错误，本地 median shift 本身能对到什么程度"，再决定 AI 该
+        # 以什么身份回来——多半是只判结构（副歌唱了几遍、漏唱哪一行），而不是由它
+        # 直接生成毫秒时间轴。
+        # 打开时行为不变：整份真实 ASR 逐字时间轴 + 整份标准歌词交给 DeepSeek 直接
+        # 给出调整后的时间轴，只由 resolve_deepseek_full_realign 做结构校验和真实
+        # ASR 时间范围裁剪；AI 失败时保留本地时间轴但 tier 不回退成高置信。
         full_realign_used=False
-        if chosen['timed'] and need_ai_help:
+        if DEEPSEEK_FULL_REALIGN_ENABLED and chosen['timed'] and need_ai_help:
             realigned=full_song_deepseek_realign(asr,chosen['timed'])
             if realigned:
                 lines=[{
@@ -892,9 +901,9 @@ def auto_standard_timeline_task(jid:str):
         summaries=[]
         for item in sorted(scored,key=lambda x:float(x['result'].get('score',0)),reverse=True):
             meta=item['candidate']; scored_result=item['result']
-            summaries.append({'candidate_id':meta['candidate_id'],'platform':meta.get('platform','netease'),'title':meta.get('title',''),'artist':meta.get('artist',''),'album':meta.get('album',''),'timing_type':meta.get('timing_type','line'),'word_coverage':meta.get('word_coverage',0),'timed':bool(item['timed']),'score':round(float(scored_result.get('score',0)),3),'anchor_count':len(scored_result.get('anchors') or []),'word_anchor_count':int(scored_result.get('word_anchor_count',0)),'word_residual_p90_ms':scored_result.get('word_residual_p90_ms'),'low_confidence':bool(scored_result.get('low_confidence',True))})
+            summaries.append({'candidate_id':meta['candidate_id'],'platform':meta.get('platform','netease'),'title':meta.get('title',''),'artist':meta.get('artist',''),'album':meta.get('album',''),'timing_type':meta.get('timing_type','line'),'word_coverage':meta.get('word_coverage',0),'timed':bool(item['timed']),'score':round(float(scored_result.get('score',0)),3),'anchor_count':len(scored_result.get('core_anchors') or []),'word_anchor_count':int(scored_result.get('word_anchor_count',0)),'word_residual_p90_ms':scored_result.get('word_residual_p90_ms'),'low_confidence':bool(scored_result.get('low_confidence',True))})
         low_confidence=confidence_tier!='high'
-        report={'status':'completed','mode':mode,'platform':candidate.get('platform','netease'),'candidate_id':candidate['candidate_id'],'song_id':candidate.get('song_id',''),'lddc_ref':chosen.get('lddc_ref',''),'timing_type':candidate.get('timing_type','line'),'word_coverage':candidate.get('word_coverage',0),'title':candidate.get('title',''),'artist':candidate.get('artist',''),'album':candidate.get('album',''),'shift_ms':shift_ms,'shift_min_ms':result.get('shift_min_ms'),'shift_max_ms':result.get('shift_max_ms'),'shift_range_ms':result.get('shift_range_ms'),'anchor_count':len(anchor_report),'anchor_span_ms':result.get('anchor_span_ms',0),'residual_p90_ms':result.get('residual_p90_ms'),'shazam':shazam_hit,'confidence_tier':confidence_tier,'full_realign_used':full_realign_used,'word_anchor_count':int(result.get('word_anchor_count',0)),'word_anchor_lines':int(result.get('word_anchor_lines',0)),'word_anchor_span_ms':int(result.get('word_anchor_span_ms',0)),'word_residual_p90_ms':result.get('word_residual_p90_ms'),'word_timing_counts':word_counts,'confidence':'low' if low_confidence else 'high','low_confidence':low_confidence,'reason':result.get('reason',''),'anchors':anchor_report,'candidates':summaries,'finished_at':time.time()}
+        report={'status':'completed','mode':mode,'platform':candidate.get('platform','netease'),'candidate_id':candidate['candidate_id'],'song_id':candidate.get('song_id',''),'lddc_ref':chosen.get('lddc_ref',''),'timing_type':candidate.get('timing_type','line'),'word_coverage':candidate.get('word_coverage',0),'title':candidate.get('title',''),'artist':candidate.get('artist',''),'album':candidate.get('album',''),'shift_ms':shift_ms,'shift_min_ms':result.get('shift_min_ms'),'shift_max_ms':result.get('shift_max_ms'),'shift_range_ms':result.get('shift_range_ms'),'anchor_count':len(core_anchors),'evidence_anchor_count':len(evidence_anchors),'anchor_span_ms':result.get('anchor_span_ms',0),'core_span_ms':result.get('core_span_ms',0),'residual_p90_ms':result.get('residual_p90_ms'),'median_abs_residual_ms':result.get('median_abs_residual_ms'),'mad_ms':result.get('mad_ms'),'max_anchor_drift_ms':result.get('max_anchor_drift_ms'),'shazam':shazam_hit,'confidence_tier':confidence_tier,'full_realign_used':full_realign_used,'word_anchor_count':int(result.get('word_anchor_count',0)),'word_anchor_lines':int(result.get('word_anchor_lines',0)),'word_anchor_span_ms':int(result.get('word_anchor_span_ms',0)),'word_residual_p90_ms':result.get('word_residual_p90_ms'),'word_timing_counts':word_counts,'confidence':'low' if low_confidence else 'high','low_confidence':low_confidence,'reason':result.get('reason',''),'core_anchors':core_anchors,'evidence_anchors':evidence_anchors,'candidates':summaries,'finished_at':time.time()}
         update(jid,status='alignment_review',title=candidate.get('title') or j.get('title',''),artist=candidate.get('artist',''),lyrics='\n'.join(lyrics),alignment={'asr_segments':asr,'lines':lines,'offset_ms':0,'timeline_match':report},error='')
     except Exception as exc:
         progress.update({'status':'failed','phase':'标准歌词时间轴匹配失败','error':str(exc)[:1000],'finished_at':time.time()})
@@ -1545,7 +1554,7 @@ def render_folia_native_locked(jid:str,j:dict[str,Any],sample:bool,start_ms:int,
         trim_start_ms,trim_end_ms=lyric_render_window([{'start':row['start'],'end':row['end']} for row in rows],source_duration_ms)
     if trim_end_ms<=trim_start_ms: raise RuntimeError('Fonia 原生渲染范围无效')
     parts=Path(j['source']).parts; anchor=(parts[1] if parts and parts[0].lower() in ('bilibili','douyin','huya','douyu') and len(parts)>1 else (parts[0] if parts else '未分类'))
-    day=datetime.now(BEIJING_TZ).strftime('%Y-%m-%d'); song_folder=safe_clip_name(str(j.get('title') or source.stem)); confidence_tier=str((al.get('timeline_match') or {}).get('confidence_tier') or ('deepseek' if bool((al.get('timeline_match') or {}).get('low_confidence')) else 'high')) if isinstance(al,dict) else 'high'; confidence_folder='DeepSeek版' if confidence_tier!='high' else '高置信'
+    day=datetime.now(BEIJING_TZ).strftime('%Y-%m-%d'); song_folder=safe_clip_name(str(j.get('title') or source.stem)); confidence_tier=str((al.get('timeline_match') or {}).get('confidence_tier') or ('deepseek' if bool((al.get('timeline_match') or {}).get('low_confidence')) else 'high')) if isinstance(al,dict) else 'high'; confidence_folder={'high':'高置信','deepseek':'DeepSeek版'}.get(confidence_tier,'本地对齐版')
     outdir=OUTPUT/anchor/day/confidence_folder/song_folder; outdir.mkdir(parents=True,exist_ok=True)
     settings=normalized_folia_settings(style.get('folia'),jid); native_mode=settings['mode']; suffix='_sample' if sample else ''
     if output_mode not in ('fast','alpha'): raise RuntimeError('未知原生输出方式')
@@ -2006,6 +2015,7 @@ def process_automation_run(run_id:str):
         failed_count=sum(song.get('status')=='failed' for song in songs)
         skipped_count=sum(song.get('status')=='skipped' for song in songs)
         deepseek_titles=[str(song.get('title') or '') for song in songs if song.get('status')=='completed' and song.get('confidence_tier')=='deepseek']
+        local_titles=[str(song.get('title') or '') for song in songs if song.get('status')=='completed' and song.get('confidence_tier')=='local']
         short_clip_titles=[str(song.get('title') or '') for song in songs if song.get('status')=='skipped' and song.get('skip_reason')=='clip_too_short']
         notify_automation_stage(
             'outputs_completed',finished,
@@ -2015,6 +2025,7 @@ def process_automation_run(run_id:str):
             outputs=[Path(path).name for path in output_paths],
             output_path=output_dir,
             deepseek_titles=deepseek_titles,
+            local_titles=local_titles,
             short_clip_titles=short_clip_titles,
         )
     except Exception as exc:

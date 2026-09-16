@@ -109,20 +109,41 @@ def find_suspect_anchor_regions(
     return regions[:max_regions]
 
 
-GLOBAL_SHIFT_DRIFT_LIMIT_MS = 2000
-
-
 def max_anchor_drift_ms(anchors: list[dict[str, Any]] | None, shift_ms: int) -> int:
-    """How far the worst anchor sits from the single whole-song shift.
+    """Diagnostic only: how far the worst anchor sits from the whole-song shift.
 
-    With the whole lyric sheet moved by one shift, a section that was sung at a
-    different pace shows up as anchors in that section sitting far from the
-    median. That is the signal to hand the song to DeepSeek for a full realign --
-    beyond about two seconds the subtitle is visibly off the singing, and no
-    single shift can serve both ends of the song at once.
+    This used to gate DeepSeek at a 2000ms limit and was wrong twice over. It was
+    fed the evidence chain, which is admitted with a tolerance window of seconds,
+    so it was comparing a deliberately loose chain against a tight threshold. And
+    a maximum is precisely the statistic a single mis-matched anchor can dominate,
+    so it re-admitted through the back door the outliers the median was chosen to
+    reject: songs whose residual p90 was 473~1109ms were handed to DeepSeek over a
+    lone 4300ms anchor. It survives only as a logged number for comparing runs --
+    nothing may branch on it. Judge systematic drift from a robust trend slope
+    over long baselines instead.
     """
     deltas = [int(anchor["delta_ms"]) for anchor in anchors or [] if anchor.get("delta_ms") is not None]
     return max((abs(delta - int(shift_ms)) for delta in deltas), default=0)
+
+
+def anchor_residual_stats(anchors: list[dict[str, Any]] | None, shift_ms: int) -> dict[str, int]:
+    """Robust spread of the anchor residuals around one whole-song shift.
+
+    p90 is reported but must not be judged on: at the anchor counts this pipeline
+    actually sees, `ceil(n*0.9)-1` lands on the last element for every n <= 9, so
+    "the 90th percentile" silently *is* the worst anchor until a song reaches ten
+    anchors. median_abs and MAD carry the same intent without that cliff.
+    """
+    signed = [int(item["delta_ms"]) - int(shift_ms) for item in anchors or [] if item.get("delta_ms") is not None]
+    if not signed:
+        return {"median_abs_residual_ms": 0, "mad_ms": 0, "residual_p90_ms": 0}
+    absolute = sorted(abs(value) for value in signed)
+    center = statistics.median(signed)
+    return {
+        "median_abs_residual_ms": round(statistics.median(absolute)),
+        "mad_ms": round(1.4826 * statistics.median([abs(value - center) for value in signed])),
+        "residual_p90_ms": absolute[min(len(absolute) - 1, math.ceil(len(absolute) * 0.9) - 1)],
+    }
 
 
 def is_high_confidence(result: dict[str, Any]) -> bool:
@@ -200,7 +221,7 @@ def choose_best_timeline_candidate(items: list[dict[str, Any]]) -> dict[str, Any
             not bool(item.get("result", {}).get("low_confidence", True)),
             float(item.get("title_similarity", 0)),
             float(item.get("result", {}).get("score", 0)),
-            len(item.get("result", {}).get("anchors") or []),
+            len(item.get("result", {}).get("core_anchors") or []),
         ),
     )
 
@@ -340,7 +361,7 @@ def score_timeline(
     """Find a monotonic anchor chain, allowing smooth/local timing drift."""
     potentials = _potential_anchors(lrc_lines, asr_segments)
     if not potentials:
-        return {"score": 0.0, "anchors": [], "reason": "没有歌词文字锚点"}
+        return {"score": 0.0, "core_anchors": [], "evidence_anchors": [], "reason": "没有歌词文字锚点"}
     centers = sorted({round(item["delta_ms"] / 500) * 500 for item in potentials})
     best_chain: list[dict[str, Any]] = []
     best_key: tuple[float, int, float] | None = None
@@ -357,10 +378,14 @@ def score_timeline(
         if best_key is None or key > best_key:
             best_key, best_chain = key, chain
     if not best_chain:
-        return {"score": 0.0, "anchors": [], "reason": "歌词锚点无法形成同一整体偏移"}
-    # Keep the tight chain for candidate confidence, then admit only very strong
-    # text matches as wider drift anchors.  Weak matches inside a long ASR
-    # segment are not line starts and would otherwise create false local jumps.
+        return {"score": 0.0, "core_anchors": [], "evidence_anchors": [], "reason": "歌词锚点无法形成同一整体偏移"}
+    # Two chains with two different jobs, and they must never be confused again.
+    # core_chain is the tight one: it is the clock, and every timing and quality
+    # judgement reads it alone. evidence_chain additionally admits very strong
+    # text matches under a tolerance window of seconds, purely so more lyric rows
+    # can carry their ASR evidence; a window that wide cannot calibrate anything.
+    # Returning both under one "anchors" key is what let a 8000ms-tolerance chain
+    # be measured against a 2000ms drift limit (see max_anchor_drift_ms).
     core_chain = best_chain
     shift_ms = round(statistics.median(item["delta_ms"] for item in core_chain))
     reliable_potentials = list(core_chain)
@@ -370,26 +395,34 @@ def score_timeline(
     expanded_chain = _best_monotonic_chain(
         reliable_potentials, shift_ms, max(8000, tolerance_ms * 4)
     )
-    if len(expanded_chain) >= len(core_chain):
-        best_chain = expanded_chain
-    residuals = sorted(abs(item["delta_ms"] - shift_ms) for item in core_chain)
-    p90 = residuals[min(len(residuals) - 1, math.ceil(len(residuals) * 0.9) - 1)]
-    span_ms = best_chain[-1]["asr_start_ms"] - best_chain[0]["asr_start_ms"]
+    evidence_chain = expanded_chain if len(expanded_chain) >= len(core_chain) else list(core_chain)
+    stats = anchor_residual_stats(core_chain, shift_ms)
+    span_ms = evidence_chain[-1]["asr_start_ms"] - evidence_chain[0]["asr_start_ms"]
     confidence_span_ms = core_chain[-1]["asr_start_ms"] - core_chain[0]["asr_start_ms"]
-    low_confidence = len(core_chain) < 3 or confidence_span_ms < 10000 or p90 > 1500
+    # The residual thresholds are deliberately absent. A live cover sits 1500~2700ms
+    # off the studio master as a matter of course, and the old `p90 > 1500` rejected
+    # every song in a 13-song batch on that alone -- while for anything under ten
+    # anchors that p90 was the single worst anchor. Residual spread is logged here
+    # and judged once the anchors themselves are word-level (they are still ASR
+    # segment starts, which carry a lead-in of their own).
+    low_confidence = len(core_chain) < 3 or confidence_span_ms < 10000
     return {
         "score": round(best_key[0], 3) if best_key else 0.0,
         "shift_ms": shift_ms,
-        "shift_min_ms": min(item["delta_ms"] for item in best_chain),
-        "shift_max_ms": max(item["delta_ms"] for item in best_chain),
-        "shift_range_ms": max(item["delta_ms"] for item in best_chain) - min(item["delta_ms"] for item in best_chain),
-        "anchors": best_chain,
-        "anchor_count": len(best_chain),
+        "shift_min_ms": min(item["delta_ms"] for item in core_chain),
+        "shift_max_ms": max(item["delta_ms"] for item in core_chain),
+        "shift_range_ms": max(item["delta_ms"] for item in core_chain) - min(item["delta_ms"] for item in core_chain),
+        "core_anchors": core_chain,
+        "evidence_anchors": evidence_chain,
+        "core_anchor_count": len(core_chain),
+        "evidence_anchor_count": len(evidence_chain),
+        "core_span_ms": confidence_span_ms,
         "anchor_span_ms": span_ms,
-        "residual_p90_ms": p90,
+        "max_anchor_drift_ms": max_anchor_drift_ms(core_chain, shift_ms),
+        **stats,
         "low_confidence": low_confidence,
         "confidence": "low" if low_confidence else "high",
-        "reason": "锚点较少或时间残差偏大" if low_confidence else "多个歌词锚点支持分段时间校正",
+        "reason": "核心锚点太少或跨度太短" if low_confidence else "多个歌词锚点支持同一整体偏移",
     }
 
 
@@ -442,8 +475,10 @@ def build_shifted_timeline(
     # interpolating a per-section shift between anchors instead let a single
     # mis-attributed anchor bend everything around it, and every anchor carries
     # the text-matching uncertainty of one ASR line. A section that genuinely
-    # drifts away from this one shift is handed to DeepSeek by the caller
-    # (see max_anchor_drift_ms) rather than patched locally here.
+    # drifts away from this one shift is not patched locally here either; that
+    # belongs to a robust whole-song stretch, once the anchors are word-level.
+    # `anchors` here is the evidence chain -- it only attaches ASR rows to lyric
+    # lines and never moves a single time.
     evidence: dict[int, list[dict[str, Any]]] = {}
     for anchor in anchors or []:
         evidence.setdefault(int(anchor["lyric_index"]), []).append(anchor)

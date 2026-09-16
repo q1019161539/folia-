@@ -45,6 +45,9 @@ def automation_notification(payload: dict[str, object]) -> tuple[str, str]:
         deepseek_titles = [str(item)[:100] for item in (payload.get("deepseek_titles") or []) if str(item).strip()][:12]
         if deepseek_titles:
             lines.append(f"DeepSeek 版（{len(deepseek_titles)} 首，本地对齐置信度不足，已用 AI 辅助对齐）：" + "、".join(deepseek_titles))
+        local_titles = [str(item)[:100] for item in (payload.get("local_titles") or []) if str(item).strip()][:12]
+        if local_titles:
+            lines.append(f"本地对齐版（{len(local_titles)} 首，本地判定置信度不足，但 AI 全曲重排当前已关闭）：" + "、".join(local_titles))
         short_clip_titles = [str(item)[:100] for item in (payload.get("short_clip_titles") or []) if str(item).strip()][:12]
         if short_clip_titles:
             lines.append(f"跳过（切片时长过短，{len(short_clip_titles)} 首）：" + "、".join(short_clip_titles))
