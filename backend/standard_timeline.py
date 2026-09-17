@@ -23,6 +23,25 @@ NOTICE_LINE = re.compile(
     r"AI作歌|未音APP|Vemus|本歌曲.{0,8}(?:来自|由)|https?://|www\.)",
     re.I,
 )
+# A label before a colon. Capped in length so a sung line that happens to
+# contain a colon ("我想对你说：我一直都在") falls through untouched.
+LABELLED_LINE = re.compile(r"^\s*([^:：\n]{1,12})\s*[:：]\s*(.*)$")
+# Words that mark the label as a production credit rather than a singer. Matched
+# as substrings so compounds are covered without listing every combination:
+# 人声录音 / 录音工程 / 缩混工程师 / 音乐制作发行 / 混音+母带 all reduce to one of these.
+CREDIT_KEYWORD = re.compile(
+    r"(作词|作曲|编曲|制作|监制|统筹|出品|发行|版权|企划|企宣|策划|宣传|宣发|推广|"
+    r"录音|混音|混缩|缩混|母带|工程|工作室|演唱|原唱|翻唱|主唱|伴唱|配唱|和声|合声|合音|和音|"
+    r"人声|弦乐|吉他|贝斯|键盘|合成器|古筝|小提琴|大提琴|二胡|琵琶|笛子|口哨|戏腔|"
+    r"封面|题字|原曲|设计|美术|MIDI|OP|SP)",
+    re.I,
+)
+# Interlude markers carry no sung text but are published as timed rows, so they
+# flash on screen for a fraction of a second between real lines.
+INTERLUDE_LINE = re.compile(
+    r"^\s*[（(\[【]?\s*(?:music|间奏|前奏|尾奏|过门|间奏音乐|solo|inst(?:rumental)?)\s*[）)\]】]?\s*$",
+    re.I,
+)
 
 
 def normalized(text: str) -> str:
@@ -34,6 +53,19 @@ def is_lyric_metadata(text: str, title: str = "", artist: str = "") -> bool:
     value = str(text or "").strip()
     if not value or ROLE_LINE.match(value) or NOTICE_LINE.search(value):
         return True
+    if INTERLUDE_LINE.match(value):
+        return True
+    # A duet sheet marks who sings what. A bare "女：" or "谷嘉诚：" row carries no
+    # lyric at all and is published with a near-zero duration (both 《坏女孩》 rows
+    # are 1ms), so it flashes between real lines. A label with lyrics after it is
+    # a sung line and must survive -- "合：能够让我们相偎相依" runs 6.5 seconds.
+    labelled = LABELLED_LINE.match(value)
+    if labelled:
+        label, remainder = labelled.group(1).strip(), labelled.group(2).strip()
+        if not remainder:
+            return True
+        if CREDIT_KEYWORD.search(label):
+            return True
     # Providers often insert a timed ``song - artist`` banner. Only treat a
     # hyphenated row as a banner when it also contains the known song title or
     # artist, so ordinary lyric punctuation remains untouched.

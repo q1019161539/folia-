@@ -44,6 +44,41 @@ class StandardTimelineTests(unittest.TestCase):
         self.assertTrue(is_lyric_metadata("心之火 - F.I.R.飞儿乐团/彭佳慧", "心之火", "F.I.R.飞儿乐团 / 彭佳慧"))
         self.assertFalse(is_lyric_metadata("爱是一场漫长旅行", "心之火", "彭佳慧"))
 
+    def test_bare_singer_labels_are_not_lyrics(self):
+        # Real rows from shipped products. A duet sheet marks who sings what;
+        # the label row carries no lyric and is published with a near-zero
+        # duration (《坏女孩》's 男：/女： are 1ms each), so it flashes on screen
+        # between real lines.
+        for value in ["男：", "女：", "合：", "Rap：", "谷嘉诚：", "赵露思：",
+                      "阳：", "宿：", "阳(宿低八)：", "Sasablue："]:
+            self.assertTrue(is_lyric_metadata(value), value)
+
+    def test_credit_labels_with_names_after_them_are_not_lyrics(self):
+        # Also real rows. The existing role list matched only exact prefixes, so
+        # compounds like 人声录音 and 缩混工程师 slipped through and shipped.
+        for value in ["混缩：黄文文", "伴唱 : 沙栩帆", "人声录音 : Sleepinkid@源音创乐",
+                      "制作统筹 : Ocd/刘京", "商务统筹 : 陈亦心", "宣传发行 : 叶增辉",
+                      "联合出品 : 无忧音乐", "录音工程：刘宇航", "混音工程：牛翊宁",
+                      "母带工程：牛翊宁", "总策划：张葛", "封面：拂言", "题字：许舟晚",
+                      "戏腔：单色凌", "制作公司：Hikoon Music", "原曲：离人赋 - 云汐",
+                      "推广：+7", "键盘/合成器：ericjuu", "音乐制作发行：哇唧唧哇",
+                      "混音/母带：LBI 利比", "缩混工程师：赵靖"]:
+            self.assertTrue(is_lyric_metadata(value), value)
+
+    def test_a_sung_line_behind_a_singer_label_survives(self):
+        # The one counter-example in the whole corpus: a part label followed by
+        # real lyrics, sung for 6.5 seconds. Filtering every colon-bearing row
+        # would delete it.
+        self.assertFalse(is_lyric_metadata("合：能够让我们相偎相依"))
+        # A colon inside an ordinary line must not make it metadata either.
+        self.assertFalse(is_lyric_metadata("我想对你说：我一直都在"))
+        self.assertFalse(is_lyric_metadata("他转身说：再见"))
+
+    def test_interlude_markers_are_not_lyrics(self):
+        for value in ["Music", "music", "间奏", "（间奏）", "[前奏]", "尾奏", "Solo"]:
+            self.assertTrue(is_lyric_metadata(value), value)
+        self.assertFalse(is_lyric_metadata("音乐响起的时候"))
+
     def test_high_confidence_candidate_beats_higher_scoring_low_confidence(self):
         items = [
             {"title_similarity": 1.0, "result": {"score": 315, "low_confidence": True, "anchors": list(range(12))}},
