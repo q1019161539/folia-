@@ -85,7 +85,20 @@ class WordTimelineTests(unittest.TestCase):
         self.assertGreater(counts["lddc_standard"], 0)
         self.assertTrue(all(timeline[0]["start_ms"] <= word["start_ms"] < word["end_ms"] <= timeline[0]["end_ms"] for word in timeline[0]["words"]))
 
-    def test_hybrid_keeps_late_live_word_anchors_with_local_drift(self):
+    def test_lines_do_not_follow_a_drifting_performance_one_by_one(self):
+        # A performance that drifts further out of step with every line: +5s,
+        # +7s, +9s. This used to be followed line by line, each line taking its
+        # own shift from its own characters (15000/27000/39000).
+        #
+        # That is deliberately given up. Measured across 64 shipped products,
+        # every one that let lines move on their own ended up with overlapping
+        # subtitles, while the clean ones have lines that sit still (90th
+        # percentile deviation from neighbours: 7ms). Real drift of this size is
+        # not what per-line movement was actually producing; it was producing
+        # neighbouring lines up to 2.2s apart and 《胭脂妆》 shipping with 16
+        # overlapping pairs. Tracking a genuinely drifting performance belongs to
+        # a whole-song stretch, which moves every line coherently, not to each
+        # line deciding for itself.
         rows = [
             provider_row("春风吹过山岗", 10000),
             provider_row("我们一起歌唱", 20000),
@@ -99,12 +112,31 @@ class WordTimelineTests(unittest.TestCase):
         result = score_provider_timeline(rows, asr, title_score=1)
         self.assertGreaterEqual(result["word_anchor_count"], 18)
         timeline = build_shifted_timeline(rows, result["shift_ms"], 50000, anchors=result["evidence_anchors"])
-        # The sheet is placed by one whole-song shift, then the real Qwen character
-        # times pull each line onto where it was actually sung -- so a verbatim
-        # candidate still follows a drifting performance line by line.
         self.assertEqual([line["local_shift_ms"] for line in timeline], [result["shift_ms"]] * 3)
         apply_hybrid_words(timeline, rows, result["word_anchors"], result["shift_ms"])
-        self.assertEqual([line["start_ms"] for line in timeline], [15000, 27000, 39000])
+        self.assertEqual([line["start_ms"] for line in timeline], [15000, 25000, 35000])
+        # The character times are still real Qwen times inside each line -- what
+        # was removed is their ability to move the line itself.
+        self.assertTrue(any(word["timing_source"] == "qwen-exact" for word in timeline[0]["words"]))
+
+    def test_word_evidence_far_from_a_line_can_never_drag_it_onto_its_neighbour(self):
+        # The 《胭脂妆》 failure shape: a line whose word-level evidence sits
+        # seconds away from where the lyric sheet puts it. Dragging the line
+        # there put two subtitles on screen at once for 1.2~1.9s, sixteen times
+        # in one song, in a file that shipped as high confidence.
+        rows = [provider_row("春风吹过山岗", 10000), provider_row("我们一起歌唱", 13000)]
+        anchors = [
+            {"lyric_index": 1, "standard_char_index": index, "kind": "exact",
+             "qwen_start_ms": 9000 + index * 400, "qwen_end_ms": 9400 + index * 400,
+             "provider_start_ms": 13000 + index * 400, "provider_end_ms": 13400 + index * 400}
+            for index in range(6)
+        ]
+        timeline = build_shifted_timeline(rows, 0, 50000)
+        starts_before = [line["start_ms"] for line in timeline]
+        apply_hybrid_words(timeline, rows, anchors, 0)
+        self.assertEqual([line["start_ms"] for line in timeline], starts_before)
+        for left, right in zip(timeline, timeline[1:]):
+            self.assertLessEqual(left["end_ms"], right["start_ms"])
 
     def test_metadata_filter_and_untimed_rows(self):
         rows = normalize_provider_rows([

@@ -499,20 +499,21 @@ def apply_hybrid_words(
         if not 0 <= index < len(rows):
             continue
         line_anchors = anchors_by_line.get(index, {})
-        exact_anchors = [anchor for anchor in line_anchors.values() if anchor.get("kind") == "exact"]
+        # The line keeps exactly the box build_shifted_timeline gave it: the whole
+        # lyric sheet moves by one shift and no line moves on its own.
+        #
+        # This used to give a line its own shift from its own matched characters,
+        # stretch its box to cover them, and then take the box from the first and
+        # last character. On real songs that moved neighbouring lines up to 2.2s
+        # apart and shipped 《胭脂妆》 with 16 pairs of overlapping subtitles, one
+        # line squeezed from 1785ms to 560ms. Measured across 64 shipped products,
+        # the ones with no overlap have lines that sit still (90th percentile
+        # deviation from their neighbours: 7ms) while every product that let lines
+        # move on their own has overlaps -- so per-line movement is switched off
+        # rather than merely bounded. Qwen times are still used for the characters
+        # inside the box, where they cannot move the line.
         local_shift = int(line.get("local_shift_ms", shift_ms))
-        if len(exact_anchors) >= 2:
-            local_shift = round(statistics.median(
-                int(anchor["qwen_start_ms"]) - int(anchor["provider_start_ms"])
-                for anchor in exact_anchors
-            ))
-        standard_start = int(line.get("standard_start_ms", rows[index].get("start_ms", 0) or 0))
-        standard_end = int(line.get("standard_end_ms", rows[index].get("end_ms", standard_start + 1) or standard_start + 1))
-        start, end = standard_start + local_shift, standard_end + local_shift
-        if line_anchors:
-            start = min(start, min(int(anchor["qwen_start_ms"]) for anchor in line_anchors.values()))
-            end = max(end, max(int(anchor["qwen_end_ms"]) for anchor in line_anchors.values()))
-        start, end = max(0, start), max(max(0, start) + 1, end)
+        start, end = int(line["start_ms"]), int(line["end_ms"])
         words = _provider_character_times(rows[index], start, end, local_shift)
         for char_index, anchor in line_anchors.items():
             if not 0 <= char_index < len(words):
@@ -534,8 +535,6 @@ def apply_hybrid_words(
             counts[word["timing_source"].replace("-", "_")] += 1
         line["words"] = words
         line["anchors"] = [word for word in words if word["timing_source"].startswith("qwen-")]
-        line["start_ms"] = words[0]["start_ms"]
-        line["end_ms"] = words[-1]["end_ms"]
         line["local_shift_ms"] = local_shift
         line["timing_precision"] = "forced-character"
         line["word_timing_source"] = "qwen-lddc-hybrid"
