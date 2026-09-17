@@ -1,4 +1,4 @@
-﻿import asyncio, base64, difflib, json, math, os, re, sqlite3, subprocess, sys, threading, time, uuid
+﻿import asyncio, base64, contextlib, difflib, json, math, os, re, sqlite3, subprocess, sys, threading, time, uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -648,6 +648,31 @@ def recognize_task(jid,engine,language):
             lines.append({'line_id':i,'text':s.get('text','').strip(),'start_ms':round(float(s.get('start',0))*1000),'end_ms':round(float(s.get('end',0))*1000),'confidence':round(float(s.get('confidence',.75)),2),'status':'asr','segment_ids':[i],'words':words,'anchors':character_anchors(words),'timing_precision':'word' if words else 'segment'})
         update(jid,status='song_review',lyrics=result.get('text',''),alignment={'asr_segments':lines,'lines':lines,'offset_ms':0})
     except Exception as e: update(jid,status='failed',error=str(e)[:1000])
+# ASR and Qwen forced alignment each need several gigabytes, and this box has
+# 16GB. The kernel OOM dump from 2026-09-17 caught them together: the ASR
+# subprocess at 7.7GB beside the model container at 3.9GB, 14.4GB of process
+# memory in total, and the ASR was killed. Nothing serialised them --
+# start_job_task is per job, so a force-align started from the web UI, or by a
+# job re-queued after a container restart, lands straight on top of a running
+# ASR. The transcriber does unload the models before ASR begins, but that is one
+# moment at the start; the half hour that follows is wide open.
+heavy_ai_lock=threading.Lock()
+HEAVY_AI_WAIT_NOTICE_S=60
+
+@contextlib.contextmanager
+def heavy_ai_slot(on_wait=None):
+    """Hold the one slot for work that needs the big models. Waiting is reported
+    through job status only -- never pushed to WeChat, where a run with a dozen
+    songs would turn into a dozen messages."""
+    started=time.time(); announced=False
+    while not heavy_ai_lock.acquire(timeout=5):
+        if on_wait and not announced and time.time()-started>=HEAVY_AI_WAIT_NOTICE_S:
+            announced=True
+            try: on_wait(time.time()-started)
+            except Exception: pass
+    try: yield round(time.time()-started,1)
+    finally: heavy_ai_lock.release()
+
 def start_job_task(jid:str,target,*args):
     """Run a per-job background task, remembering its thread so a wedged job can recover.
 
@@ -1304,6 +1329,23 @@ def neighbor_retry_candidates(lines:list[dict[str,Any]],failed_indices:list[int]
     return result
 
 def force_align_task(jid:str,language:str='Chinese'):
+    """Queue behind any running ASR before loading the aligner. Wrapping rather
+    than guarding inside keeps the alignment body untouched."""
+    def waiting_for_slot(waited:float):
+        # Reported through this job's own progress so a long wait reads as
+        # queueing rather than as a hang. Deliberately not a WeChat push: a run
+        # with a dozen songs would send a dozen messages.
+        try:
+            alignment=(getjob(jid).get('alignment') or {})
+            if isinstance(alignment,dict):
+                update(jid,alignment={**alignment,'aligner_progress':{
+                    **(alignment.get('aligner_progress') or {}),'status':'running',
+                    'phase':'正在等待整场 ASR 完成后再开始逐字对齐','waited_seconds':round(waited)}})
+        except Exception: pass
+    with heavy_ai_slot(waiting_for_slot):
+        return force_align_task_locked(jid,language)
+
+def force_align_task_locked(jid:str,language:str='Chinese'):
     lines=[]; old={}; progress={'status':'running','done':0,'total':0,'succeeded':0,'failed':0,'percent':0,'phase':'正在准备逐字对齐','current':0,'current_text':'','started_at':time.time()}
     try:
         j=getjob(jid); old=j.get('alignment') or {}; lines=old.get('lines',[]) if isinstance(old,dict) else old
@@ -2000,7 +2042,12 @@ def ensure_automation_transcript(run:dict[str,Any]):
         notify_automation_stage('asr_started',run,output_path=job.get('output_path',''),
             audio_duration_sec=audio_seconds,
             asr_eta=estimate_asr(audio_seconds,automation_eta_history()))
-    job=wait_transcriber(run['id'],job_id)
+    # Held for the whole ASR, not just its start: any force-align that begins
+    # while this runs puts the Qwen model beside the ASR subprocess.
+    with heavy_ai_slot(lambda waited: update_automation_run(
+            run['id'],stage='waiting_ai_slot',error='')):
+        update_automation_run(run['id'],stage='transcribing')
+        job=wait_transcriber(run['id'],job_id)
     response=transcriber_request('GET',f'/api/jobs/{job_id}/download/transcript.jsonl?inline=1')
     rows=[json.loads(line) for line in response.text.splitlines() if line.strip()]
     segments=transcript_segments(rows)
