@@ -658,20 +658,27 @@ def recognize_task(jid,engine,language):
 # moment at the start; the half hour that follows is wide open.
 heavy_ai_lock=threading.Lock()
 HEAVY_AI_WAIT_NOTICE_S=60
+heavy_ai_state:dict[str,Any]={'holder':'','since':0.0,'waiting':{}}
 
 @contextlib.contextmanager
-def heavy_ai_slot(on_wait=None):
+def heavy_ai_slot(on_wait=None,label:str=''):
     """Hold the one slot for work that needs the big models. Waiting is reported
-    through job status only -- never pushed to WeChat, where a run with a dozen
-    songs would turn into a dozen messages."""
-    started=time.time(); announced=False
-    while not heavy_ai_lock.acquire(timeout=5):
-        if on_wait and not announced and time.time()-started>=HEAVY_AI_WAIT_NOTICE_S:
-            announced=True
-            try: on_wait(time.time()-started)
-            except Exception: pass
+    through job status and the queue view only -- never pushed to WeChat, where a
+    run with a dozen songs would turn into a dozen messages."""
+    started=time.time(); announced=False; ticket=uuid.uuid4().hex[:8]
+    heavy_ai_state['waiting'][ticket]={'label':label,'since':started}
+    try:
+        while not heavy_ai_lock.acquire(timeout=5):
+            if on_wait and not announced and time.time()-started>=HEAVY_AI_WAIT_NOTICE_S:
+                announced=True
+                try: on_wait(time.time()-started)
+                except Exception: pass
+    finally:
+        heavy_ai_state['waiting'].pop(ticket,None)
+    heavy_ai_state.update(holder=label,since=time.time())
     try: yield round(time.time()-started,1)
-    finally: heavy_ai_lock.release()
+    finally:
+        heavy_ai_state.update(holder='',since=0.0); heavy_ai_lock.release()
 
 def start_job_task(jid:str,target,*args):
     """Run a per-job background task, remembering its thread so a wedged job can recover.
@@ -1342,7 +1349,7 @@ def force_align_task(jid:str,language:str='Chinese'):
                     **(alignment.get('aligner_progress') or {}),'status':'running',
                     'phase':'正在等待整场 ASR 完成后再开始逐字对齐','waited_seconds':round(waited)}})
         except Exception: pass
-    with heavy_ai_slot(waiting_for_slot):
+    with heavy_ai_slot(waiting_for_slot,label=f'逐字对齐：{getjob(jid).get("title") or jid[:8]}'):
         return force_align_task_locked(jid,language)
 
 def force_align_task_locked(jid:str,language:str='Chinese'):
@@ -2045,7 +2052,8 @@ def ensure_automation_transcript(run:dict[str,Any]):
     # Held for the whole ASR, not just its start: any force-align that begins
     # while this runs puts the Qwen model beside the ASR subprocess.
     with heavy_ai_slot(lambda waited: update_automation_run(
-            run['id'],stage='waiting_ai_slot',error='')):
+            run['id'],stage='waiting_ai_slot',error=''),
+            label=f'整场 ASR：{Path(str(run.get("source") or "")).name}'):
         update_automation_run(run['id'],stage='transcribing')
         job=wait_transcriber(run['id'],job_id)
     response=transcriber_request('GET',f'/api/jobs/{job_id}/download/transcript.jsonl?inline=1')
@@ -2297,6 +2305,40 @@ def automation_worker_loop():
             if row: process_automation_run(row['id']); continue
         except Exception: pass
         automation_wakeup.wait(5); automation_wakeup.clear()
+
+@app.get('/api/automation/queue')
+def automation_queue():
+    """What the pipeline is doing right now and what is behind it.
+
+    The run list already carries a status per run, but a queued recording is one
+    row among dozens of finished ones. This answers the question directly, and
+    adds the two shared resources that can hold everything up: the slot for the
+    big AI models and the renderer. Both are single-occupancy by design, so
+    "waiting" here is normal operation, not a stall.
+    """
+    with db() as c:
+        rows=c.execute("SELECT id,status,stage,source,songs,current_song,created_at FROM automation_runs WHERE status IN ('running','queued','cancelling') ORDER BY created_at").fetchall()
+    active=[]; waiting=[]
+    for row in rows:
+        try: songs=json.loads(row['songs'] or '[]')
+        except Exception: songs=[]
+        done=sum(1 for song in songs if song.get('status')=='completed')
+        index=int(row['current_song'] if row['current_song'] is not None else -1)
+        item={'id':row['id'],'status':row['status'],'stage':row['stage'],
+              'source':row['source'],'name':Path(str(row['source'] or '')).name,
+              'song_total':len(songs),'song_done':done,'waiting_seconds':round(time.time()-(row['created_at'] or time.time())),
+              'current_song':(songs[index].get('title') if 0<=index<len(songs) else '')}
+        (active if row['status']!='queued' else waiting).append(item)
+    now=time.time()
+    return {
+        'active':active,'queued':waiting,
+        'ai_slot':{'busy':heavy_ai_lock.locked(),'holder':heavy_ai_state.get('holder') or '',
+                   'held_seconds':round(now-(heavy_ai_state.get('since') or now)),
+                   'waiting':sorted(({'label':v['label'],'seconds':round(now-v['since'])}
+                                     for v in list((heavy_ai_state.get('waiting') or {}).values())
+                                     if isinstance(v,dict)),key=lambda x:-x['seconds'])},
+        'render_slot':{'busy':render_lock.locked()},
+    }
 
 @app.get('/api/automation/broadcasters')
 def automation_broadcasters():
