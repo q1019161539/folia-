@@ -14,6 +14,7 @@ from standard_timeline import (
     max_anchor_drift_ms,
     parse_lrc,
     plain_lyric_lines,
+    confidence_output_folder,
     is_lyric_metadata,
     resolve_deepseek_full_realign,
     score_timeline,
@@ -43,6 +44,27 @@ class StandardTimelineTests(unittest.TestCase):
         self.assertTrue(all(is_lyric_metadata(value) for value in values))
         self.assertTrue(is_lyric_metadata("心之火 - F.I.R.飞儿乐团/彭佳慧", "心之火", "F.I.R.飞儿乐团 / 彭佳慧"))
         self.assertFalse(is_lyric_metadata("爱是一场漫长旅行", "心之火", "彭佳慧"))
+
+    def test_low_confidence_output_folder_no_longer_claims_deepseek_ran(self):
+        # The classic render path put everything that was not 'high' into
+        # 'DeepSeek版'. With the full-song realign switched off, 纵容 and
+        # 风花雪月 were filed there with full_realign_used=False -- the folder
+        # named a step that never ran, which is how it looked like DeepSeek was
+        # still working. Both render paths now share this one function.
+        self.assertEqual(confidence_output_folder(
+            {"timeline_match": {"confidence_tier": "local", "low_confidence": True}}), "低置信")
+        self.assertEqual(confidence_output_folder(
+            {"timeline_match": {"confidence_tier": "high", "low_confidence": False}}), "高置信")
+        # A job aligned before the switch-off really did go through DeepSeek, so
+        # its folder keeps saying so.
+        self.assertEqual(confidence_output_folder(
+            {"timeline_match": {"confidence_tier": "deepseek"}}), "DeepSeek版")
+
+    def test_output_folder_falls_back_when_the_tier_was_never_recorded(self):
+        self.assertEqual(confidence_output_folder({"timeline_match": {"low_confidence": True}}), "低置信")
+        self.assertEqual(confidence_output_folder({"timeline_match": {}}), "高置信")
+        self.assertEqual(confidence_output_folder({}), "高置信")
+        self.assertEqual(confidence_output_folder(None), "高置信")
 
     def test_bare_singer_labels_are_not_lyrics(self):
         # Real rows from shipped products. A duet sheet marks who sings what;

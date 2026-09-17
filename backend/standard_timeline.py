@@ -550,6 +550,23 @@ def score_timeline(
     }
 
 
+def confidence_output_folder(alignment: Any) -> str:
+    """Which directory a finished video belongs in, for every render path.
+
+    This lived twice, once per renderer, and the two copies disagreed: the
+    classic path bucketed everything that was not 'high' into 'DeepSeek版'. With
+    the full-song realign switched off, every low-confidence song therefore
+    filed itself under the name of a step that never ran -- and since 49 of 50
+    jobs take that path, the directory the other copy wrote was never once
+    created. One function so that adding a tier cannot reintroduce the split.
+    """
+    match = (alignment.get("timeline_match") or {}) if isinstance(alignment, dict) else {}
+    tier = str(match.get("confidence_tier") or ("low" if match.get("low_confidence") else "high"))
+    # 'deepseek' only appears on jobs aligned before the realign was switched
+    # off; for those the folder name still describes what actually happened.
+    return {"high": "高置信", "deepseek": "DeepSeek版"}.get(tier, "低置信")
+
+
 def candidate_pool_quality(scored: list[dict[str, Any]]) -> dict[str, Any]:
     """How much independent lyric-text evidence the whole candidate pool found.
 

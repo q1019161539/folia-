@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from song_identity_diagnostics import acrcloud_identify_window
-from standard_timeline import build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, clamp_forced_words, estimate_untimed_timeline, find_suspect_anchor_regions, is_high_confidence, is_lyric_metadata, lyric_render_window, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, song_identity_suspicious
+from standard_timeline import build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, clamp_forced_words, confidence_output_folder, estimate_untimed_timeline, find_suspect_anchor_regions, is_high_confidence, is_lyric_metadata, lyric_render_window, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, song_identity_suspicious
 from word_timeline import apply_hybrid_words, normalize_provider_rows, score_provider_timeline, timed_rows
 from automation import MIN_RECORDING_BYTES, automation_transcriber_payload, broadcaster_directories, eligible_recording, parse_ai_json, project_transcript, recording_choices, restore_completed_clip_paths, transcript_for_ai, transcript_segments, validate_detected_songs
 from folia_native import FOLIA_EFFECTS, FOLIA_RENDERER_REVISION, apply_folia_preview_profile, build_folia_config, normalized_folia_settings
@@ -1634,7 +1634,7 @@ def render_folia_native_locked(jid:str,j:dict[str,Any],sample:bool,start_ms:int,
         trim_start_ms,trim_end_ms=lyric_render_window([{'start':row['start'],'end':row['end']} for row in rows],source_duration_ms)
     if trim_end_ms<=trim_start_ms: raise RuntimeError('Fonia 原生渲染范围无效')
     parts=Path(j['source']).parts; anchor=(parts[1] if parts and parts[0].lower() in ('bilibili','douyin','huya','douyu') and len(parts)>1 else (parts[0] if parts else '未分类'))
-    day=datetime.now(BEIJING_TZ).strftime('%Y-%m-%d'); song_folder=safe_clip_name(str(j.get('title') or source.stem)); confidence_tier=str((al.get('timeline_match') or {}).get('confidence_tier') or ('deepseek' if bool((al.get('timeline_match') or {}).get('low_confidence')) else 'high')) if isinstance(al,dict) else 'high'; confidence_folder={'high':'高置信','deepseek':'DeepSeek版'}.get(confidence_tier,'本地对齐版')
+    day=datetime.now(BEIJING_TZ).strftime('%Y-%m-%d'); song_folder=safe_clip_name(str(j.get('title') or source.stem)); confidence_tier=str((al.get('timeline_match') or {}).get('confidence_tier') or ('deepseek' if bool((al.get('timeline_match') or {}).get('low_confidence')) else 'high')) if isinstance(al,dict) else 'high'; confidence_folder=confidence_output_folder(al)
     outdir=OUTPUT/anchor/day/confidence_folder/song_folder; outdir.mkdir(parents=True,exist_ok=True)
     settings=normalized_folia_settings(style.get('folia'),jid); native_mode=settings['mode']; suffix='_sample' if sample else ''
     if output_mode not in ('fast','alpha'): raise RuntimeError('未知原生输出方式')
@@ -1667,7 +1667,7 @@ def render_task(jid,sample,start_ms,output_mode='fast',pre_acquired=False):
         if style.get('effect')=='folia-native':
             render_folia_native_locked(jid,j,sample,start_ms,output_mode); return
         al=j['alignment']; lines=al.get('lines',[]) if isinstance(al,dict) else al; offset=al.get('offset_ms',0) if isinstance(al,dict) else 0
-        source=MEDIA/j['source']; day=datetime.now(BEIJING_TZ).strftime('%Y-%m-%d'); parts=Path(j['source']).parts; anchor=(parts[1] if parts and parts[0].lower() in ('bilibili','douyin','huya','douyu') and len(parts)>1 else (parts[0] if parts else '未分类')); song_folder=safe_clip_name(str(j.get('title') or source.stem)); confidence_tier=str((al.get('timeline_match') or {}).get('confidence_tier') or ('deepseek' if bool((al.get('timeline_match') or {}).get('low_confidence')) else 'high')) if isinstance(al,dict) else 'high'; low_confidence=confidence_tier!='high'; confidence_folder='DeepSeek版' if low_confidence else '高置信'; outdir=OUTPUT/anchor/day/confidence_folder/song_folder; outdir.mkdir(parents=True,exist_ok=True); stem=source.stem
+        source=MEDIA/j['source']; day=datetime.now(BEIJING_TZ).strftime('%Y-%m-%d'); parts=Path(j['source']).parts; anchor=(parts[1] if parts and parts[0].lower() in ('bilibili','douyin','huya','douyu') and len(parts)>1 else (parts[0] if parts else '未分类')); song_folder=safe_clip_name(str(j.get('title') or source.stem)); confidence_tier=str((al.get('timeline_match') or {}).get('confidence_tier') or ('deepseek' if bool((al.get('timeline_match') or {}).get('low_confidence')) else 'high')) if isinstance(al,dict) else 'high'; low_confidence=confidence_tier!='high'; confidence_folder=confidence_output_folder(al); outdir=OUTPUT/anchor/day/confidence_folder/song_folder; outdir.mkdir(parents=True,exist_ok=True); stem=source.stem
         suffix='_sample' if sample else ('_folia_pv' if style.get('mode')=='pv' else '_folia_overlay'); out=outdir/(stem+suffix+'.mp4'); ass=WORK/(jid+'.ass')
         fs=int(style.get('font_size',52)); pos=int(style.get('position',82)); margin_v=max(10,int(1080*(100-pos)/100)); stroke=int(style.get('stroke',3))
         horizontal=max(0,min(100,int(style.get('horizontal',50)))); pos_x=int(1920*horizontal/100); pos_y=int(1080*max(0,min(100,pos))/100)
