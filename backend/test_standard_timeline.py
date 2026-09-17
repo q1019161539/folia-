@@ -14,6 +14,7 @@ from standard_timeline import (
     max_anchor_drift_ms,
     parse_lrc,
     plain_lyric_lines,
+    build_review_assessment,
     confidence_output_folder,
     is_lyric_metadata,
     resolve_deepseek_full_realign,
@@ -44,6 +45,60 @@ class StandardTimelineTests(unittest.TestCase):
         self.assertTrue(all(is_lyric_metadata(value) for value in values))
         self.assertTrue(is_lyric_metadata("心之火 - F.I.R.飞儿乐团/彭佳慧", "心之火", "F.I.R.飞儿乐团 / 彭佳慧"))
         self.assertFalse(is_lyric_metadata("爱是一场漫长旅行", "心之火", "彭佳慧"))
+
+    def test_a_high_tier_song_can_still_need_checking_first(self):
+        # 《胭脂妆》 shipped as tier=high with match and timing confidence both
+        # high, and carried sixteen places where two subtitle lines were on
+        # screen at once. The tier describes the evidence behind the alignment,
+        # not the result, so it is recorded as a fact and may never lower the
+        # level -- otherwise exactly this song would be filed as "no risk".
+        assessment = build_review_assessment({
+            "confidence_tier": "high", "match_confidence": "high", "timing_confidence": "high",
+            "cross_model_conflict": True, "word_vs_line_shift_diff_ms": 2234,
+            "core_anchor_count": 9, "core_span_ms": 174768, "mad_ms": 1065,
+            "timing_type": "verbatim",
+        })
+        self.assertEqual(assessment["review_level"], "critical")
+        codes = [item["code"] for item in assessment["review_reasons"]]
+        self.assertIn("timing_model_conflict", codes)
+        conflict = next(i for i in assessment["review_reasons"] if i["code"] == "timing_model_conflict")
+        self.assertEqual(conflict["facts"]["model_delta_ms"], 2234)
+
+    def test_a_wrong_song_name_outranks_everything_else(self):
+        assessment = build_review_assessment({
+            "song_identity_suspicious": True, "song_identity_primary_title": "风花雪月",
+            "lyric_title": "黯然销魂", "lyric_artist": "离音",
+            "core_anchor_count": 4, "core_span_ms": 80100, "mad_ms": 64,
+            "timing_type": "verbatim",
+        })
+        self.assertEqual(assessment["review_level"], "critical")
+        identity = next(i for i in assessment["review_reasons"] if i["code"] == "song_identity_suspicious")
+        self.assertEqual(identity["facts"]["lyric_title"], "黯然销魂")
+
+    def test_thin_evidence_is_worth_a_look_but_is_not_an_alarm(self):
+        assessment = build_review_assessment({
+            "core_anchor_count": 2, "core_span_ms": 4000, "mad_ms": 120,
+            "timing_type": "verbatim",
+        })
+        self.assertEqual(assessment["review_level"], "warning")
+        weak = next(i for i in assessment["review_reasons"] if i["code"] == "weak_anchor_evidence")
+        self.assertEqual(weak["facts"], {"anchor_count": 2, "anchor_span_ms": 4000})
+
+    def test_a_measurement_that_was_never_taken_is_not_a_bad_measurement(self):
+        # Reports written before mad_ms and core_span_ms existed carry neither.
+        # Reading the absence as zero flagged 80 of 86 finished songs, including
+        # ones with 18 and 36 anchors, as short of evidence.
+        assessment = build_review_assessment({"core_anchor_count": 18, "timing_type": "verbatim"})
+        self.assertEqual(assessment["review_level"], "normal")
+        self.assertEqual(build_review_assessment({})["review_level"], "normal")
+
+    def test_a_sound_song_raises_nothing(self):
+        # 《香水有毒》's real numbers -- the baseline everyone agrees is good.
+        assessment = build_review_assessment({
+            "confidence_tier": "high", "core_anchor_count": 18, "core_span_ms": 244000,
+            "mad_ms": 319, "timing_type": "verbatim",
+        })
+        self.assertEqual(assessment, {"review_level": "normal", "review_reasons": []})
 
     def test_low_confidence_output_folder_no_longer_claims_deepseek_ran(self):
         # The classic render path put everything that was not 'high' into

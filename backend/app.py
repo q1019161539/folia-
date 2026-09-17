@@ -9,7 +9,8 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from song_identity_diagnostics import acrcloud_identify_window
-from standard_timeline import build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, clamp_forced_words, confidence_output_folder, estimate_untimed_timeline, find_suspect_anchor_regions, is_high_confidence, is_lyric_metadata, lyric_render_window, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, song_identity_suspicious
+from pipeline_eta import estimate_asr, estimate_songs
+from standard_timeline import build_review_assessment, build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, clamp_forced_words, confidence_output_folder, estimate_untimed_timeline, find_suspect_anchor_regions, is_high_confidence, is_lyric_metadata, lyric_render_window, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, song_identity_suspicious
 from word_timeline import apply_hybrid_words, normalize_provider_rows, score_provider_timeline, timed_rows
 from automation import MIN_RECORDING_BYTES, automation_transcriber_payload, broadcaster_directories, eligible_recording, parse_ai_json, project_transcript, recording_choices, restore_completed_clip_paths, transcript_for_ai, transcript_segments, validate_detected_songs
 from folia_native import FOLIA_EFFECTS, FOLIA_RENDERER_REVISION, apply_folia_preview_profile, build_folia_config, normalized_folia_settings
@@ -120,6 +121,11 @@ def db():
     c.execute('CREATE TABLE IF NOT EXISTS automation_profiles(id TEXT PRIMARY KEY,created_at REAL,updated_at REAL,name TEXT,path TEXT,enabled INTEGER,enabled_at REAL,min_bytes INTEGER,min_confidence REAL,padding REAL,style TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS automation_seen(profile_id TEXT,source TEXT,size INTEGER,mtime REAL,stable_count INTEGER,disposition TEXT,updated_at REAL,PRIMARY KEY(profile_id,source))')
     c.execute('CREATE TABLE IF NOT EXISTS automation_runs(id TEXT PRIMARY KEY,profile_id TEXT,created_at REAL,updated_at REAL,status TEXT,stage TEXT,source TEXT,size INTEGER,mtime REAL,transcriber_job_id TEXT,transcriber_run_id TEXT,transcript TEXT,songs TEXT,current_song INTEGER,error TEXT,cancel_requested INTEGER DEFAULT 0)')
+    # Stage timings, for estimating how long a run will take. created_at to
+    # updated_at cannot answer that: it also counts time spent queueing behind
+    # another render, so an estimator trained on it learns other runs' queues.
+    if 'timings' not in {row['name'] for row in c.execute('PRAGMA table_info(automation_runs)')}:
+        c.execute('ALTER TABLE automation_runs ADD COLUMN timings TEXT')
     c.commit(); return c
 def fid(path:Path): return base64.urlsafe_b64encode(str(path.relative_to(MEDIA)).encode()).decode().rstrip('=')
 def fpath(id:str):
@@ -1780,8 +1786,8 @@ def automation_profile_row(row):
 
 def automation_run_row(row,include_transcript:bool=False):
     item=dict(row)
-    for key,default in (('transcript',[]),('songs',[])):
-        try: item[key]=json.loads(item.get(key) or '[]')
+    for key,default in (('transcript',[]),('songs',[]),('timings',{})):
+        try: item[key]=json.loads(item[key]) if item.get(key) else default
         except Exception: item[key]=default
     item['cancel_requested']=bool(item.get('cancel_requested'))
     if not include_transcript: item.pop('transcript',None)
@@ -1853,6 +1859,89 @@ def transcriber_request(method:str,path:str,**kwargs):
     with httpx.Client(timeout=60) as client:
         response=client.request(method,TRANSCRIBER_URL+path,**kwargs); response.raise_for_status(); return response
 
+# A song that waits a moment for the previous render to finish is the pipeline
+# working normally, not news. Only a wait long enough to look like a hang is
+# worth a message, and repeats are spaced out so a nine-song run cannot turn
+# into nine notifications.
+RENDER_QUEUE_NOTICE_AFTER_S=60
+RENDER_QUEUE_NOTICE_EVERY_S=900
+_render_queue_notice_at:dict[str,float]={}
+
+def wait_for_render_slot(run:dict[str,Any],songs:list[dict[str,Any]],index:int)->float:
+    """Block until the renderer is free, telling the user once if the wait is
+    long enough to look like a stall. Returns how long it waited, which is
+    excluded from the measured work when estimating future runs."""
+    started=time.time()
+    while render_lock.locked():
+        if automation_cancelled(run['id']): raise RuntimeError('任务已中止')
+        waited=time.time()-started
+        last=_render_queue_notice_at.get(run['id'],0.0)
+        if waited>=RENDER_QUEUE_NOTICE_AFTER_S and time.time()-last>=RENDER_QUEUE_NOTICE_EVERY_S:
+            _render_queue_notice_at[run['id']]=time.time()
+            notify_automation_stage('render_queue_waiting',run,
+                song_title=str(songs[index].get('title') or ''),
+                completed_count=sum(1 for s in songs if s.get('status')=='completed'),
+                total_count=len(songs),wait_seconds=round(waited))
+        time.sleep(5)
+    return round(time.time()-started,1)
+
+def run_timings(run:dict[str,Any])->dict[str,Any]:
+    raw=run.get('timings')
+    if isinstance(raw,dict): return dict(raw)
+    try: return json.loads(raw) if raw else {}
+    except Exception: return {}
+
+def mark_run_timing(run_id:str,**stamps):
+    """Record when a stage began or ended, so later runs can be estimated from
+    real work rather than from wall-clock spans that include queueing."""
+    run=get_automation_run(run_id,False)
+    timings=run_timings(run); timings.update({k:v for k,v in stamps.items() if v is not None})
+    update_automation_run(run_id,timings=timings)
+    return timings
+
+def add_render_wait(run_id:str,seconds:float):
+    if seconds<=0: return
+    run=get_automation_run(run_id,False); timings=run_timings(run)
+    timings['render_wait_seconds']=round(float(timings.get('render_wait_seconds') or 0)+seconds,1)
+    update_automation_run(run_id,timings=timings)
+
+def automation_eta_history(limit:int=60)->list[dict[str,Any]]:
+    """Past runs in the shape pipeline_eta expects. Only completed ones: a run
+    that failed halfway measures nothing useful about how long a whole run takes."""
+    with db() as c:
+        rows=c.execute("SELECT songs,timings FROM automation_runs WHERE status IN ('completed','completed_with_errors') ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()
+    history=[]
+    for row in rows:
+        try: timings=json.loads(row['timings'] or '{}')
+        except Exception: continue
+        try: songs=json.loads(row['songs'] or '[]')
+        except Exception: songs=[]
+        history.append({'timings':timings,
+                        'audio_duration_sec':timings.get('audio_duration_sec'),
+                        'song_count':sum(1 for s in songs if s.get('status')=='completed'),
+                        'render_wait_seconds':timings.get('render_wait_seconds') or 0})
+    return history
+
+def song_review(song:dict[str,Any])->dict[str,Any]:
+    """Translate one finished song into how much attention it needs. Reads the
+    stored alignment, so a song that shipped can still be flagged by a check
+    that only runs after alignment."""
+    if song.get('status')=='skipped':
+        return {'review_level':'normal','review_reasons':[]}
+    match=song.get('timeline_match') or {}
+    return build_review_assessment({
+        'song_identity_suspicious':song.get('song_identity_suspicious'),
+        'song_identity_primary_title':match.get('song_identity_primary_title'),
+        'lyric_title':match.get('title'),'lyric_artist':match.get('artist'),
+        'cross_model_conflict':match.get('cross_model_conflict'),
+        'word_vs_line_shift_diff_ms':match.get('word_vs_line_shift_diff_ms'),
+        # The stored report names the core chain's size anchor_count, while
+        # score_timeline calls the same thing core_anchor_count.
+        'core_anchor_count':match.get('anchor_count'),
+        'core_span_ms':match.get('core_span_ms'),'mad_ms':match.get('mad_ms'),
+        'timing_type':match.get('timing_type'),'confidence_tier':song.get('confidence_tier'),
+    })
+
 def notify_automation_stage(event:str,run:dict[str,Any],**details):
     """Send a best-effort stage notification through the existing WeCom config."""
     source=str(run.get('source') or '')
@@ -1906,15 +1995,31 @@ def ensure_automation_transcript(run:dict[str,Any]):
         payload=automation_transcriber_payload(run['source'],'auto-'+run['id'][:24])
         job=transcriber_request('POST','/api/jobs',json=payload).json(); job_id=job['id']
         run=update_automation_run(run['id'],transcriber_job_id=job_id,transcriber_run_id=job.get('run_id',''),stage='transcribing')
-        notify_automation_stage('asr_started',run,output_path=job.get('output_path',''))
+        audio_seconds=automation_audio_seconds(run)
+        mark_run_timing(run['id'],asr_started_at=time.time(),audio_duration_sec=audio_seconds)
+        notify_automation_stage('asr_started',run,output_path=job.get('output_path',''),
+            audio_duration_sec=audio_seconds,
+            asr_eta=estimate_asr(audio_seconds,automation_eta_history()))
     job=wait_transcriber(run['id'],job_id)
     response=transcriber_request('GET',f'/api/jobs/{job_id}/download/transcript.jsonl?inline=1')
     rows=[json.loads(line) for line in response.text.splitlines() if line.strip()]
     segments=transcript_segments(rows)
     if not segments: raise RuntimeError('逐句转录文件为空')
     update_automation_run(run['id'],transcript=segments,stage='transcribed')
-    notify_automation_stage('asr_completed',run,segment_count=len(segments),output_path=job.get('output_path',''))
+    timings=mark_run_timing(run['id'],asr_finished_at=time.time())
+    notify_automation_stage('asr_completed',run,segment_count=len(segments),output_path=job.get('output_path',''),
+        elapsed_seconds=stage_elapsed(timings,'asr_started_at','asr_finished_at'))
     return segments
+
+def automation_audio_seconds(run:dict[str,Any])->float:
+    """Length of the recording. ASR speed tracks audio length, not file size:
+    the same hour is the same work at 1GB or at 4GB, only the bitrate differs."""
+    try: return round(media_duration(MEDIA/run['source']),1)
+    except Exception: return 0.0
+
+def stage_elapsed(timings:dict[str,Any],start_key:str,end_key:str)->float:
+    start,end=timings.get(start_key),timings.get(end_key)
+    return round(end-start,1) if start and end and end>start else 0.0
 def full_song_deepseek_realign(asr_segments:list[dict[str,Any]],lrc_lines:list[dict[str,Any]])->list[dict[str,Any]]:
     """Terminal remediation step: hand DeepSeek the complete real ASR word timeline
     and the complete standard lyric text, and let it return a fully adjusted timed
@@ -1993,15 +2098,22 @@ def create_automation_clip_batch(run:dict[str,Any],profile:dict[str,Any],songs:l
     items=[{'title':safe_clip_name(song['title']),'start_seconds':song['start_ms']/1000,'end_seconds':song['end_ms']/1000,'kind':'official','enabled':True,'status':'pending'} for song in pending]
     with db() as c:
         c.execute('INSERT INTO clip_batches VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(bid,now,now,'queued',run['source'],profile['padding'],'copy_exact',json.dumps(items,ensure_ascii=False),-1,0,output_dir,'','自动流水线等待切片\n',0)); c.commit()
-    update_automation_run(run['id'],stage='clipping'); clip_batch_task(bid); batch=getclip(bid)
+    update_automation_run(run['id'],stage='clipping')
+    mark_run_timing(run['id'],clips_started_at=time.time())
+    clip_batch_task(bid); batch=getclip(bid)
     completed=sum(item.get('status')=='completed' for item in batch.get('items') or [])
     failed=sum(item.get('status')=='failed' for item in batch.get('items') or [])
+    timings=mark_run_timing(run['id'],clips_finished_at=time.time(),songs_started_at=time.time())
     notify_automation_stage(
         'clips_completed',run,
         completed_count=completed,
         failed_count=failed,
         output_path=publicclip(batch).get('output_dir_host',''),
-        clips=[item.get('output_name') or item.get('title') for item in (batch.get('items') or []) if item.get('status')=='completed'],
+        elapsed_seconds=stage_elapsed(timings,'clips_started_at','clips_finished_at'),
+        failed_titles=[item.get('title') for item in (batch.get('items') or []) if item.get('status')=='failed'],
+        # Only now is the song count known, so only now can the rest of the run
+        # be estimated -- at ASR start it is the one thing that decides the time.
+        songs_eta=estimate_songs(completed,automation_eta_history()),
     )
     for song,item in zip(pending,batch.get('items') or []):
         if item.get('status')=='completed':
@@ -2043,16 +2155,21 @@ def process_automation_song(run:dict[str,Any],profile:dict[str,Any],segments:lis
             song.update({'status':'skipped','error':'标准歌词零锚点或匹配失败：'+project.get('error','')}); update_automation_run(run['id'],songs=songs); return
         match_result=(project.get('alignment') or {}).get('timeline_match') or {}
         confidence_tier=match_result.get('confidence_tier','high')
-        song.update({'status':'timeline_ready','timeline_confidence':match_result.get('confidence','low'),'confidence_tier':confidence_tier,'song_identity_suspicious':bool(match_result.get('song_identity_suspicious'))}); update_automation_run(run['id'],songs=songs,stage='song_aligning')
+        # Only the fields the review assessment reads -- the full match result
+        # carries the anchor arrays, which would bloat every run record.
+        song.update({'status':'timeline_ready','timeline_confidence':match_result.get('confidence','low'),'confidence_tier':confidence_tier,'song_identity_suspicious':bool(match_result.get('song_identity_suspicious')),
+            'timeline_match':{key:match_result.get(key) for key in (
+                'title','artist','timing_type','anchor_count','core_span_ms','mad_ms',
+                'cross_model_conflict','word_vs_line_shift_diff_ms','song_identity_primary_title')}})
+        update_automation_run(run['id'],songs=songs,stage='song_aligning')
         progress=((project.get('alignment') or {}).get('aligner_progress') or {})
         if progress.get('status')!='completed': force_align_task(project['id']); project=getjob(project['id'])
         if project.get('status')=='failed': raise RuntimeError('Qwen 逐字失败：'+project.get('error',''))
         song['status']='aligned'; update_automation_run(run['id'],songs=songs,stage='song_rendering')
         output=project.get('output') or {}; output_path=Path(str(output.get('path','')))
         if not output_path.is_file():
-            while render_lock.locked():
-                if automation_cancelled(run['id']): raise RuntimeError('任务已中止')
-                time.sleep(5)
+            waited=wait_for_render_slot(run,songs,index)
+            add_render_wait(run['id'],waited)
             render_task(project['id'],False,0); project=getjob(project['id']); output=project.get('output') or {}
         if project.get('status')!='completed': raise RuntimeError('成片失败：'+project.get('error',''))
         song.update({'status':'completed','output':output,'output_url':f'/api/jobs/{project["id"]}/output-file'})
@@ -2095,21 +2212,32 @@ def process_automation_run(run_id:str):
         completed_count=sum(song.get('status')=='completed' for song in songs)
         failed_count=sum(song.get('status')=='failed' for song in songs)
         skipped_count=sum(song.get('status')=='skipped' for song in songs)
-        deepseek_titles=[str(song.get('title') or '') for song in songs if song.get('status')=='completed' and song.get('confidence_tier')=='deepseek']
-        local_titles=[str(song.get('title') or '') for song in songs if song.get('status')=='completed' and song.get('confidence_tier')=='local']
-        suspicious_identity_titles=[str(song.get('title') or '') for song in songs if song.get('status')=='completed' and song.get('song_identity_suspicious')]
-        short_clip_titles=[str(song.get('title') or '') for song in songs if song.get('status')=='skipped' and song.get('skip_reason')=='clip_too_short']
+        timings=mark_run_timing(run_id,songs_finished_at=time.time())
+        # One entry per song carrying how much attention it needs and why, so
+        # the notification can lead with what to open first. The old payload
+        # grouped songs by which technical branch produced them, which is not a
+        # question the reader has.
+        song_payload=[]
+        for song in songs:
+            state=str(song.get('status') or '')
+            entry={'title':str(song.get('title') or ''),
+                   'state':'completed' if state=='completed' else ('skipped' if state=='skipped' else 'failed')}
+            if entry['state']=='completed':
+                entry.update(song_review(song))
+            else:
+                entry['reason']=('clip_too_short' if song.get('skip_reason')=='clip_too_short'
+                                 else ('render_failed' if state=='failed' else str(song.get('error') or '')))
+                entry['review_level']='normal'
+            song_payload.append(entry)
         notify_automation_stage(
             'outputs_completed',finished,
             completed_count=completed_count,
             failed_count=failed_count,
             skipped_count=skipped_count,
-            outputs=[Path(path).name for path in output_paths],
             output_path=output_dir,
-            deepseek_titles=deepseek_titles,
-            local_titles=local_titles,
-            suspicious_identity_titles=suspicious_identity_titles,
-            short_clip_titles=short_clip_titles,
+            songs=song_payload,
+            elapsed_seconds=stage_elapsed(timings,'asr_started_at','songs_finished_at'),
+            render_wait_seconds=timings.get('render_wait_seconds') or 0,
         )
     except Exception as exc:
         cancelled=automation_cancelled(run_id)

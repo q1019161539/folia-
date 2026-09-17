@@ -550,6 +550,76 @@ def score_timeline(
     }
 
 
+# How far anchors may scatter around the one whole-song shift before the
+# alignment is worth a second look. The songs that shipped well sit at 168~377ms;
+# 《胭脂妆》, which shipped with sixteen overlapping subtitle pairs, sat at 1065.
+REVIEW_POOR_MAD_MS = 800
+REVIEW_MIN_ANCHORS = 3
+REVIEW_MIN_SPAN_MS = 10000
+
+
+def build_review_assessment(facts: dict[str, Any]) -> dict[str, Any]:
+    """How much attention a finished song needs, and why.
+
+    Separate from confidence_tier on purpose. 《胭脂妆》 was tier=high,
+    match_confidence=high and timing_confidence=high, and still shipped with
+    sixteen places where two subtitle lines sat on screen at once -- the tier
+    describes how good the *evidence* for the alignment was, not whether the
+    result is sound. So a high tier is recorded as one more fact here and can
+    never lower the level: the level is the worst thing found, whatever the tier
+    says.
+
+    Returns reason codes and the raw numbers behind them, never wording. The
+    notifier turns codes into Chinese; thresholds stay here, so tuning them does
+    not mean touching the notification templates.
+    """
+    reasons: list[dict[str, Any]] = []
+
+    if facts.get("song_identity_suspicious"):
+        reasons.append({"code": "song_identity_suspicious", "severity": "critical", "facts": {
+            k: v for k, v in (
+                ("primary_title", facts.get("song_identity_primary_title")),
+                ("lyric_title", facts.get("lyric_title")),
+                ("lyric_artist", facts.get("lyric_artist")),
+            ) if v}})
+
+    if facts.get("cross_model_conflict"):
+        diff = facts.get("word_vs_line_shift_diff_ms")
+        reasons.append({"code": "timing_model_conflict", "severity": "critical",
+                        "facts": {"model_delta_ms": int(diff)} if diff is not None else {}})
+
+    # A measurement that was never recorded is not a bad measurement. Reports
+    # written before these fields existed have no span and no MAD at all, and
+    # reading the absence as zero flagged 80 of 86 finished songs -- including
+    # ones with 18 and 36 anchors -- as short of evidence.
+    anchors = facts.get("core_anchor_count")
+    span = facts.get("core_span_ms")
+    thin = (anchors is not None and int(anchors) < REVIEW_MIN_ANCHORS) or \
+           (span is not None and int(span) < REVIEW_MIN_SPAN_MS)
+    if thin:
+        known = {}
+        if anchors is not None:
+            known["anchor_count"] = int(anchors)
+        if span is not None:
+            known["anchor_span_ms"] = int(span)
+        reasons.append({"code": "weak_anchor_evidence", "severity": "warning", "facts": known})
+
+    mad = facts.get("mad_ms")
+    if mad is not None and int(mad) > REVIEW_POOR_MAD_MS:
+        reasons.append({"code": "anchor_consistency_poor", "severity": "warning",
+                        "facts": {"mad_ms": int(mad)}})
+
+    if facts.get("timing_type") and str(facts["timing_type"]) != "verbatim":
+        reasons.append({"code": "line_timing_only", "severity": "warning", "facts": {}})
+
+    level = "normal"
+    if any(item["severity"] == "critical" for item in reasons):
+        level = "critical"
+    elif reasons:
+        level = "warning"
+    return {"review_level": level, "review_reasons": reasons}
+
+
 def confidence_output_folder(alignment: Any) -> str:
     """Which directory a finished video belongs in, for every render path.
 
