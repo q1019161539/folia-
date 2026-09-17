@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from song_identity_diagnostics import acrcloud_identify_window
+import ai_slot
 from pipeline_eta import estimate_asr, estimate_songs
 from standard_timeline import build_review_assessment, build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, clamp_forced_words, confidence_output_folder, estimate_untimed_timeline, find_suspect_anchor_regions, is_high_confidence, is_lyric_metadata, lyric_render_window, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, song_identity_suspicious
 from word_timeline import apply_hybrid_words, normalize_provider_rows, score_provider_timeline, timed_rows
@@ -617,8 +618,13 @@ def recognize_task(jid,engine,language):
         j=getjob(jid); source=MEDIA/j['source']; update(jid,status='recognizing',engine=engine,error='')
         with httpx.Client(timeout=7200) as h:
             if engine=='local':
-                with open(source,'rb') as f: r=h.post(LOCAL_WORKER+'/recognize',files={'file':(source.name,f,'video/mp4')},data={'language':language})
-                r.raise_for_status(); result=r.json()
+                # Loads Whisper in the model container, so it belongs to the same
+                # single slot as the pipeline's ASR and Qwen alignment. Started
+                # from the web UI in its own thread, it would otherwise land on
+                # top of a running automation ASR -- the pair that filled memory.
+                with heavy_ai_slot(label=f'手动识别：{j.get("title") or source.name}'):
+                    with open(source,'rb') as f: r=h.post(LOCAL_WORKER+'/recognize',files={'file':(source.name,f,'video/mp4')},data={'language':language})
+                    r.raise_for_status(); result=r.json()
             else:
                 if not DASHSCOPE_KEY: raise RuntimeError('尚未配置阿里云 DASHSCOPE_API_KEY')
                 wav=WORK/(jid+'-aliyun.wav')
@@ -656,29 +662,10 @@ def recognize_task(jid,engine,language):
 # job re-queued after a container restart, lands straight on top of a running
 # ASR. The transcriber does unload the models before ASR begins, but that is one
 # moment at the start; the half hour that follows is wide open.
-heavy_ai_lock=threading.Lock()
-HEAVY_AI_WAIT_NOTICE_S=60
-heavy_ai_state:dict[str,Any]={'holder':'','since':0.0,'waiting':{}}
-
-@contextlib.contextmanager
 def heavy_ai_slot(on_wait=None,label:str=''):
-    """Hold the one slot for work that needs the big models. Waiting is reported
-    through job status and the queue view only -- never pushed to WeChat, where a
-    run with a dozen songs would turn into a dozen messages."""
-    started=time.time(); announced=False; ticket=uuid.uuid4().hex[:8]
-    heavy_ai_state['waiting'][ticket]={'label':label,'since':started}
-    try:
-        while not heavy_ai_lock.acquire(timeout=5):
-            if on_wait and not announced and time.time()-started>=HEAVY_AI_WAIT_NOTICE_S:
-                announced=True
-                try: on_wait(time.time()-started)
-                except Exception: pass
-    finally:
-        heavy_ai_state['waiting'].pop(ticket,None)
-    heavy_ai_state.update(holder=label,since=time.time())
-    try: yield round(time.time()-started,1)
-    finally:
-        heavy_ai_state.update(holder='',since=0.0); heavy_ai_lock.release()
+    """Everything that loads Whisper or the Qwen aligner goes through one slot;
+    see ai_slot for why. Thin alias so call sites read in this module's style."""
+    return ai_slot.occupy(label=label,on_wait=on_wait)
 
 def start_job_task(jid:str,target,*args):
     """Run a per-job background task, remembering its thread so a wedged job can recover.
@@ -2329,14 +2316,9 @@ def automation_queue():
               'song_total':len(songs),'song_done':done,'waiting_seconds':round(time.time()-(row['created_at'] or time.time())),
               'current_song':(songs[index].get('title') if 0<=index<len(songs) else '')}
         (active if row['status']!='queued' else waiting).append(item)
-    now=time.time()
     return {
         'active':active,'queued':waiting,
-        'ai_slot':{'busy':heavy_ai_lock.locked(),'holder':heavy_ai_state.get('holder') or '',
-                   'held_seconds':round(now-(heavy_ai_state.get('since') or now)),
-                   'waiting':sorted(({'label':v['label'],'seconds':round(now-v['since'])}
-                                     for v in list((heavy_ai_state.get('waiting') or {}).values())
-                                     if isinstance(v,dict)),key=lambda x:-x['seconds'])},
+        'ai_slot':ai_slot.snapshot(),
         'render_slot':{'busy':render_lock.locked()},
     }
 
