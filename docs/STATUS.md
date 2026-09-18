@@ -1,8 +1,17 @@
 # 当前状态
 
-最后整理：2026-09-16
+最后整理：2026-09-18
 
 ## 已上线
+
+- 2026-09-18：修复自动流水线自 09-17 19:05 起**完全停止接收新录播**。起因是用户反馈"自动流程没启动过"：三条规则都启用、容器全部健康、扫描线程也活着（`py-spy` 抓到 `automation-scan` 正停在 `app.py` 的 `automation_wakeup.wait(30)`），数据库没有被锁、`ffprobe` 秒回、按线上真实数据做的只读扫描模拟判定完全正确，但连续 8 小时零排队、零日志、零报错，`automation_seen` 里今早那条 1.93 GiB 的录播永远卡在 `observing / stable=1`。
+  1. **根因**：`db()` 里那条 `ALTER TABLE automation_runs ADD COLUMN timings` 把表从 16 列变成 17 列，而 `scan_automation_profile`（自动排队）和 `run_existing_recording`（手动执行历史录播）两处仍是按位置写的 `INSERT INTO automation_runs VALUES(?×16)`，每次都抛 `OperationalError: table automation_runs has 17 columns but 16 values were supplied`；`automation_scan_loop` 外层的 `except Exception: pass` 把异常整个吞掉，于是故障一点痕迹都不留。已在事务里复现并回滚验证（未写入任何数据）。这也意味着**手动执行历史录播此前同样是坏的**。
+  2. **插入改为具名且只写本次真正要设的列**：新增 `AUTOMATION_RUN_INSERT` 常量，列出 16 个业务列，`timings` 留给数据库，两处插入共用它。刻意不写成"跟表列数一致的 17 列"——那样下次再加列还得记得改；读取侧的 `automation_run_row` 和 `run_timings` 本就把空值当 `{}`。没有采用"给 `timings` 加 `NOT NULL DEFAULT '{}'`"的方案：线上既有行的该列已是 NULL，为此再补一次迁移是新风险。
+  3. **两个后台循环不再静默**：新增 `automation_loop_error()`，`automation_scan_loop` 和 `automation_worker_loop` 的 `except` 改为输出完整 traceback 到 stderr；日志函数自身包了一层保护，不让"报告失败"把这两个必须长活的线程弄死。
+  4. **仍然待办**：`db()` 里"检查列在不在然后 ALTER"的迁移方式散落各处，建议单独做成 `schema_version` + 有序迁移；后台线程还缺 `last_scan_at` / `last_success_at` / `last_error` 和每轮扫描/命中/入队计数——`py-spy` 只能证明线程活着，证明不了扫描成功，这次正是卡在这个盲区。
+  测试：`backend/test_automation.py` 新增 3 项——禁止再出现按位置插入该表的语句（只做这一条源码文本断言，不解析 SQL 推导列集合）、用真实建表 DDL + 全部迁移列在内存库里把这条插入真跑一遍、**再额外加一个假想的未来迁移列后插入仍然成功**（后者正是当初 `timings` 干的事，是真正对症的回归）。隔离环境 12 项通过，容器内完整后端套件 111 项通过，新测试在修复前的代码上确实 3 项失败。
+  部署：备份旧 `backend/app.py` 后同步 `backend/app.py`、`backend/test_automation.py`，`docker compose build/up studio-api`，健康检查 `ok=true`，启动日志无异常。重启后约 30 秒内自动排队今早两场录播——`小红泡-管珩心/2026-09-18/06-06-41`（1.93 GiB，已进入整场 ASR）和 `07-54-21`（1.07 GiB，排队中）。排查和验证全程未修改原录播、切片、成片和数据库数据。
+  注意：`赛蒂娅Sentia` 规则是 09-17 21:40 才启用的，当天那两场（`18-40-31`、`17-10-14`）在启用时被记为基线，修复后也不会自动跑，需要在页面上用"手动执行以前的录播"触发（该入口此前同样受本 bug 影响，现已可用）。
 
 - 2026-09-16：修掉两个把好结果误判成低置信的判定错误，并**整条关闭 DeepSeek 全曲重排**。起因是上一条改动部署后最近 13 首歌全部判低置信、全部走了 DeepSeek 全曲重排、零首高置信，而用户实测 DeepSeek 重排的字幕"整体偏移、对不上唱的位置"，质量还不如本地对齐——把一切推给 LLM 是错误方向。核对代码后确认低置信不是对齐能力的问题，是判定逻辑本身有两个错误：
   1. **`p90` 在锚点数 ≤9 时根本就是最大值**：`residuals[min(n-1, ceil(n*0.9)-1)]` 在 n=6 取 idx 5、n=9 取 idx 8，都落在最后一个元素上，要到 10 个锚点才真的是倒数第二。这批歌锚点数是 6/9/13/10/10/16/6，其中三首所谓的"九成锚点质量"其实是"最差的那一个锚点"。`p90 > 1500` 这条硬门槛因此被**删除**（不是调大数值）：现场翻唱与录音室母带天然有 1500~2700ms 的差异，拿它当硬失败判据本身就不成立。置信度现在只剩 `核心锚点数≥3 且 跨度≥10000ms`。

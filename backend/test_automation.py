@@ -1,4 +1,6 @@
 import json
+import re
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -108,6 +110,51 @@ class AutomationHelpersTest(unittest.TestCase):
         projected = project_transcript(segments, 9000, 13000)
         self.assertEqual((projected[0]["start_ms"], projected[0]["end_ms"]), (1000, 3000))
         self.assertEqual(projected[0]["words"][0]["start_ms"], 1000)
+
+
+class AutomationRunsInsertSchemaTest(unittest.TestCase):
+    """The scan loop swallows its exceptions, so a schema/insert mismatch here is
+    invisible: the pipeline simply stops queueing recordings. automation_runs has
+    already gained a column by migration once (timings), which broke both bare
+    positional inserts and stalled automation until it was found by hand."""
+
+    source = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
+
+    row = ("run", "profile", 1.0, 1.0, "queued", "waiting", "主播/录播.mp4", 1, 1.0, "", "", "[]", "[]", -1, "", 0)
+
+    def insert_statement(self):
+        constant = re.search(r"AUTOMATION_RUN_INSERT=\((.*?)\)\n", self.source, re.S)
+        self.assertIsNotNone(constant, "找不到 AUTOMATION_RUN_INSERT")
+        return "".join(re.findall(r"'([^']*)'", constant.group(1)))
+
+    def migrated_table(self, *extra_columns):
+        """A live-shaped table: the CREATE statement the service ships, plus every
+        column its migrations add, plus whatever a future migration might add."""
+        create = re.search(r"(CREATE TABLE IF NOT EXISTS automation_runs\(.*?\))'", self.source, re.S)
+        self.assertIsNotNone(create, "找不到 automation_runs 的建表语句")
+        connection = sqlite3.connect(":memory:")
+        connection.execute(create.group(1))
+        for column in re.findall(r"ALTER TABLE automation_runs ADD COLUMN (\w+ \w+)", self.source):
+            connection.execute(f"ALTER TABLE automation_runs ADD COLUMN {column}")
+        for column in extra_columns:
+            connection.execute(f"ALTER TABLE automation_runs ADD COLUMN {column}")
+        return connection
+
+    def test_no_positional_insert_into_automation_runs(self):
+        self.assertFalse("INSERT INTO automation_runs VALUES(" in self.source, "仍有按位置插入 automation_runs 的语句")
+
+    def test_insert_statement_runs_against_the_migrated_schema(self):
+        connection = self.migrated_table()
+        connection.execute(self.insert_statement(), self.row)
+        stored = connection.execute("SELECT status,source,timings FROM automation_runs").fetchone()
+        self.assertEqual(stored, ("queued", "主播/录播.mp4", None))
+
+    def test_insert_survives_a_future_migration_column(self):
+        """The real regression: this is exactly what adding timings did to the old
+        positional insert, and the pipeline stopped queueing recordings in silence."""
+        connection = self.migrated_table("some_future_column TEXT")
+        connection.execute(self.insert_statement(), self.row)
+        self.assertEqual(connection.execute("SELECT count(*) FROM automation_runs").fetchone()[0], 1)
 
 
 if __name__ == "__main__":

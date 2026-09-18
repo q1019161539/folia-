@@ -1,4 +1,4 @@
-﻿import asyncio, base64, contextlib, difflib, json, math, os, re, sqlite3, subprocess, sys, threading, time, uuid
+﻿import asyncio, base64, contextlib, difflib, json, math, os, re, sqlite3, subprocess, sys, threading, time, traceback, uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1813,6 +1813,24 @@ def cancel_render(jid:str):
 # --- Durable recording automation -------------------------------------------------
 AUTOMATION_ACTIVE={'queued','running','cancelling'}
 
+def automation_loop_error(thread:str,what:str):
+    """Report a background-loop failure without ever letting the report kill the
+    loop: these two threads must survive anything, but a thread that survives in
+    silence is exactly how the pipeline stalled unnoticed for a whole day."""
+    try: print(f'[{thread}] {what}：\n{traceback.format_exc()}',file=sys.stderr,flush=True)
+    except Exception: pass
+
+# Columns are named rather than positional, and only the ones a new run actually
+# sets are listed. automation_runs has already gained a column by migration once
+# (timings), and a bare VALUES(...) list silently broke every insert the moment it
+# did -- inside the scan loop that failure is swallowed by the catch-all, so the
+# pipeline just stopped picking up recordings. Naming only what we set means the
+# next migration cannot break this statement either: added columns take their own
+# default, and every reader here already treats a missing timings as {}.
+AUTOMATION_RUN_INSERT=('INSERT INTO automation_runs(id,profile_id,created_at,updated_at,status,stage,source,size,mtime,'
+    'transcriber_job_id,transcriber_run_id,transcript,songs,current_song,error,cancel_requested) '
+    'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+
 def automation_profile_row(row):
     item=dict(row)
     try: item['style']=json.loads(item.get('style') or '{}')
@@ -1879,7 +1897,7 @@ def scan_automation_profile(profile:dict[str,Any]):
             exists=c.execute('SELECT 1 FROM automation_runs WHERE profile_id=? AND source=? AND size=? AND mtime=?',(profile['id'],relative,stat.st_size,stat.st_mtime)).fetchone()
             if exists:
                 c.execute("UPDATE automation_seen SET disposition='queued',updated_at=? WHERE profile_id=? AND source=?",(now,profile['id'],relative)); c.commit(); continue
-            c.execute('INSERT INTO automation_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(run_id,profile['id'],now,now,'queued','waiting',relative,stat.st_size,stat.st_mtime,'','','[]','[]',-1,'',0))
+            c.execute(AUTOMATION_RUN_INSERT,(run_id,profile['id'],now,now,'queued','waiting',relative,stat.st_size,stat.st_mtime,'','','[]','[]',-1,'',0))
             c.execute("UPDATE automation_seen SET disposition='queued',stable_count=?,updated_at=? WHERE profile_id=? AND source=?",(stable,now,profile['id'],relative)); c.commit()
         automation_wakeup.set()
 
@@ -1888,7 +1906,12 @@ def automation_scan_loop():
         try:
             with db() as c: profiles=[automation_profile_row(row) for row in c.execute('SELECT * FROM automation_profiles WHERE enabled=1').fetchall()]
             for profile in profiles: scan_automation_profile(profile)
-        except Exception: pass
+        except Exception:
+            # Never let this thread die, but never fail silently either: a scan
+            # that throws every cycle means no recording is ever picked up, and
+            # the only symptom used to be an automation page that stayed empty.
+            # The traceback is what turns "it broke" into a line number.
+            automation_loop_error('automation-scan','扫描失败')
         automation_wakeup.wait(30); automation_wakeup.clear()
 
 def transcriber_request(method:str,path:str,**kwargs):
@@ -2290,7 +2313,8 @@ def automation_worker_loop():
         try:
             with db() as c: row=c.execute("SELECT id FROM automation_runs WHERE status='queued' ORDER BY created_at LIMIT 1").fetchone()
             if row: process_automation_run(row['id']); continue
-        except Exception: pass
+        except Exception:
+            automation_loop_error('automation-worker','取任务失败')
         automation_wakeup.wait(5); automation_wakeup.clear()
 
 @app.get('/api/automation/queue')
@@ -2350,7 +2374,7 @@ def run_existing_recording(profile_id:str,body:AutomationManualRunIn):
     with db() as c:
         active=c.execute("SELECT id FROM automation_runs WHERE profile_id=? AND source=? AND status IN ('queued','running','cancelling')",(profile_id,source_path)).fetchone()
         if active: raise HTTPException(409,'这场录播已经在处理队列中')
-        c.execute('INSERT INTO automation_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(run_id,profile_id,now,now,'queued','waiting',source_path,stat.st_size,stat.st_mtime,'','','[]','[]',-1,'',0))
+        c.execute(AUTOMATION_RUN_INSERT,(run_id,profile_id,now,now,'queued','waiting',source_path,stat.st_size,stat.st_mtime,'','','[]','[]',-1,'',0))
         c.execute('INSERT OR IGNORE INTO automation_seen VALUES(?,?,?,?,?,?,?)',(profile_id,source_path,stat.st_size,stat.st_mtime,2,'manual',now))
         c.execute("UPDATE automation_seen SET disposition='manual',updated_at=? WHERE profile_id=? AND source=? AND disposition='observing'",(now,profile_id,source_path)); c.commit()
     automation_wakeup.set(); return get_automation_run(run_id)
