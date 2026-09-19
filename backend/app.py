@@ -11,10 +11,11 @@ from pydantic import BaseModel
 from song_identity_diagnostics import acrcloud_identify_window
 import ai_slot
 from pipeline_eta import estimate_asr, estimate_songs
-from standard_timeline import build_review_assessment, build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, clamp_forced_words, confidence_output_folder, estimate_untimed_timeline, find_suspect_anchor_regions, is_high_confidence, is_lyric_metadata, lyric_render_window, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, song_identity_suspicious
+from standard_timeline import build_review_assessment, build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, clamp_forced_words, confidence_output_folder, estimate_untimed_timeline, find_suspect_anchor_regions, is_high_confidence, is_lyric_metadata, lyric_render_window, normalize_identity, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, song_identity_suspicious, title_similarity as compare_titles
 from word_timeline import apply_hybrid_words, normalize_provider_rows, score_provider_timeline, timed_rows
 from automation import MIN_RECORDING_BYTES, automation_transcriber_payload, broadcaster_directories, eligible_recording, parse_ai_json, project_transcript, recording_choices, restore_completed_clip_paths, transcript_for_ai, transcript_segments, validate_detected_songs
 from folia_native import FOLIA_EFFECTS, FOLIA_RENDERER_REVISION, apply_folia_preview_profile, build_folia_config, normalized_folia_settings
+from song_identity import backfill_identity, identity_fields, matched_candidate_fields, resolve_search_identity
 
 MEDIA=Path(os.getenv('MEDIA_ROOT','/media/bililive')).resolve()
 MEDIA_WRITE=Path(os.getenv('MEDIA_WRITE_ROOT','/media-output')).resolve()
@@ -127,6 +128,13 @@ def db():
     # another render, so an estimator trained on it learns other runs' queues.
     if 'timings' not in {row['name'] for row in c.execute('PRAGMA table_info(automation_runs)')}:
         c.execute('ALTER TABLE automation_runs ADD COLUMN timings TEXT')
+    # Identity is owned by the identification stage alone; see song_identity.py.
+    # Kept in its own columns rather than reusing title/artist so that a lyric
+    # candidate cannot reach it even by accident, and so an old job without one
+    # is distinguishable from a job whose identity is genuinely empty.
+    job_columns={row['name'] for row in c.execute('PRAGMA table_info(jobs)')}
+    for column in ('identified_title','identified_artist','identity_source'):
+        if column not in job_columns: c.execute(f'ALTER TABLE jobs ADD COLUMN {column} TEXT')
     c.commit(); return c
 def fid(path:Path): return base64.urlsafe_b64encode(str(path.relative_to(MEDIA)).encode()).decode().rstrip('=')
 def fpath(id:str):
@@ -327,6 +335,13 @@ def getjob(jid):
     with db() as c: r=c.execute('SELECT * FROM jobs WHERE id=?',(jid,)).fetchone()
     if not r: raise HTTPException(404,'任务不存在')
     return rowdict(r)
+# Named columns, and only the ones a new job actually sets: jobs has just gained
+# three columns by migration, and the positional VALUES(...) form that used to be
+# here is the exact shape that silently broke every automation insert once the
+# same thing happened to automation_runs.
+JOB_INSERT=('INSERT INTO jobs(id,created_at,updated_at,status,source,engine,title,artist,lyrics,alignment,style,error,output,'
+    'identified_title,identified_artist,identity_source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+
 def update(jid,**kw):
     kw['updated_at']=time.time()
     with db() as c: c.execute('UPDATE jobs SET '+','.join(f'{k}=?' for k in kw)+' WHERE id=?',tuple(json.dumps(v,ensure_ascii=False) if isinstance(v,(dict,list)) else v for v in kw.values())+(jid,)); c.commit()
@@ -383,12 +398,51 @@ class AutomationProfileIn(BaseModel):
     name:str=''; path:str; min_confidence:float=.8; padding_seconds:float=5; style:StyleIn|None=None
 class AutomationManualRunIn(BaseModel): source:str
 
+def backfill_job_identity():
+    """Recover identities the automation stage recorded before this column existed.
+
+    Only jobs whose original name is still on file in automation_runs.songs are
+    filled in; a job we cannot recover keeps an empty identity and falls back to
+    its display title at query time, flagged legacy_fallback. Promoting the
+    current title here would be the one thing worth avoiding -- that title is
+    exactly what a lyric candidate may have overwritten.
+    """
+    try:
+        with db() as c:
+            originals={}
+            for row in c.execute('SELECT songs FROM automation_runs'):
+                try: songs=json.loads(row['songs'] or '[]')
+                except Exception: continue
+                for song in songs:
+                    if song.get('project_id') and song.get('title'): originals[song['project_id']]={'title':song['title']}
+            if not originals: return
+            filled=0
+            for row in c.execute("SELECT id,title,alignment,identified_title FROM jobs WHERE identified_title IS NULL OR identified_title=''").fetchall():
+                try: match=(json.loads(row['alignment'] or '{}') or {}).get('timeline_match') or {}
+                except Exception: match={}
+                fields=backfill_identity(dict(row),originals.get(row['id']),match if isinstance(match,dict) else {})
+                if not fields: continue
+                c.execute('UPDATE jobs SET identified_title=?,identified_artist=?,identity_source=? WHERE id=?',
+                    (fields['identified_title'],fields['identified_artist'],fields['identity_source'],row['id'])); filled+=1
+            c.commit()
+        if filled: print(f'[identity] 从自动流水线记录回填了 {filled} 个项目的歌曲身份',file=sys.stderr,flush=True)
+    except Exception:
+        print(f'[identity] 身份回填失败：\n{traceback.format_exc()}',file=sys.stderr,flush=True)
+
 @app.on_event('startup')
 def startup():
     global automation_started
     with db() as c:
         c.execute("UPDATE clip_batches SET status='interrupted',error='服务重启，任务已中断',updated_at=? WHERE status IN ('queued','running','cancelling')",(time.time(),)); c.commit()
         c.execute("UPDATE automation_runs SET status='queued',updated_at=? WHERE status IN ('running','cancelling')",(time.time(),)); c.commit()
+    # Off by default, and deliberately so. A dry run over 95 historical jobs showed
+    # that "recoverable" is not the same as "correct": 《很任性》 would be pushed back
+    # to the 人人心 guess its fingerprint had already corrected, one fingerprint
+    # title arrives decorated (归期(动画《凡人修仙传》插曲)) and another in English
+    # (Turn Left, Turn Right), both worse as search terms than the clean name.
+    # New jobs get their identity from the identification stage anyway; the
+    # historical rows stay on legacy_fallback until each diff has been reviewed.
+    if os.getenv('IDENTITY_BACKFILL','0')=='1': backfill_job_identity()
     if not automation_started:
         automation_started=True
         threading.Thread(target=automation_scan_loop,daemon=True,name='automation-scan').start()
@@ -608,7 +662,10 @@ def create_job(body:JobIn):
             result['resumed']=True
             return result
     jid=uuid.uuid4().hex; now=time.time(); style=StyleIn().model_dump()
-    with db() as c: c.execute('INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(jid,now,now,'selected',source,'',inferred_song_title(p),'','',json.dumps({'asr_segments':[],'lines':[],'offset_ms':0}),json.dumps(style), '',json.dumps({}))); c.commit()
+    # A clip filename is a display name, not an identification: it comes from the
+    # automation stage's guess. Identity stays empty until a stage that can
+    # actually identify the song fills it in.
+    with db() as c: c.execute(JOB_INSERT,(jid,now,now,'selected',source,'',inferred_song_title(p),'','',json.dumps({'asr_segments':[],'lines':[],'offset_ms':0}),json.dumps(style), '',json.dumps({}),'','','')); c.commit()
     return getjob(jid)
 @app.get('/api/jobs/{jid}')
 def job(jid:str): return getjob(jid)
@@ -811,7 +868,13 @@ async def fetch_netease_candidate_lyrics(song_id:str):
     return T2S.convert((((data or {}).get('lrc') or {}).get('lyric') or '').strip())
 
 async def collect_standard_timeline_candidates(j:dict[str,Any],asr:list[dict[str,Any]],progress:dict[str,Any]):
-    title=str(j.get('title') or '').strip()
+    # Search from the identified name, never from the display title: the display
+    # title is what a previous run's lyric candidate may have overwritten, and
+    # searching under an overwritten name is what made the pool degenerate in the
+    # first place. Old jobs fall back to the display title, reported as
+    # identity_source=legacy_fallback rather than silently.
+    identity=resolve_search_identity(j)
+    title=identity['title']
     fragments=[]
     for segment in sorted(asr,key=lambda x:len(norm_text(str(x.get('text','')))),reverse=True):
         text=str(segment.get('text','')).strip()
@@ -849,7 +912,7 @@ async def collect_standard_timeline_candidates(j:dict[str,Any],asr:list[dict[str
     for number,(candidate,provider_data,raw_lrc) in enumerate(loaded,1):
         progress.update({'phase':f'正在比较歌词版本 {number}/{len(loaded)}','candidates_done':number,'candidates_total':len(loaded)})
         update(j['id'],status='timeline_matching',alignment={**(j.get('alignment') or {}),'timeline_match':progress},error='')
-        title_similarity=difflib.SequenceMatcher(None,norm_text(title),norm_text(candidate.get('title','')),autojunk=False).ratio() if title else 0
+        title_similarity=compare_titles(title,candidate.get('title','')) if title else 0
         provider_rows=normalized_lddc_rows(provider_data or {})
         timed=timed_rows(provider_rows) if provider_rows else parse_lrc(raw_lrc)
         plain=[row['text'] for row in provider_rows] if provider_rows else plain_lyric_lines(raw_lrc)
@@ -890,7 +953,7 @@ def auto_standard_timeline_task(jid:str):
         # 直接认原曲，不受识别错字影响，认出来就直接采用、连切片文件名一起改正。
         # 识别不出来时保持原歌名，流程照常。
         shazam_hit=identify_song_shazam(MEDIA/j['source'],duration_ms,progress,jid,old)
-        identified_by_fingerprint=bool(shazam_hit and norm_text(shazam_hit['title'])!=norm_text(str(j.get('title') or '')))
+        identified_by_fingerprint=bool(shazam_hit and normalize_identity(shazam_hit['title'])!=normalize_identity(str(j.get('title') or '')))
         if identified_by_fingerprint:
             progress.update({'phase':f'指纹识别到《{shazam_hit["title"][:20]}》，改用这个歌名'})
             update(jid,status='timeline_matching',alignment={**old,'timeline_match':progress},error='')
@@ -923,9 +986,9 @@ def auto_standard_timeline_task(jid:str):
             acr_hit=None
             if ACRCLOUD_ACCESS_KEY and ACRCLOUD_ACCESS_SECRET and ACRCLOUD_HOST:
                 acr_hit=acrcloud_identify_window(MEDIA/j['source'],probe_offset_ms,ACRCLOUD_ACCESS_KEY,ACRCLOUD_ACCESS_SECRET,ACRCLOUD_HOST)
-            if acr_hit and acr_hit.get('title') and norm_text(acr_hit['title'])!=norm_text(str(j.get('title') or '')):
+            if acr_hit and acr_hit.get('title') and normalize_identity(acr_hit['title'])!=normalize_identity(str(j.get('title') or '')):
                 secondary_provider,secondary_title='acrcloud',acr_hit['title']
-                acr_j=adopt_identified_song(jid,j,{'title':acr_hit['title']})
+                acr_j=adopt_identified_song(jid,j,{'title':acr_hit['title'],'artist':acr_hit.get('artist','')},'acrcloud')
                 acr_scored=asyncio.run(collect_standard_timeline_candidates(acr_j,asr,progress))
                 acr_quality=candidate_pool_quality(acr_scored)
                 if acr_scored and acr_quality['best_anchor_count']>pool_quality['best_anchor_count']:
@@ -938,7 +1001,7 @@ def auto_standard_timeline_task(jid:str):
                 resume_from_ms=probe_offset_ms+SHAZAM_STEP_MS
                 rescan_hit=identify_song_shazam(MEDIA/j['source'],duration_ms,progress,jid,old,min_offset_ms=resume_from_ms)
                 identity_rescanned=True
-                if rescan_hit and norm_text(rescan_hit['title'])!=norm_text(str(j.get('title') or '')):
+                if rescan_hit and normalize_identity(rescan_hit['title'])!=normalize_identity(str(j.get('title') or '')):
                     rescan_j=adopt_identified_song(jid,j,rescan_hit)
                     rescan_scored=asyncio.run(collect_standard_timeline_candidates(rescan_j,asr,progress))
                     rescan_quality=candidate_pool_quality(rescan_scored)
@@ -1004,7 +1067,16 @@ def auto_standard_timeline_task(jid:str):
             summaries.append({'candidate_id':meta['candidate_id'],'platform':meta.get('platform','netease'),'title':meta.get('title',''),'artist':meta.get('artist',''),'album':meta.get('album',''),'timing_type':meta.get('timing_type','line'),'word_coverage':meta.get('word_coverage',0),'timed':bool(item['timed']),'score':round(float(scored_result.get('score',0)),3),'anchor_count':len(scored_result.get('core_anchors') or []),'word_anchor_count':int(scored_result.get('word_anchor_count',0)),'word_residual_p90_ms':scored_result.get('word_residual_p90_ms'),'low_confidence':bool(scored_result.get('low_confidence',True))})
         low_confidence=confidence_tier!='high'
         report={'status':'completed','mode':mode,'platform':candidate.get('platform','netease'),'candidate_id':candidate['candidate_id'],'song_id':candidate.get('song_id',''),'lddc_ref':chosen.get('lddc_ref',''),'timing_type':candidate.get('timing_type','line'),'word_coverage':candidate.get('word_coverage',0),'title':candidate.get('title',''),'artist':candidate.get('artist',''),'album':candidate.get('album',''),'shift_ms':shift_ms,'shift_min_ms':result.get('shift_min_ms'),'shift_max_ms':result.get('shift_max_ms'),'shift_range_ms':result.get('shift_range_ms'),'anchor_count':len(core_anchors),'evidence_anchor_count':len(evidence_anchors),'evidence_added_count':len(evidence_anchors)-len(core_anchors),'anchor_span_ms':result.get('anchor_span_ms',0),'core_span_ms':result.get('core_span_ms',0),'residual_p90_ms':result.get('residual_p90_ms'),'median_abs_residual_ms':result.get('median_abs_residual_ms'),'mad_ms':result.get('mad_ms'),'max_anchor_drift_ms':result.get('max_anchor_drift_ms'),'long_baseline_pairs':result.get('long_baseline_pairs'),'drift_over_span_ms':result.get('drift_over_span_ms'),'direction_support':result.get('direction_support'),'affine_mad_ms':result.get('affine_mad_ms'),'mad_improvement_ratio':result.get('mad_improvement_ratio'),'suspect_regions':suspect_regions,'suspect_region_reasons':sorted({str(r.get('reason','')) for r in suspect_regions}),'shazam':shazam_hit,'song_identity_suspicious':identity_suspicious,'song_identity_rescanned':identity_rescanned,'song_identity_pool_size':pool_quality['candidate_count'],'song_identity_zero_score_ratio':pool_quality['zero_score_ratio'],'song_identity_best_anchor_count':pool_quality['best_anchor_count'],'song_identity_primary_provider':'shazam' if shazam_hit else None,'song_identity_primary_title':(shazam_hit or {}).get('title'),'song_identity_secondary_provider':secondary_provider,'song_identity_secondary_title':secondary_title or None,'song_identity_secondary_used':secondary_used,'confidence_tier':confidence_tier,'full_realign_used':full_realign_used,'line_shift_ms':result.get('line_shift_ms',shift_ms),'effective_shift_ms':result.get('effective_shift_ms',shift_ms),'shift_source':result.get('shift_source','line'),'timing_model':result.get('timing_model','line_global'),'word_bootstrap_status':result.get('word_bootstrap_status'),'word_eligible_line_count':int(result.get('word_eligible_line_count',0)),'word_dominant_cluster_line_count':int(result.get('word_dominant_cluster_line_count',0)),'word_local_shift_line_count':int(result.get('word_local_shift_line_count',0)),'word_anchor_count':int(result.get('word_anchor_count',0)),'word_anchor_raw_count':int(result.get('word_anchor_raw_count',0)),'word_anchor_rejected_count':int(result.get('word_anchor_rejected_count',0)),'word_anchor_lines':int(result.get('word_anchor_lines',0)),'word_anchor_span_ms':int(result.get('word_anchor_span_ms',0)),'word_residual_p90_ms':result.get('word_residual_p90_ms'),'word_median_abs_residual_ms':result.get('word_median_abs_residual_ms'),'word_mad_ms':result.get('word_mad_ms'),'word_model_shift_ms':result.get('word_model_shift_ms'),'word_model_median_abs_residual_ms':result.get('word_model_median_abs_residual_ms'),'word_model_mad_ms':result.get('word_model_mad_ms'),'word_model_inlier_ratio_500':result.get('word_model_inlier_ratio_500'),'word_model_coverage_ratio':result.get('word_model_coverage_ratio'),'word_vs_line_shift_diff_ms':result.get('word_vs_line_shift_diff_ms'),'cross_model_conflict':bool(result.get('cross_model_conflict',False)),'match_confidence':result.get('match_confidence','low' if low_confidence else 'high'),'timing_confidence':result.get('timing_confidence','unavailable'),'word_timing_counts':word_counts,'confidence':'low' if low_confidence else 'high','low_confidence':low_confidence,'reason':result.get('reason',''),'core_anchors':core_anchors,'evidence_anchors':evidence_anchors,'candidates':summaries,'finished_at':time.time()}
-        update(jid,status='alignment_review',title=candidate.get('title') or j.get('title',''),artist=candidate.get('artist',''),lyrics='\n'.join(lyrics),alignment={'asr_segments':asr,'lines':lines,'offset_ms':0,'timeline_match':report},error='')
+        identity=resolve_search_identity(j)
+        report.update({**matched_candidate_fields(candidate),'identified_title':identity['title'],
+            'identified_artist':identity['artist'],'identity_source':identity['source']})
+        # The winning lyric sheet never renames the song. It used to: title and
+        # artist were written straight from the candidate, the next re-run then
+        # searched under that name, and the pool narrowed to near-miss titles
+        # until the same wrong sheet won again (《夏天的风》 became 《夏日の風》 and
+        # its verbatim releases became unreachable). What the sheet calls itself
+        # is reported as matched_* and nothing downstream treats it as identity.
+        update(jid,status='alignment_review',lyrics='\n'.join(lyrics),alignment={'asr_segments':asr,'lines':lines,'offset_ms':0,'timeline_match':report},error='')
     except Exception as exc:
         progress.update({'status':'failed','phase':'标准歌词时间轴匹配失败','error':str(exc)[:1000],'finished_at':time.time()})
         try:
@@ -1031,7 +1103,14 @@ def choose_song(jid:str,body:SongIn):
         if text and not re.match(r'^(ar|ti|al|by|offset):',text,re.I) and not is_lyric_metadata(text,body.title,body.artist): raw.append(text)
     old=j.get('alignment') or {}; asr=old.get('asr_segments',old if isinstance(old,list) else [])
     align=align_standard_lyrics(raw,asr)
-    return update(jid,status='alignment_review',title=body.title,artist=body.artist,lyrics='\n'.join(raw),alignment={'asr_segments':asr,'lines':align,'offset_ms':0})
+    # Picking a lyric sheet by hand is still picking a lyric sheet: it records
+    # what was matched, never who the song is. Identity comes from recognition
+    # alone, so this endpoint leaves title, artist and the identity columns
+    # untouched no matter what the chosen sheet calls itself.
+    return update(jid,status='alignment_review',lyrics='\n'.join(raw),
+        alignment={'asr_segments':asr,'lines':align,'offset_ms':0,
+            'timeline_match':{**(old.get('timeline_match') or {} if isinstance(old,dict) else {}),
+                **matched_candidate_fields({'title':body.title,'artist':body.artist,'platform':body.platform,'candidate_id':body.candidate_id})}})
 @app.post('/api/jobs/{jid}/refine-timing')
 def refine_timing(jid:str):
     j=getjob(jid); old=j.get('alignment') or {}; asr=old.get('asr_segments',[]) if isinstance(old,dict) else []
@@ -1145,7 +1224,7 @@ def sync_clip_rename_to_automation(old_path:Path,new_path:Path):
                     c.execute('UPDATE clip_batches SET items=?,updated_at=? WHERE id=?',(json.dumps(items,ensure_ascii=False),time.time(),row['id'])); c.commit()
             except Exception: pass
 
-def adopt_identified_song(jid:str,j:dict[str,Any],hit:dict[str,Any])->dict[str,Any]:
+def adopt_identified_song(jid:str,j:dict[str,Any],hit:dict[str,Any],source:str='shazam')->dict[str,Any]:
     """Take the fingerprinted title as this clip's real name, on disk as well as in the job.
 
     The slice was named from the automation stage's guess off the rough line-level
@@ -1157,7 +1236,10 @@ def adopt_identified_song(jid:str,j:dict[str,Any],hit:dict[str,Any])->dict[str,A
     so a second song that fingerprints the same never overwrites the first.
     """
     source_rel=Path(str(j.get('source') or ''))
-    updates:dict[str,Any]={'title':hit['title']}
+    # A fingerprint is an identification, so this is one of the few places allowed
+    # to write identity -- and it writes the identity columns, not just the
+    # display title, so later lyric searches start from it.
+    updates:dict[str,Any]={'title':hit['title'],**identity_fields(hit['title'],str(hit.get('artist') or ''),source)}
     target_name=safe_clip_name(hit['title'])+source_rel.suffix
     if source_rel.name and target_name!=source_rel.name:
         writable=MEDIA_WRITE/source_rel
@@ -2201,7 +2283,10 @@ def create_imported_song_job(song:dict[str,Any],segments:list[dict[str,Any]],pro
     for line in asr: line['anchors']=character_anchors(line.get('words') or [])
     jid=uuid.uuid4().hex; now=time.time(); style=profile.get('style') or StyleIn().model_dump()
     with db() as c:
-        c.execute('INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(jid,now,now,'song_review',relative,'local',song['title'],'',' '.join(row['text'] for row in asr),json.dumps({'asr_segments':asr,'lines':asr,'offset_ms':0,'automation_import':{'source':song.get('source'),'clip_start_ms':song['clip_start_ms']}},ensure_ascii=False),json.dumps(style,ensure_ascii=False),'',json.dumps({}))); c.commit()
+        # The automation stage read the whole-recording ASR and named this song;
+        # that is an identification, so it seeds identity as well as the title.
+        identity=identity_fields(song['title'],'','deepseek')
+        c.execute(JOB_INSERT,(jid,now,now,'song_review',relative,'local',song['title'],'',' '.join(row['text'] for row in asr),json.dumps({'asr_segments':asr,'lines':asr,'offset_ms':0,'automation_import':{'source':song.get('source'),'clip_start_ms':song['clip_start_ms']}},ensure_ascii=False),json.dumps(style,ensure_ascii=False),'',json.dumps({}),identity['identified_title'],identity['identified_artist'],identity['identity_source'])); c.commit()
     song.update({'project_id':jid,'status':'project_created'}); return getjob(jid)
 
 def process_automation_song(run:dict[str,Any],profile:dict[str,Any],segments:list[dict[str,Any]],songs:list[dict[str,Any]],index:int):

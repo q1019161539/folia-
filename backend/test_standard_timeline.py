@@ -12,6 +12,7 @@ from standard_timeline import (
     is_high_confidence,
     lyric_render_window,
     max_anchor_drift_ms,
+    normalize_identity,
     parse_lrc,
     plain_lyric_lines,
     build_review_assessment,
@@ -20,6 +21,7 @@ from standard_timeline import (
     resolve_deepseek_full_realign,
     score_timeline,
     song_identity_suspicious,
+    title_similarity,
 )
 
 
@@ -533,6 +535,109 @@ class StandardTimelineTests(unittest.TestCase):
         self.assertEqual(resolve_deepseek_full_realign({}, [{"text": "x"}], 0, 1000), [])
         self.assertEqual(resolve_deepseek_full_realign({"lines": "not-a-list"}, [{"text": "x"}], 0, 1000), [])
         self.assertEqual(resolve_deepseek_full_realign(None, [{"text": "x"}], 0, 1000), [])
+
+
+class LineEndTest(unittest.TestCase):
+    """A line is over when its last character is sung. The median row interval was
+    standing in for that measurement and cut real singing: 《夏天的风》 opens with
+    7.3-second lines against a 4.3-second median."""
+
+    @staticmethod
+    def row(text, start, end, words=None):
+        row = {"text": text, "start_ms": start, "end_ms": end}
+        if words is not None:
+            row["words"] = words
+        return row
+
+    def chars(self, text, start, per_char):
+        return [{"text": char, "start_ms": start + index * per_char, "end_ms": start + (index + 1) * per_char}
+                for index, char in enumerate(text)]
+
+    def test_a_slow_line_keeps_its_real_length(self):
+        rows = [
+            self.row("七月的风懒懒的", 0, 7300, self.chars("七月的风懒懒的", 0, 1042)),
+            self.row("不久后天闷闷的", 13500, 17700, self.chars("不久后天闷闷的", 13500, 600)),
+            self.row("气温爬升", 22000, 26000, self.chars("气温爬升", 22000, 1000)),
+            self.row("索性闭上了双眼", 30000, 34000, self.chars("索性闭上了双眼", 30000, 571)),
+        ]
+        lines = build_shifted_timeline(rows, 0, 60000)
+        self.assertEqual(lines[0]["end_ms"], 7294)
+
+    def test_a_row_published_through_an_interlude_ends_with_the_voice(self):
+        """《坏女孩》: the row ran to the next sung line 32 seconds later."""
+        rows = [
+            self.row("最后一句", 0, 32000, self.chars("最后一句", 0, 500)),
+            self.row("间奏后第一句", 32000, 35000, self.chars("间奏后第一句", 32000, 500)),
+        ]
+        lines = build_shifted_timeline(rows, 0, 60000)
+        self.assertEqual(lines[0]["end_ms"], 2000)
+        self.assertLess(lines[0]["end_ms"] - lines[0]["start_ms"], 3000)
+
+    def test_a_row_without_character_times_still_uses_the_interval_cap(self):
+        rows = [
+            self.row("没有字级时间的一行", 0, 32000),
+            self.row("下一行", 32000, 35000),
+            self.row("再下一行", 36000, 39000),
+        ]
+        lines = build_shifted_timeline(rows, 0, 60000)
+        self.assertLess(lines[0]["end_ms"] - lines[0]["start_ms"], 10000)
+
+    def test_a_line_never_runs_into_the_next_one(self):
+        rows = [
+            self.row("这一行的末字拖到下一行之后", 0, 9000, self.chars("这一行的末字拖到下一行之后", 0, 692)),
+            self.row("下一行", 5000, 8000, self.chars("下一行", 5000, 500)),
+        ]
+        lines = build_shifted_timeline(rows, 0, 60000)
+        self.assertLessEqual(lines[0]["end_ms"], lines[1]["start_ms"])
+
+
+class TitleIdentityTest(unittest.TestCase):
+    """Real case: 《读心术》2026-09-18. A Shazam hit spelled 讀心術 made the two
+    verbatim releases spelled 读心术 lose the title comparison, so a line-only
+    release won and the timeline was built on line anchors that were 2.7 s off
+    (word anchors put the shift at -5944 ms, line anchors at -8669 ms)."""
+
+    def test_identity_folds_traditional_and_punctuation(self):
+        self.assertEqual(normalize_identity("讀心術"), normalize_identity("读心术"))
+        self.assertEqual(normalize_identity(" 读心术 (Live) "), "读心术live")
+        self.assertEqual(normalize_identity(""), "")
+
+    def test_same_song_in_either_script_scores_identical(self):
+        self.assertEqual(title_similarity("讀心術", "读心术"), 1.0)
+        self.assertEqual(title_similarity("讀心術", "讀心術"), 1.0)
+        self.assertLess(title_similarity("讀心術", "世界上的另一个我"), 0.5)
+        self.assertEqual(title_similarity("", "读心术"), 0.0)
+
+    def test_verbatim_release_wins_across_scripts(self):
+        fingerprint_title = "讀心術"
+        items = [
+            {
+                "candidate": {"candidate_id": "qq:1130991", "title": "读心术", "timing_type": "verbatim"},
+                "title_similarity": title_similarity(fingerprint_title, "读心术"),
+                "result": {"low_confidence": False, "score": 254.603, "core_anchors": [{}] * 9},
+            },
+            {
+                "candidate": {"candidate_id": "lrclib:30063400", "title": "讀心術", "timing_type": "line"},
+                "title_similarity": title_similarity(fingerprint_title, "讀心術"),
+                "result": {"low_confidence": False, "score": 224.353, "core_anchors": [{}] * 9},
+            },
+        ]
+        self.assertEqual(choose_best_timeline_candidate(items)["candidate"]["candidate_id"], "qq:1130991")
+
+    def test_title_floor_still_blocks_a_verbatim_release_of_another_song(self):
+        items = [
+            {
+                "candidate": {"candidate_id": "qq:999", "title": "另一首歌", "timing_type": "verbatim"},
+                "title_similarity": title_similarity("讀心術", "另一首歌"),
+                "result": {"low_confidence": False, "score": 900, "core_anchors": [{}] * 20},
+            },
+            {
+                "candidate": {"candidate_id": "lrclib:30063400", "title": "读心术", "timing_type": "line"},
+                "title_similarity": title_similarity("讀心術", "读心术"),
+                "result": {"low_confidence": False, "score": 224.353, "core_anchors": [{}] * 9},
+            },
+        ]
+        self.assertEqual(choose_best_timeline_candidate(items)["candidate"]["candidate_id"], "lrclib:30063400")
 
 
 if __name__ == "__main__":

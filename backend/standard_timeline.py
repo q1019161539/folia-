@@ -7,6 +7,35 @@ import re
 import statistics
 from typing import Any
 
+from opencc import OpenCC
+
+
+# Song titles are compared for identity, never rendered, so a traditional and a
+# simplified spelling of the same song has to collapse to one key: a fingerprint
+# hit spelled 讀心術 and a platform release spelled 读心术 are the same song, and
+# treating them as different once cost a whole song its word-timed lyrics -- the
+# verbatim release lost the title-similarity comparison to a line-only one and
+# the timeline was built on anchors that were 2.7 seconds off.
+#
+# Deliberately separate from app.norm_text, which doubles as a per-character
+# punctuation filter whose output other code indexes back into the original
+# string; converting characters there would shift those indices.
+_IDENTITY_T2S = OpenCC("t2s")
+IDENTITY_STRIP = re.compile(r"[^\w㐀-鿿]+")
+
+
+def normalize_identity(text: str) -> str:
+    """Fold a title down to what decides whether two releases are the same song."""
+    return IDENTITY_STRIP.sub("", _IDENTITY_T2S.convert(str(text or "").lower().replace("臺", "台")))
+
+
+def title_similarity(left: str, right: str) -> float:
+    """Compare two titles as identities, blind to 繁简 and punctuation."""
+    first, second = normalize_identity(left), normalize_identity(right)
+    if not first or not second:
+        return 0.0
+    return difflib.SequenceMatcher(None, first, second, autojunk=False).ratio()
+
 
 TIME_TAG = re.compile(r"\[(\d{1,3}):(\d{1,2}(?:\.\d{1,3})?)\]")
 OFFSET_TAG = re.compile(r"\[offset\s*:\s*([+-]?\d+)\]", re.I)
@@ -752,13 +781,29 @@ def build_shifted_timeline(
             standard_end = int(lrc_lines[index + 1]["start_ms"])
         else:
             standard_end = standard_start + tail
-        # Do not hold a line through a clearly exceptional instrumental gap; use
-        # this version's typical row interval as the inferred display duration.
-        # This has to cover a verbatim release's own end_ms too, not just the
-        # inferred one: the last line before an interlude is routinely published
-        # with an end that runs to the next sung line, which left one line of
-        # 《坏女孩》on screen for 32 seconds straight through the break.
-        if standard_end - standard_start > tail * 1.5:
+        # Do not hold a line through a clearly exceptional instrumental gap.
+        #
+        # A row that carries real per-character times already says when it is
+        # over: the moment its last character finishes. That is the measurement,
+        # and it needs no guess -- it still catches 《坏女孩》, whose row was
+        # published with an end running to the next sung line 32 seconds later,
+        # because the singing itself had stopped long before.
+        #
+        # The median row interval was the previous answer, and as one ruler for a
+        # whole song it cut real singing: 《夏天的风》 opens with 7.3-second lines
+        # against a 4.3-second median, so three of them were trimmed by ~3 seconds
+        # and their character times squeezed into the shortened box -- the line
+        # vanished mid-phrase and the karaoke sweep ran ahead of the voice. That
+        # ruler is now only the fallback, for rows that carry no character times
+        # and therefore offer nothing better to measure.
+        sung_end = max(
+            (int(word["end_ms"]) for word in line.get("words") or []
+             if word.get("end_ms") is not None and int(word["end_ms"]) > standard_start),
+            default=None,
+        )
+        if sung_end is not None:
+            standard_end = min(standard_end, sung_end)
+        elif standard_end - standard_start > tail * 1.5:
             standard_end = standard_start + tail
         shifted_start, shifted_end = standard_start + shift_ms, standard_end + shift_ms
         start, end = max(0, shifted_start), min(duration_ms, shifted_end)

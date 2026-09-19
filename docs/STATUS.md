@@ -1,8 +1,20 @@
 # 当前状态
 
-最后整理：2026-09-18
+最后整理：2026-09-19
 
 ## 已上线
+
+- 2026-09-19：**歌曲身份不再允许被歌词候选反向覆盖**，并修掉行尾判据误砍慢句。起因是《读心术》查完对齐后顺藤摸到的一连串问题，最后落到一个自锁的反馈环上。
+  1. **候选标题覆盖项目标题（根因）**：`auto_standard_timeline_task` 结尾用 `title=candidate.get('title')` 把选中歌词的标题写回 job。于是《夏天的风》被 lrclib 一条别名条目改名成《夏日の風》，**下一次重跑就拿这个错名去搜**，候选池退化成 `夏日の風/夏日晚风/夏日之风/夏日寒风/夏日の梦` 一堆近似词，真正的《夏天的风》逐字版（QQ/酷狗都有，46 行 verbatim）再也搜不到，只能退回行级歌词。越重跑越糟。只读审计 46 首有匹配结果的歌：**21 首标题与最初识别名不一致，且 100% 都等于选中候选的标题**——没有第二个机制改过标题。其中多首是改成了另一首歌（`西楼→孩子 (Live)`、`猫咪→他的猫`、`内线→犯贱`、`要抱抱→小野猫 (片段)(DJ默涵版)`），等于选错歌之后把犯罪现场也清理了。
+  2. **改动**：新增 `backend/song_identity.py`。身份只由识别层写入——`create_imported_song_job`（DeepSeek，`identity_source=deepseek`）和 `adopt_identified_song`（指纹，`shazam`/`acrcloud`）；`jobs` 表迁移新增 `identified_title`/`identified_artist`/`identity_source`；歌词搜索改读 `resolve_search_identity(j)`，老项目回退显示标题并标记 `legacy_fallback`。候选信息只进报告的 `matched_title/matched_artist/matched_album/matched_source/matched_candidate_id`。`IDENTITY_SOURCES` 里**没有 `manual`**：人工在歌词页选哪份歌词，和候选自己声称叫什么，是同一种判断换个马甲，放进来等于把环从人工那头重新接上。`PUT /api/jobs/{id}/song` 因此不再写 title/artist。
+  3. **历史回填默认关闭**（`IDENTITY_BACKFILL=1` 才执行）。只读预演 95 个项目：59 个"可回填"里，`很任性 (Live)` 会被退回成指纹已经纠正过的错猜 `人人心`，`归期` 会被指纹自带的装饰名 `归期(动画《凡人修仙传》插曲)` 覆盖，`向左转向右转` 会变成英文名 `Turn Left, Turn Right`（当搜索词更差）。**"能恢复"不等于"恢复的是对的"**，所以历史项目保持 `legacy_fallback` 原样不动，等专门的自动重新识别任务。后续实测又添一个反例：`要抱抱` 这首的 ASR 原文是"我是一只性感的小野猫喵"，DeepSeek 当初的原始名才是错的、被覆盖的名字反而对——历史身份恢复必须走重新识别拿证据，不能信任何单一来源。
+  4. **顺带修掉两个同源问题**：`title_similarity` 之前用 `norm_text` 比较，不做繁简转换，于是 Shazam 给的繁体「讀心術」和平台简体「读心术」相似度只有 **0.333**，`choose_best_timeline_candidate` 的"逐字版优先"窗口（最高分 −0.05）直接把两个逐字版（综合分 251、78 个逐字锚点、p90 382ms）挡在外面，让一个行级版（224、9 个句段起点锚点、p90 1517ms）胜出，整首字幕偏早 2.7 秒还被判高置信。新增 `normalize_identity()`/`title_similarity()`（繁简+标点归一）置于 `standard_timeline.py`，刻意不动 `app.norm_text`——它同时兼着按字符过滤标点的活，有 11 处使用且部分要按下标映射回原文，在那里做繁简转换会让下标错位。同一套函数也用于指纹"是不是另一首歌"的判断，顺带消除了《读心术》切片被反复改名的折腾。
+  5. **行尾判据改用末字时间**（`build_shifted_timeline`）。原来的保险是"行长超过全曲行间隔中位数的 1.5 倍就砍回中位数"，当初为《坏女孩》一行挂屏 32 秒而加。但中位数是一把全曲统一的尺子，对"开头慢、副歌快"的歌会砍掉真唱：《夏天的风》开头三句真实时长 7293/6832/7212 ms，中位数只有 4256 ms，于是被砍掉近 3 秒，`apply_hybrid_words` 还会把这行的字级时间压缩塞进砍短的框里——字幕唱到一半消失、跟唱整体偏快。改为：**带真实字级时间的行，行尾取末字唱完的时刻**（`min(原行尾, 末字 end)`）；没有字级时间的行保留原 `tail` 兜底。《坏女孩》那条照样被挡住——它的行虽然登记了"到下一句为止"，但歌声早停了。全量影子测量 37 首逐字项目：恢复 177 行、收紧 144 行（收紧的是"下一行起点比末字还晚"的，比原来更贴），没有任何行退回兜底路径。
+  6. **另一处必须同时做的**：`INSERT INTO jobs` 原本是按位置的 13 列，加三列身份字段会重演 09-18 那次 `automation_runs` 的列数故障。已改为具名 `JOB_INSERT`，并补了"表上再多一个未来列也不影响插入"的回归测试。
+  测试：新增 `backend/test_song_identity.py`（16 项：身份只能由识别层产生、`manual`/`candidate` 作为来源直接抛错、切换候选只改 `matched_*`、回填不得把可能被污染的当前标题写进身份、指纹优先于 DeepSeek 猜测、搜索必须从 `identified_title` 起）；`backend/test_standard_timeline.py` 新增繁简相似度 4 项和行尾 4 项（含《坏女孩》间奏防回归、《夏天的风》慢句保留）。容器内完整后端套件 **135 项通过**。
+  部署：`backend/app.py`、`backend/standard_timeline.py`、`backend/song_identity.py` 及测试同步后 `docker compose build/up studio-api`。**踩坑记录**：`backend/Dockerfile` 是逐个文件名 COPY 的，新增模块没进清单，首次重建后容器 `ModuleNotFoundError: No module named 'song_identity'` 起不来约 2 分钟（当时队列为空，未影响任何任务）；已把 `song_identity.py` 加入 COPY 清单。以后新增后端模块必须同时改 Dockerfile。
+  验证（只读模拟，未重跑任何历史歌曲）：9 首 `timing_type=line` 的歌分别用"被污染的当前标题"和"最初识别名"重跑候选选择——**前者 7/9 选中逐字版（繁简修复之功），后者 9/9**（身份修复补上《夏天的风》和《爱你》两首）。也就是说所谓的"没有逐字歌词只能走行级"的歌，一首都不是真的。另用 8 个独立测试项目把这批歌渲染到 `Folia成片/_新规则试渲染/逐字优先验证_20260919/` 供人工核对，未覆盖任何历史成片、未改历史项目的对齐记录、未重命名任何切片。
+  仍然待解：(a) `choose_best_timeline_candidate` 的"逐字版优先"只看版本类型、不看这份逐字版是否真的匹配上，实测《爱你》选中一个 **0 个逐字锚点**的逐字版、平移直接跑到 −107 秒，需要给那一键加证据门槛；(b) 标题装饰（`(片段)`、`(DJ默涵版)`、`《X》插曲`）仍会压低正版逐字版的相似度，`归期`/`小野猫` 就栽在这里；(c) 21 首被污染身份的历史项目需要自动重新识别来恢复，连带它们按错名生成的成片目录；(d) `ROLE_LINE` 不认 `Written by：`，`Take My Love` 的制作名单混进了字幕。
 
 - 2026-09-18：修复自动流水线自 09-17 19:05 起**完全停止接收新录播**。起因是用户反馈"自动流程没启动过"：三条规则都启用、容器全部健康、扫描线程也活着（`py-spy` 抓到 `automation-scan` 正停在 `app.py` 的 `automation_wakeup.wait(30)`），数据库没有被锁、`ffprobe` 秒回、按线上真实数据做的只读扫描模拟判定完全正确，但连续 8 小时零排队、零日志、零报错，`automation_seen` 里今早那条 1.93 GiB 的录播永远卡在 `observing / stable=1`。
   1. **根因**：`db()` 里那条 `ALTER TABLE automation_runs ADD COLUMN timings` 把表从 16 列变成 17 列，而 `scan_automation_profile`（自动排队）和 `run_existing_recording`（手动执行历史录播）两处仍是按位置写的 `INSERT INTO automation_runs VALUES(?×16)`，每次都抛 `OperationalError: table automation_runs has 17 columns but 16 values were supplied`；`automation_scan_loop` 外层的 `except Exception: pass` 把异常整个吞掉，于是故障一点痕迹都不留。已在事务里复现并回滚验证（未写入任何数据）。这也意味着**手动执行历史录播此前同样是坏的**。
