@@ -31,6 +31,12 @@ NETEASE_HEADERS={'User-Agent':'Mozilla/5.0','Referer':'https://music.163.com/'}
 BEIJING_TZ=ZoneInfo('Asia/Shanghai')
 MIN_SONG_DURATION_MS=90_000
 SHAZAM_PROBE_MS=30_000; SHAZAM_STEP_MS=25_000
+# Which service answers the identification stage's one fingerprint question.
+# ACRCloud by default since 2026-09-19: Shazam's unofficial endpoint returned
+# nothing for 《不期而遇》 across all 7 windows while 《读心术》 matched at 0 ms in
+# the same minute on the same network -- the chain was healthy, the library just
+# could not place the performance. Set FINGERPRINT_PROVIDER=shazam to switch back.
+FINGERPRINT_PROVIDER=os.getenv('FINGERPRINT_PROVIDER','acrcloud').strip().lower()
 # A fingerprint hit's title is trusted outright unless the candidate pool it leads
 # to gives strong reason not to: real case, a clip fingerprinted as 《值得
 # (Dj版)》when it was actually 云汐's 《离人赋》, and the giveaway was already
@@ -1092,12 +1098,12 @@ def auto_standard_timeline_task(jid:str):
         # 猜歌名同样不可靠（同一段文本换模型给出三个互相矛盾且都错的答案）。指纹识别
         # 直接认原曲，不受识别错字影响，认出来就直接采用、连切片文件名一起改正。
         # 识别不出来时保持原歌名，流程照常。
-        shazam_hit=identify_song_shazam(MEDIA/j['source'],duration_ms,progress,jid,old)
+        shazam_hit,fingerprint_provider=identify_song_fingerprint(MEDIA/j['source'],duration_ms,progress,jid,old)
         identified_by_fingerprint=bool(shazam_hit and normalize_identity(shazam_hit['title'])!=normalize_identity(str(j.get('title') or '')))
         if identified_by_fingerprint:
             progress.update({'phase':f'指纹识别到《{shazam_hit["title"][:20]}》，改用这个歌名'})
             update(jid,status='timeline_matching',alignment={**old,'timeline_match':progress},error='')
-            j=adopt_identified_song(jid,j,shazam_hit)
+            j=adopt_identified_song(jid,j,shazam_hit,fingerprint_provider)
         scored=asyncio.run(collect_standard_timeline_candidates(j,asr,progress))
         if not scored: raise RuntimeError('没有搜索到可比较的标准歌词版本')
         pool_quality=candidate_pool_quality(scored)
@@ -1139,10 +1145,10 @@ def auto_standard_timeline_task(jid:str):
                 progress.update({'phase':'第二意见仍不理想，正在重新扫描指纹确认歌曲身份'})
                 update(jid,status='timeline_matching',alignment={**old,'timeline_match':progress},error='')
                 resume_from_ms=probe_offset_ms+SHAZAM_STEP_MS
-                rescan_hit=identify_song_shazam(MEDIA/j['source'],duration_ms,progress,jid,old,min_offset_ms=resume_from_ms)
+                rescan_hit,_=identify_song_fingerprint(MEDIA/j['source'],duration_ms,progress,jid,old,min_offset_ms=resume_from_ms)
                 identity_rescanned=True
                 if rescan_hit and normalize_identity(rescan_hit['title'])!=normalize_identity(str(j.get('title') or '')):
-                    rescan_j=adopt_identified_song(jid,j,rescan_hit)
+                    rescan_j=adopt_identified_song(jid,j,rescan_hit,fingerprint_provider)
                     rescan_scored=asyncio.run(collect_standard_timeline_candidates(rescan_j,asr,progress))
                     rescan_quality=candidate_pool_quality(rescan_scored)
                     if rescan_scored and rescan_quality['best_anchor_count']>pool_quality['best_anchor_count']:
@@ -1440,6 +1446,44 @@ def identify_song_shazam(source:Path,duration_ms:int,progress:dict[str,Any],jid:
     except Exception:
         return None
     return payload if isinstance(payload,dict) and payload.get('title') else None
+
+def identify_song_acrcloud(source:Path,duration_ms:int,progress:dict[str,Any],jid:str='',old:dict[str,Any]|None=None,min_offset_ms:int=0)->dict[str,Any]|None:
+    """Walk the clip with ACRCloud, first hit wins.
+
+    Same shape as the Shazam probe it replaces, and the same reasoning behind it:
+    a cover only fingerprints where the performance tracks the release closely,
+    so consecutive overlapping windows cover the clip instead of a few spread
+    probes that can all miss the one stretch that matches.
+
+    ACRCloud is the primary identifier because Shazam's unofficial endpoint
+    silently returned nothing for real songs it should know -- 《不期而遇》 came
+    back empty from all 7 windows while 《读心术》 matched at 0 ms in the same
+    minute on the same network, so the chain was intact and the library simply
+    could not place the performance. Whether ACRCloud does better on live covers
+    is what this switch is for.
+
+    Never raises and never fails the task: no hit leaves the existing title in place.
+    """
+    if not (ACRCLOUD_ACCESS_KEY and ACRCLOUD_ACCESS_SECRET and ACRCLOUD_HOST): return None
+    offsets=list(range(min_offset_ms,max(min_offset_ms+1,duration_ms-10000),SHAZAM_STEP_MS))[:24]
+    if not offsets: return None
+    progress.update({'phase':'正在用音频指纹识别歌曲'})
+    if jid:
+        try: update(jid,status='timeline_matching',alignment={**(old or {}),'timeline_match':progress},error='')
+        except Exception: pass
+    deadline=time.monotonic()+240
+    for offset in offsets:
+        if time.monotonic()>=deadline: break
+        hit=acrcloud_identify_window(source,offset,ACRCLOUD_ACCESS_KEY,ACRCLOUD_ACCESS_SECRET,ACRCLOUD_HOST,SHAZAM_PROBE_MS)
+        if hit and str(hit.get('title') or '').strip():
+            return {**hit,'matched_at_ms':offset}
+    return None
+
+def identify_song_fingerprint(source:Path,duration_ms:int,progress:dict[str,Any],jid:str='',old:dict[str,Any]|None=None,min_offset_ms:int=0):
+    """The identification stage's one fingerprint call, and which service answered it."""
+    if FINGERPRINT_PROVIDER=='shazam':
+        return identify_song_shazam(source,duration_ms,progress,jid,old,min_offset_ms),'shazam'
+    return identify_song_acrcloud(source,duration_ms,progress,jid,old,min_offset_ms),'acrcloud'
 
 def align_single_asr_segment(source:Path,seg:dict[str,Any],duration_ms:int,padding_ms:int=500):
     """Best-effort local repair: force-align one ASR segment on its own narrow window.
