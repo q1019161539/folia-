@@ -116,8 +116,39 @@ ASR_SEGMENTS:
 仅输出 JSON：
 {"mappings":[{"line_id":0,"segment_ids":[12,13],"confidence":0.96,"status":"matched"},{"line_id":1,"segment_ids":[],"confidence":0,"status":"needs_review"}]}'''
 
+_schema_ready=threading.Event()
+
+@contextlib.contextmanager
 def db():
-    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row
+    """One connection per block, closed on the way out.
+
+    This used to hand back a bare connection, and `with db() as c` only opened a
+    transaction -- it never closed anything. The connections then waited on the
+    garbage collector while holding their file handles and, where a cursor was
+    left part-read, a shared lock: 66 descriptors onto studio.db were open at
+    once on 2026-09-19, and the same day a retry request died on "database is
+    locked" while every read on the box kept working. The busy timeout is also
+    raised from sqlite3's 5 seconds, so a writer queues behind a long read
+    instead of giving up on it.
+
+    The schema is settled once per process rather than on every call: six CREATE
+    TABLE statements and two PRAGMA scans ran on each of the thirty-three call
+    sites, several of them inside per-anchor loops.
+    """
+    c=sqlite3.connect(DB,timeout=30); c.row_factory=sqlite3.Row
+    try:
+        if not _schema_ready.is_set():
+            ensure_schema(c); _schema_ready.set()
+        yield c
+        c.commit()
+    except BaseException:
+        try: c.rollback()
+        except Exception: pass
+        raise
+    finally:
+        c.close()
+
+def ensure_schema(c):
     c.execute('CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,created_at REAL,updated_at REAL,status TEXT,source TEXT,engine TEXT,title TEXT,artist TEXT,lyrics TEXT,alignment TEXT,style TEXT,error TEXT,output TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS clip_batches(id TEXT PRIMARY KEY,created_at REAL,updated_at REAL,status TEXT,source TEXT,padding REAL,mode TEXT,items TEXT,current_index INTEGER,progress REAL,output_dir TEXT,error TEXT,log TEXT,cancel_requested INTEGER DEFAULT 0)')
     c.execute('CREATE TABLE IF NOT EXISTS automation_profiles(id TEXT PRIMARY KEY,created_at REAL,updated_at REAL,name TEXT,path TEXT,enabled INTEGER,enabled_at REAL,min_bytes INTEGER,min_confidence REAL,padding REAL,style TEXT)')
@@ -135,7 +166,7 @@ def db():
     job_columns={row['name'] for row in c.execute('PRAGMA table_info(jobs)')}
     for column in ('identified_title','identified_artist','identity_source'):
         if column not in job_columns: c.execute(f'ALTER TABLE jobs ADD COLUMN {column} TEXT')
-    c.commit(); return c
+    c.commit()
 def fid(path:Path): return base64.urlsafe_b64encode(str(path.relative_to(MEDIA)).encode()).decode().rstrip('=')
 def fpath(id:str):
     try: rel=base64.urlsafe_b64decode(id+'='*(-len(id)%4)).decode(); p=(MEDIA/rel).resolve()
@@ -1550,14 +1581,28 @@ def force_align_task_locked(jid:str,language:str='Chinese'):
                 preserved+=1; continue
             asr_start=int(line.get('asr_start_ms',row['start'])); asr_end=int(line.get('asr_end_ms',row['end']))
             fixed=has_standard_timeline(line)
-            reliable_asr=has_asr_evidence(line) and line.get('asr_start_ms') is not None and line.get('asr_end_ms') is not None
             if fixed:
-                padding=1200 if reliable_asr else 2500
-                bound_start=max(0,asr_start-padding); bound_end=min(duration_ms,asr_end+padding)
-            else:
-                padding=300; bound_start=max(0,asr_start-padding); bound_end=min(duration_ms,asr_end+padding)
-            standard_duration_ms=int(line['standard_end_ms'])-int(line['standard_start_ms']) if fixed and line.get('standard_start_ms') is not None and line.get('standard_end_ms') is not None else None
-            candidates.append({'index':index,'text':line['text'],'start_ms':asr_start,'end_ms':asr_end,'estimated':False,'fixed_timeline':fixed,'reliable_asr':reliable_asr,'padding_ms':padding,'bound_start':bound_start,'bound_end':bound_end,'clip_bound_start':bound_start,'clip_bound_end':bound_end,'standard_duration_ms':standard_duration_ms})
+                # A standard lyric row is finished the moment it is shifted. The
+                # release's own timing is internally correct and one whole-song
+                # shift is the only thing we know well enough to apply to it;
+                # this stage is not allowed to touch it again, box or characters.
+                #
+                # It used to realign every such row and write back both the box
+                # and the character times, which is only ever as good as the
+                # evidence underneath. 《身骑白马》 carried ASR evidence on 2 of its
+                # 31 rows, and the rewrite squeezed 《放下西凉 没人管》 from the
+                # sheet's 6585ms to 3520ms while stretching 《我一心只想 王宝钏》
+                # from 9152ms to 12160ms -- rows the sheet itself had spaced
+                # evenly, now sweeping at wildly different speeds. Where real
+                # character times exist they already came from the release and
+                # from apply_hybrid_words during the timeline stage.
+                preserved+=1; continue
+            # Only rows without a standard timeline reach here -- ASR-derived rows
+            # and hand-pasted lyrics, which have nothing but this stage to time
+            # them. The wide 1200/2500ms windows went with the standard rows.
+            reliable_asr=has_asr_evidence(line) and line.get('asr_start_ms') is not None and line.get('asr_end_ms') is not None
+            padding=300; bound_start=max(0,asr_start-padding); bound_end=min(duration_ms,asr_end+padding)
+            candidates.append({'index':index,'text':line['text'],'start_ms':asr_start,'end_ms':asr_end,'estimated':False,'fixed_timeline':False,'reliable_asr':reliable_asr,'padding_ms':padding,'bound_start':bound_start,'bound_end':bound_end,'clip_bound_start':bound_start,'clip_bound_end':bound_end,'standard_duration_ms':None})
         if not candidates and not preserved: raise RuntimeError('没有可对齐的标准歌词行，请先采用标准歌词并完成粗对齐')
         raw_reliable=sum(1 for line in lines if line.get('status')!='asr' and has_asr_evidence(line) and int(line.get('end_ms',0))>int(line.get('start_ms',0)))
         standard_total=sum(1 for line in lines if line.get('status')!='asr' and not line.get('deleted') and str(line.get('text','')).strip())
@@ -1903,6 +1948,21 @@ def render_task(jid,sample,start_ms,output_mode='fast',pre_acquired=False):
         if not acquired:
             if not render_lock.acquire(False): raise RuntimeError('已有成片正在渲染，请稍后再试')
             acquired=True
+        # Rendering belongs in the same memory domain as the models, not beside
+        # it. render_lock only ever answered "is another render running"; it said
+        # nothing about the ASR or aligner, so a render could start on top of
+        # them. On 2026-09-19 this box stopped answering ping altogether and had
+        # to be power-cycled, with an ASR and a render overlapping on 15 GiB.
+        # Two locks that each believe themselves safe is exactly the shape of
+        # that failure -- so a render now waits for the one slot like everything
+        # else that needs real memory.
+        with heavy_ai_slot(label=f'渲染：{getjob(jid).get("title") or jid[:8]}'):
+            render_task_locked(jid,sample,start_ms,output_mode)
+    finally:
+        if acquired: render_lock.release()
+
+def render_task_locked(jid,sample,start_ms,output_mode='fast'):
+    try:
         j=getjob(jid); style=j['style'] or {}
         if style.get('effect')=='folia-native':
             render_folia_native_locked(jid,j,sample,start_ms,output_mode); return
@@ -1981,8 +2041,6 @@ def render_task(jid,sample,start_ms,output_mode='fast',pre_acquired=False):
             os.replace(trimmed,out); direct_trimmed=True
         manifest={'source':str(source),'output':str(out),'style':style,'timeline_match':al.get('timeline_match') if isinstance(al,dict) else None,'trim_start_ms':trim_start_ms,'trim_end_ms':trim_end_ms,'edge_padding_ms':5000 if not sample else None,'post_render_stream_copy_trim':direct_trimmed,'created_at':datetime.now(BEIJING_TZ).isoformat(),'renderer':'ffmpeg-ass-v1'}; (outdir/(stem+'.render.json')).write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8'); update(jid,status='completed',output={'path':str(out),'sample':sample,'size':out.stat().st_size,'low_confidence':low_confidence,'confidence_tier':confidence_tier,'trim_start_ms':trim_start_ms,'trim_end_ms':trim_end_ms,'post_render_stream_copy_trim':direct_trimmed})
     except Exception as e: update(jid,status='failed',error=str(e)[:2000])
-    finally:
-        if acquired: render_lock.release()
 @app.post('/api/jobs/{jid}/preview-video')
 def preview_video(jid:str,body:RenderIn):
     getjob(jid)
@@ -2458,7 +2516,17 @@ def process_automation_run(run_id:str):
             update_automation_run(run_id,songs=songs,error='',stage='analyzed')
         publish_automation_song_analysis(get_automation_run(run_id,True),profile,songs)
         if not songs:
-            update_automation_run(run_id,status='completed',stage='completed',current_song=-1); return
+            # A recording with no singing still gets a closing message. Returning
+            # here silently left the reader with "transcribing started" and
+            # "transcribing done" and nothing after, which reads exactly like a
+            # run that hung.
+            finished=update_automation_run(run_id,status='completed',stage='completed',current_song=-1)
+            timings=mark_run_timing(run_id,songs_finished_at=time.time())
+            notify_automation_stage('outputs_completed',finished,completed_count=0,failed_count=0,
+                skipped_count=0,output_path='',songs=[],
+                elapsed_seconds=stage_elapsed(timings,'asr_started_at','songs_finished_at'),
+                render_wait_seconds=timings.get('render_wait_seconds') or 0)
+            return
         songs=create_automation_clip_batch(get_automation_run(run_id,True),profile,songs)
         for index in range(len(songs)):
             process_automation_song(get_automation_run(run_id,True),profile,segments,songs,index)

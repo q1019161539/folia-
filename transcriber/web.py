@@ -140,6 +140,12 @@ def build_command(job: dict[str, Any]) -> list[str]:
         command += ["--test-minutes", str(options["test_minutes"])]
     if options.get("skip_separation"):
         command.append("--skip-separation")
+    else:
+        # main.py defaults to skipping, so leaving the flag off is not the same
+        # as asking for separation -- it is asking for nothing. A request that
+        # said separate_vocals ran an ordinary ASR over the original mix instead,
+        # and the only sign was separation_seconds: 0.0 in the stats afterwards.
+        command.append("--with-separation")
     if options.get("skip_alignment"):
         command.append("--skip-alignment")
     if options.get("no_vad"):

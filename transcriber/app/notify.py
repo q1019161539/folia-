@@ -143,6 +143,12 @@ def _outputs_body(payload: dict[str, object]) -> list[list[str]]:
         blocks.append(block)
     if normal:
         blocks.append([f"✅ 其余 {len(normal)} 首未发现明显风险"])
+    if not songs and not completed and not failed and not skipped:
+        # A recording with no singing in it used to end in silence: the pipeline
+        # returned early and this message was never sent, so the reader saw
+        # "transcribing started", "transcribing done", and then nothing at all --
+        # indistinguishable from a run that hung.
+        blocks.append(["🔇 本场未检出歌曲，没有需要查看的成片"])
     output_path = _clip(payload.get("output_path"), 400)
     if output_path:
         blocks.append([f"📁 {output_path}"])

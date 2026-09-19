@@ -18,6 +18,18 @@ class OutputsNotificationTests(unittest.TestCase):
         payload.update(extra)
         return automation_notification(payload)
 
+    def test_a_recording_without_songs_still_says_so(self):
+        """The pipeline used to return early here and send nothing, leaving
+        "transcribing done" as the last word -- unreadable against a hung run."""
+        _, content = self.base([], output_path="")
+        self.assertIn("🔇 本场未检出歌曲", content)
+        self.assertIn("结果：成功 0｜失败 0｜跳过 0", content)
+        self.assertNotIn("✅ 其余", content)
+
+    def test_the_no_songs_line_stays_out_of_a_normal_run(self):
+        _, content = self.base([song("歌一"), song("歌二")])
+        self.assertNotIn("未检出歌曲", content)
+
     def test_normal_songs_are_counted_not_listed(self):
         # A dozen healthy songs listed by name would bury the one that needs
         # opening, which is the whole point of the message.

@@ -135,5 +135,50 @@ class NoCandidateWriteBackTest(unittest.TestCase):
         self.assertNotIn("title=str(j.get('title')", collect)
 
 
+class HeavyWorkShareOneSlotTest(unittest.TestCase):
+    """render_lock only ever answered "is another render running". On 2026-09-19
+    this box stopped answering ping and had to be power-cycled with an ASR and a
+    render overlapping on 15 GiB -- two locks each believing themselves safe."""
+
+    def test_rendering_waits_for_the_same_slot_as_the_models(self):
+        body = APP.split("def render_task(", 1)[1].split("def render_task_locked", 1)[0]
+        self.assertIn("heavy_ai_slot(", body)
+        self.assertIn("render_task_locked(", body)
+
+    def test_the_render_body_no_longer_owns_the_lock_itself(self):
+        body = APP.split("def render_task_locked(", 1)[1].split("@app.post('/api/jobs/{jid}/preview-video')", 1)[0]
+        self.assertNotIn("render_lock.release()", body)
+        self.assertNotIn("render_lock.acquire", body)
+
+    def test_every_heavy_stage_names_the_same_slot(self):
+        for marker in ("整场 ASR：", "逐字对齐：", "手动识别：", "渲染：", "人声分离重识别："):
+            self.assertIn(marker, APP, marker)
+
+
+class StandardTimelineIsFinalTest(unittest.TestCase):
+    """A standard lyric row is finished the moment it is shifted. 《身骑白马》 carried
+    ASR evidence on 2 of its 31 rows, and forced alignment still rewrote every box:
+    《放下西凉 没人管》 went from the sheet's 6585ms to 3520ms while 《我一心只想 王宝钏》
+    went from 9152ms to 12160ms -- rows the sheet itself had spaced evenly."""
+
+    def test_forced_alignment_skips_rows_that_already_have_a_standard_timeline(self):
+        stage = APP.split("def force_align_task_locked", 1)[1].split("if not candidates and not preserved", 1)[0]
+        self.assertIn("fixed=has_standard_timeline(line)", stage)
+        guard = stage.split("fixed=has_standard_timeline(line)", 1)[1].split("reliable_asr=", 1)[0]
+        self.assertIn("if fixed:", guard)
+        self.assertIn("preserved+=1; continue", guard)
+
+    def test_the_widened_windows_for_standard_rows_are_gone(self):
+        """1200/2500ms windows only ever existed to realign standard rows."""
+        stage = APP.split("def force_align_task_locked", 1)[1].split("if not candidates and not preserved", 1)[0]
+        self.assertNotIn("1200 if reliable_asr else 2500", stage)
+
+    def test_a_standard_row_never_has_its_box_rewritten(self):
+        write_back = APP.split("lines[index]['words']=words; lines[index]['anchors']=words", 1)[1][:400]
+        self.assertIn("lines[index]['start_ms']=words[0]['start_ms']", write_back)
+        stage = APP.split("def force_align_task_locked", 1)[1].split("if not candidates and not preserved", 1)[0]
+        self.assertIn("'fixed_timeline':False", stage)
+
+
 if __name__ == "__main__":
     unittest.main()
