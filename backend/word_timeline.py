@@ -54,6 +54,47 @@ def timed_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if row.get("start_ms") is not None]
 
 
+def provider_char_count(rows: list[dict[str, Any]]) -> int:
+    """How many characters the aligner can actually match on.
+
+    Deliberately the same units the matcher consumes, rather than len(text): a
+    second counting rule would measure a different song than the one being
+    aligned.
+    """
+    return sum(len(_provider_chars(row)) for row in rows)
+
+
+def word_anchor_coverage(word_anchor_count: int, rows: list[dict[str, Any]]) -> float | None:
+    """Share of the release's characters that found a live counterpart."""
+    total = provider_char_count(rows)
+    if not total:
+        return None
+    return max(0, int(word_anchor_count)) / total
+
+
+def separation_retry_needed(
+    timing_type: str,
+    word_anchor_count: int,
+    rows: list[dict[str, Any]],
+    threshold: float,
+) -> bool:
+    """Would re-reading this clip from separated vocals be worth ~9 GiB and a quarter hour?
+
+    Only for a word-timed release -- a line-only sheet has no character times to
+    match against, so a cleaner ASR would change nothing about its anchors.
+
+    Coverage across 37 finished verbatim songs ran min 0%, median 10.3%, max
+    28.9%, and the starved ones sat far below: 《心之火》 1.6% (7 anchors out of
+    432 characters) against 《读心术》 17.4% (78 of 449). 《心之火》 re-read from
+    separated vocals went from 95 recognised characters to 767, and from 7 word
+    anchors to 80, with the word residual median dropping 158ms -> 46ms.
+    """
+    if str(timing_type) != "verbatim" or threshold <= 0:
+        return False
+    coverage = word_anchor_coverage(word_anchor_count, rows)
+    return coverage is not None and coverage < threshold
+
+
 def _char_units(text: str, start_ms: int | None, end_ms: int | None) -> list[dict[str, Any]]:
     characters = list(str(text or ""))
     if not characters:

@@ -408,9 +408,13 @@ def create_job():
         separation_model = str(payload.get("separation_model", "htdemucs"))
         if separation_model not in {"htdemucs", "mdx_q"}:
             raise ValueError("未知分离模型")
-        # Vocal separation is temporarily disabled in the Web app. Keep the
-        # underlying CLI module available for future comparisons.
-        asr_source = "mix"
+        # Separation stays off for everything that does not ask for it by name:
+        # it costs ~9 GiB peak and about 1.5x realtime on top of the ASR, which is
+        # why the workbench never offers it. The studio asks for it on one clip at
+        # a time, only when a song's word anchors came back too sparse to align
+        # on, and only while holding the single big-model slot.
+        separate_vocals = bool(payload.get("separate_vocals", False))
+        asr_source = "vocals" if separate_vocals else "mix"
         asr_engine = str(payload.get("asr_engine", "local"))
         if asr_engine not in {"local", "aliyun"}:
             raise ValueError("未知 ASR 引擎")
@@ -438,7 +442,7 @@ def create_job():
             "separation_model": separation_model,
             "asr_source": asr_source,
             "asr_engine": asr_engine,
-            "skip_separation": True,
+            "skip_separation": not separate_vocals,
             "skip_alignment": bool(payload.get("skip_alignment", False)),
             "no_vad": bool(payload.get("no_vad", False)),
             "notification_mode": "automation" if payload.get("notification_mode") == "automation" else "default",

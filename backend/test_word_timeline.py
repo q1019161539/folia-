@@ -1,7 +1,14 @@
 ﻿import unittest
 
 from standard_timeline import build_shifted_timeline
-from word_timeline import apply_hybrid_words, normalize_provider_rows, score_provider_timeline
+from word_timeline import (
+    apply_hybrid_words,
+    normalize_provider_rows,
+    provider_char_count,
+    score_provider_timeline,
+    separation_retry_needed,
+    word_anchor_coverage,
+)
 
 
 def provider_row(text, start):
@@ -381,6 +388,56 @@ class WordTimelineTests(unittest.TestCase):
         result = score_provider_timeline(rows, asr, title_score=1)
         self.assertEqual(result["word_anchor_count"], 0)
         self.assertFalse(result["low_confidence"])
+
+
+class SeparationRetryTriggerTest(unittest.TestCase):
+    """《心之火》 matched 7 of its 432 characters against a mix the ASR could barely
+    hear; read back from separated vocals it matched 80. 《读心术》 matched 78 of 449
+    on the first pass and has nothing to gain. Coverage across 37 finished verbatim
+    songs: median 10.3%, starved ones far below."""
+
+    @staticmethod
+    def row(text, start, per_char=300):
+        return {"text": text, "start_ms": start,
+                "end_ms": start + per_char * len(text),
+                "words": [{"text": char, "start_ms": start + index * per_char,
+                           "end_ms": start + (index + 1) * per_char}
+                          for index, char in enumerate(text)]}
+
+    def sheet(self, lines=10, text="我只想让你回到最初"):
+        return [self.row(text, 10_000 + index * 4000) for index in range(lines)]
+
+    def test_char_count_ignores_what_the_matcher_ignores(self):
+        rows = [self.row("你好 世界！", 1000)]
+        self.assertEqual(provider_char_count(rows), 4)
+
+    def test_coverage_is_anchors_over_matchable_characters(self):
+        rows = self.sheet(lines=10)
+        self.assertEqual(provider_char_count(rows), 90)
+        self.assertAlmostEqual(word_anchor_coverage(9, rows), 0.1)
+        self.assertAlmostEqual(word_anchor_coverage(0, rows), 0.0)
+
+    def test_a_starved_verbatim_song_is_worth_re_reading(self):
+        rows = self.sheet(lines=10)
+        self.assertTrue(separation_retry_needed("verbatim", 5, rows, 0.10))
+
+    def test_a_well_covered_song_is_left_alone(self):
+        rows = self.sheet(lines=10)
+        self.assertFalse(separation_retry_needed("verbatim", 18, rows, 0.10))
+        self.assertFalse(separation_retry_needed("verbatim", 9, rows, 0.10))
+
+    def test_a_line_only_release_never_triggers_it(self):
+        """No character times to match against, so a cleaner ASR changes nothing."""
+        rows = self.sheet(lines=10)
+        self.assertFalse(separation_retry_needed("line", 0, rows, 0.10))
+
+    def test_a_zero_threshold_disables_the_retry(self):
+        rows = self.sheet(lines=10)
+        self.assertFalse(separation_retry_needed("verbatim", 0, rows, 0.0))
+
+    def test_no_characters_means_no_verdict_rather_than_a_retry(self):
+        self.assertIsNone(word_anchor_coverage(0, []))
+        self.assertFalse(separation_retry_needed("verbatim", 0, [], 0.10))
 
 
 if __name__ == "__main__":

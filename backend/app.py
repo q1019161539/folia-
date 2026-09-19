@@ -12,7 +12,7 @@ from song_identity_diagnostics import acrcloud_identify_window
 import ai_slot
 from pipeline_eta import estimate_asr, estimate_songs
 from standard_timeline import build_review_assessment, build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, clamp_forced_words, confidence_output_folder, estimate_untimed_timeline, find_suspect_anchor_regions, is_high_confidence, is_lyric_metadata, lyric_render_window, normalize_identity, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, song_identity_suspicious, title_similarity as compare_titles
-from word_timeline import apply_hybrid_words, normalize_provider_rows, score_provider_timeline, timed_rows
+from word_timeline import apply_hybrid_words, normalize_provider_rows, score_provider_timeline, separation_retry_needed, timed_rows, word_anchor_coverage
 from automation import MIN_RECORDING_BYTES, automation_transcriber_payload, broadcaster_directories, eligible_recording, parse_ai_json, project_transcript, recording_choices, restore_completed_clip_paths, transcript_for_ai, transcript_segments, validate_detected_songs
 from folia_native import FOLIA_EFFECTS, FOLIA_RENDERER_REVISION, apply_folia_preview_profile, build_folia_config, normalized_folia_settings
 from song_identity import backfill_identity, identity_fields, matched_candidate_fields, resolve_search_identity
@@ -931,6 +931,115 @@ async def collect_standard_timeline_candidates(j:dict[str,Any],asr:list[dict[str
     progress['lddc_fallback']=lddc_failed
     return scored
 
+# Reading a clip back from separated vocals costs ~9 GiB peak and roughly a
+# quarter hour for a three-minute song, so it is reserved for songs whose word
+# anchors came back too sparse to align on. 10% of the release's characters is
+# the line: across 37 finished verbatim songs coverage ran median 10.3%, and the
+# starved ones sat far below it -- 《心之火》 at 1.6% (7 anchors of 432 characters)
+# against 《读心术》 at 17.4%. Re-read from vocals, 《心之火》 went from 95 recognised
+# characters to 767 and from 7 word anchors to 80, its word residual median
+# falling 158ms -> 46ms.
+SEPARATION_RETRY_COVERAGE=float(os.getenv('SEPARATION_RETRY_COVERAGE','0.10'))
+SEPARATION_RETRY_MODEL=os.getenv('SEPARATION_RETRY_MODEL','mdx_q')
+
+def separation_cache_key(clip:Path)->str:
+    """Identify the exact work, not just its output file.
+
+    Keyed on the clip itself plus the separator and the ASR settings, so changing
+    the model or the VAD setting invalidates the result instead of silently
+    reusing a recording separated under different parameters.
+    """
+    stat=clip.stat()
+    return f'{stat.st_size}:{int(stat.st_mtime)}:{SEPARATION_RETRY_MODEL}:vocals:no_vad'
+
+def wait_transcriber_job(jid:str,job_id:str,progress:dict[str,Any],old:dict[str,Any]):
+    while True:
+        job=transcriber_request('GET',f'/api/jobs/{job_id}').json()
+        status=job.get('status')
+        if status=='completed': return job
+        if status in ('failed','cancelled','interrupted'):
+            raise RuntimeError('人声分离重识别失败：'+str(job.get('error') or job.get('progress_label') or status))
+        progress.update({'phase':f'人声分离重识别：{job.get("progress_label") or status}',
+            'separation_percent':job.get('progress')})
+        try: update(jid,alignment={**old,'timeline_match':progress})
+        except Exception: pass
+        time.sleep(10)
+
+def maybe_retry_with_separated_vocals(jid:str,j:dict[str,Any],chosen:dict[str,Any],scored:list[dict[str,Any]],
+        asr:list[dict[str,Any]],progress:dict[str,Any]):
+    """Re-read this one clip from separated vocals when its word anchors are too sparse.
+
+    The whole call holds the single big-model slot, separation included. The two
+    must not get a lock each: separation peaks around 9 GiB and the ASR
+    subprocess has been measured at 7.7 GiB, and two locks that each believe
+    themselves safe is exactly how the 2026-09-17 OOM happened.
+
+    Every candidate is scored again against the cleaner ASR, not just the one
+    that won -- better evidence can change which release fits best, and rescoring
+    costs nothing because the lyric sheets are already in hand.
+    """
+    report={'applied':False,'reason':'','coverage':None}
+    candidate,result=chosen['candidate'],chosen['result']
+    rows=chosen.get('provider_rows') or []
+    coverage=word_anchor_coverage(int(result.get('word_anchor_count',0)),rows) if rows else None
+    report['coverage']=round(coverage,4) if coverage is not None else None
+    if not separation_retry_needed(str(candidate.get('timing_type','')),int(result.get('word_anchor_count',0)),
+            rows,SEPARATION_RETRY_COVERAGE):
+        report['reason']='not_needed'
+        return chosen,scored,asr,report
+    clip=MEDIA/str(j.get('source') or '')
+    try: key=separation_cache_key(clip)
+    except OSError:
+        report['reason']='clip_missing'
+        return chosen,scored,asr,report
+    previous=(j.get('alignment') or {}).get('separation_retry') or {}
+    if previous.get('key')==key:
+        # Already read from vocals; the segments in hand are that result.
+        report.update({'reason':'already_applied','key':key})
+        return chosen,scored,asr,report
+    progress.update({'phase':f'逐字证据不足（{coverage:.1%}），正在用人声分离重新识别','separation_retry':True})
+    try: update(jid,alignment={**(j.get('alignment') or {}),'timeline_match':progress})
+    except Exception: pass
+    try:
+        payload={'input':str(j.get('source') or ''),'stage':'all','run_id':'sep-'+jid[:20],
+            'chunk_seconds':180,'asr_engine':'local','skip_alignment':False,'no_vad':True,
+            'separate_vocals':True,'separation_model':SEPARATION_RETRY_MODEL,
+            'notification_mode':'automation'}
+        with heavy_ai_slot(label=f'人声分离重识别：{j.get("title") or jid[:8]}'):
+            job=transcriber_request('POST','/api/jobs',json=payload).json()
+            finished=wait_transcriber_job(jid,job['id'],progress,j.get('alignment') or {})
+        response=transcriber_request('GET',f'/api/jobs/{job["id"]}/download/transcript.jsonl?inline=1')
+        fresh=transcript_segments([json.loads(line) for line in response.text.splitlines() if line.strip()])
+        if not fresh: raise RuntimeError('人声分离重识别没有产出句段')
+    except Exception as exc:
+        # A failed retry must not cost the song its timeline: keep the original
+        # ASR and the candidate already chosen.
+        report.update({'reason':'failed','error':str(exc)[:200]})
+        progress.pop('separation_retry',None)
+        return chosen,scored,asr,report
+    rescored=[]
+    for item in scored:
+        meta=item['candidate']
+        if item['timed'] and item.get('provider_rows') and meta.get('timing_type')=='verbatim':
+            fresh_result=score_provider_timeline(item['timed'],fresh,title_score=item['title_similarity'])
+        elif item['timed']:
+            fresh_result=score_timeline(item['timed'],fresh,title_score=item['title_similarity'])
+        else:
+            fresh_result=item['result']
+        rescored.append({**item,'result':fresh_result})
+    usable=[item for item in rescored if item['timed'] and item['result'].get('core_anchors')]
+    best=choose_best_timeline_candidate(usable) if usable else chosen
+    after=word_anchor_coverage(int(best['result'].get('word_anchor_count',0)),best.get('provider_rows') or [])
+    report.update({'applied':True,'reason':'ok','key':key,'model':SEPARATION_RETRY_MODEL,
+        'coverage_after':round(after,4) if after is not None else None,
+        'word_anchor_count_before':int(result.get('word_anchor_count',0)),
+        'word_anchor_count_after':int(best['result'].get('word_anchor_count',0)),
+        'asr_segments_before':len(asr),'asr_segments_after':len(fresh),
+        'candidate_before':candidate.get('candidate_id'),'candidate_after':best['candidate'].get('candidate_id'),
+        'finished_at':time.time()})
+    progress.pop('separation_retry',None)
+    return best,rescored,fresh,report
+
 def auto_standard_timeline_task(jid:str):
     progress={'status':'running','phase':'正在准备标准歌词候选','started_at':time.time(),'queries_done':0,'queries_total':0,'candidates_done':0,'candidates_total':0}
     try:
@@ -1015,6 +1124,10 @@ def auto_standard_timeline_task(jid:str):
         # 真正的硬失败只剩"连一个候选都搜不到"或者补救链跑完仍然建不出任何时间轴
         # 这两种情况（下面 if not lines 那一行）。
         chosen=choose_best_timeline_candidate(usable) if usable else max(scored,key=lambda x:float(x['result'].get('score',0)))
+        chosen,scored,asr,separation=maybe_retry_with_separated_vocals(jid,j,chosen,scored,asr,progress)
+        if separation.get('applied'):
+            old={**old,'asr_segments':asr}
+            update(jid,alignment={**old,'timeline_match':progress})
 
         candidate,result=chosen['candidate'],chosen['result']
         # 判定一律只读 core_anchors——那是核心锚点链，是这首歌的时钟；evidence_anchors
@@ -1069,14 +1182,17 @@ def auto_standard_timeline_task(jid:str):
         report={'status':'completed','mode':mode,'platform':candidate.get('platform','netease'),'candidate_id':candidate['candidate_id'],'song_id':candidate.get('song_id',''),'lddc_ref':chosen.get('lddc_ref',''),'timing_type':candidate.get('timing_type','line'),'word_coverage':candidate.get('word_coverage',0),'title':candidate.get('title',''),'artist':candidate.get('artist',''),'album':candidate.get('album',''),'shift_ms':shift_ms,'shift_min_ms':result.get('shift_min_ms'),'shift_max_ms':result.get('shift_max_ms'),'shift_range_ms':result.get('shift_range_ms'),'anchor_count':len(core_anchors),'evidence_anchor_count':len(evidence_anchors),'evidence_added_count':len(evidence_anchors)-len(core_anchors),'anchor_span_ms':result.get('anchor_span_ms',0),'core_span_ms':result.get('core_span_ms',0),'residual_p90_ms':result.get('residual_p90_ms'),'median_abs_residual_ms':result.get('median_abs_residual_ms'),'mad_ms':result.get('mad_ms'),'max_anchor_drift_ms':result.get('max_anchor_drift_ms'),'long_baseline_pairs':result.get('long_baseline_pairs'),'drift_over_span_ms':result.get('drift_over_span_ms'),'direction_support':result.get('direction_support'),'affine_mad_ms':result.get('affine_mad_ms'),'mad_improvement_ratio':result.get('mad_improvement_ratio'),'suspect_regions':suspect_regions,'suspect_region_reasons':sorted({str(r.get('reason','')) for r in suspect_regions}),'shazam':shazam_hit,'song_identity_suspicious':identity_suspicious,'song_identity_rescanned':identity_rescanned,'song_identity_pool_size':pool_quality['candidate_count'],'song_identity_zero_score_ratio':pool_quality['zero_score_ratio'],'song_identity_best_anchor_count':pool_quality['best_anchor_count'],'song_identity_primary_provider':'shazam' if shazam_hit else None,'song_identity_primary_title':(shazam_hit or {}).get('title'),'song_identity_secondary_provider':secondary_provider,'song_identity_secondary_title':secondary_title or None,'song_identity_secondary_used':secondary_used,'confidence_tier':confidence_tier,'full_realign_used':full_realign_used,'line_shift_ms':result.get('line_shift_ms',shift_ms),'effective_shift_ms':result.get('effective_shift_ms',shift_ms),'shift_source':result.get('shift_source','line'),'timing_model':result.get('timing_model','line_global'),'word_bootstrap_status':result.get('word_bootstrap_status'),'word_eligible_line_count':int(result.get('word_eligible_line_count',0)),'word_dominant_cluster_line_count':int(result.get('word_dominant_cluster_line_count',0)),'word_local_shift_line_count':int(result.get('word_local_shift_line_count',0)),'word_anchor_count':int(result.get('word_anchor_count',0)),'word_anchor_raw_count':int(result.get('word_anchor_raw_count',0)),'word_anchor_rejected_count':int(result.get('word_anchor_rejected_count',0)),'word_anchor_lines':int(result.get('word_anchor_lines',0)),'word_anchor_span_ms':int(result.get('word_anchor_span_ms',0)),'word_residual_p90_ms':result.get('word_residual_p90_ms'),'word_median_abs_residual_ms':result.get('word_median_abs_residual_ms'),'word_mad_ms':result.get('word_mad_ms'),'word_model_shift_ms':result.get('word_model_shift_ms'),'word_model_median_abs_residual_ms':result.get('word_model_median_abs_residual_ms'),'word_model_mad_ms':result.get('word_model_mad_ms'),'word_model_inlier_ratio_500':result.get('word_model_inlier_ratio_500'),'word_model_coverage_ratio':result.get('word_model_coverage_ratio'),'word_vs_line_shift_diff_ms':result.get('word_vs_line_shift_diff_ms'),'cross_model_conflict':bool(result.get('cross_model_conflict',False)),'match_confidence':result.get('match_confidence','low' if low_confidence else 'high'),'timing_confidence':result.get('timing_confidence','unavailable'),'word_timing_counts':word_counts,'confidence':'low' if low_confidence else 'high','low_confidence':low_confidence,'reason':result.get('reason',''),'core_anchors':core_anchors,'evidence_anchors':evidence_anchors,'candidates':summaries,'finished_at':time.time()}
         identity=resolve_search_identity(j)
         report.update({**matched_candidate_fields(candidate),'identified_title':identity['title'],
-            'identified_artist':identity['artist'],'identity_source':identity['source']})
+            'identified_artist':identity['artist'],'identity_source':identity['source'],
+            'separation_retry':separation})
         # The winning lyric sheet never renames the song. It used to: title and
         # artist were written straight from the candidate, the next re-run then
         # searched under that name, and the pool narrowed to near-miss titles
         # until the same wrong sheet won again (《夏天的风》 became 《夏日の風》 and
         # its verbatim releases became unreachable). What the sheet calls itself
         # is reported as matched_* and nothing downstream treats it as identity.
-        update(jid,status='alignment_review',lyrics='\n'.join(lyrics),alignment={'asr_segments':asr,'lines':lines,'offset_ms':0,'timeline_match':report},error='')
+        update(jid,status='alignment_review',lyrics='\n'.join(lyrics),
+            alignment={'asr_segments':asr,'lines':lines,'offset_ms':0,'timeline_match':report,
+                **({'separation_retry':separation} if separation.get('applied') else {})},error='')
     except Exception as exc:
         progress.update({'status':'failed','phase':'标准歌词时间轴匹配失败','error':str(exc)[:1000],'finished_at':time.time()})
         try:
