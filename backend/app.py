@@ -2752,6 +2752,10 @@ def automation_run(run_id:str): return get_automation_run(run_id)
 def cancel_automation_run(run_id:str):
     run=get_automation_run(run_id,True)
     if run['status'] not in AUTOMATION_ACTIVE: return get_automation_run(run_id)
+    if run['status']=='queued':
+        update_automation_run(run_id,status='cancelled',stage='cancelled',cancel_requested=1,error='任务已中止')
+        automation_wakeup.set()
+        return get_automation_run(run_id)
     update_automation_run(run_id,status='cancelling',cancel_requested=1)
     if run.get('transcriber_job_id'):
         try: transcriber_request('POST',f'/api/jobs/{run["transcriber_job_id"]}/cancel',json={})
