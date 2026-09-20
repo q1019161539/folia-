@@ -468,8 +468,9 @@ def notify_automation():
         title, content = automation_notification(payload)
     except (TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
-    notify_wecom(title, content)
-    return jsonify({"ok": True})
+    delivery = notify_wecom(title, content)
+    status = 200 if delivery.get("ok") or delivery.get("status") == "not_configured" else 502
+    return jsonify(delivery), status
 
 
 @app.post("/api/jobs/<job_id>/cancel")

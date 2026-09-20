@@ -21,11 +21,11 @@ class TimestampWordTests(unittest.TestCase):
             "clips": ["第一首.mp4", "第二首.mp4"],
             "output_path": "/video/歌曲切片",
         })
-        self.assertEqual(title, "Folia 自动流程切片完成")
+        self.assertEqual(title, "✂️ Folia 切片完成")
         self.assertIn("主播：芒芒_Mou", content)
         self.assertIn("录播：测试录播.mp4", content)
         self.assertIn("切片：成功 2，失败 1", content)
-        self.assertIn("输出目录：/video/歌曲切片", content)
+        self.assertIn("📁 /video/歌曲切片", content)
 
     def test_automation_outputs_completed_notification(self):
         title, content = automation_notification({
@@ -36,10 +36,9 @@ class TimestampWordTests(unittest.TestCase):
             "outputs": ["第一首_folia_overlay.mp4", "第二首_folia_overlay.mp4"],
             "output_path": "/vol1/1000/video/Folia成片/赛蒂娅Sentia/2026-09-14",
         })
-        self.assertEqual(title, "Folia 自动流程成品处理完成")
-        self.assertIn("成品：成功 2，失败 0，跳过 0", content)
-        self.assertIn("第一首_folia_overlay.mp4", content)
-        self.assertIn("输出目录：/vol1/1000/video/Folia成片", content)
+        self.assertEqual(title, "🎬 Folia 成片处理完成")
+        self.assertIn("结果：成功 2｜失败 0｜跳过 0", content)
+        self.assertIn("📁 /vol1/1000/video/Folia成片", content)
 
     def test_recording_outputs_use_broadcaster_date_and_recording_name(self):
         with tempfile.TemporaryDirectory() as directory:

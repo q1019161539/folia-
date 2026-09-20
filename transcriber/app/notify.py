@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.request import Request, urlopen
 
@@ -230,19 +231,27 @@ def automation_notification(payload: dict[str, object]) -> tuple[str, str]:
     return AUTOMATION_NOTIFICATION_TITLES[event], "\n".join(lines)
 
 
-def notify_wecom(title: str, content: str) -> None:
-    """Best-effort 企业微信机器人通知；未配置或发送失败不影响任务结果。"""
+def notify_wecom(title: str, content: str) -> dict[str, object]:
+    """发送企业微信机器人通知，并返回可观测的投递结果。"""
     url = os.environ.get("WECOM_WEBHOOK_URL", "").strip()
     if not url:
-        return
+        return {"ok": False, "status": "not_configured", "attempts": 0}
     payload = json.dumps(
         {"msgtype": "text", "text": {"content": f"{title}\n{content}"}},
         ensure_ascii=False,
     ).encode("utf-8")
-    try:
-        request = Request(url, data=payload, headers={"Content-Type": "application/json"})
-        with urlopen(request, timeout=8) as response:
-            response.read(256)
-    except Exception:
-        # 通知是附加能力，网络故障不能改变 ASR 任务状态。
-        return
+    last_error = "unknown error"
+    for attempt in range(1, 4):
+        try:
+            request = Request(url, data=payload, headers={"Content-Type": "application/json"})
+            with urlopen(request, timeout=8) as response:
+                result = json.loads(response.read(1024).decode("utf-8"))
+            if result.get("errcode") == 0:
+                return {"ok": True, "status": "sent", "attempts": attempt}
+            last_error = f"WeCom errcode={result.get('errcode')}: {result.get('errmsg', '')}"
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+        if attempt < 3:
+            time.sleep(attempt)
+    # 通知是附加能力，投递失败不能改变 ASR 任务状态；调用方负责记录结果。
+    return {"ok": False, "status": "failed", "attempts": 3, "error": last_error}

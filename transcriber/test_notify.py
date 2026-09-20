@@ -1,6 +1,23 @@
+import json
+import os
 import unittest
+from unittest.mock import patch
 
-from app.notify import MAX_NOTIFICATION_BYTES, automation_notification
+from app.notify import MAX_NOTIFICATION_BYTES, automation_notification, notify_wecom
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self, _size):
+        return json.dumps(self.payload).encode("utf-8")
 
 
 def song(title, level="normal", reasons=None, state="completed", reason=None):
@@ -144,6 +161,31 @@ class StageNotificationTests(unittest.TestCase):
     def test_unknown_event_is_rejected(self):
         with self.assertRaises(ValueError):
             automation_notification({"event": "something_else"})
+
+
+class WeComDeliveryTests(unittest.TestCase):
+    @patch.dict(os.environ, {"WECOM_WEBHOOK_URL": "https://example.invalid/hook"})
+    @patch("app.notify.time.sleep")
+    @patch("app.notify.urlopen")
+    def test_http_200_with_wecom_error_is_retried_and_reported(self, mocked_open, _sleep):
+        mocked_open.return_value = FakeResponse({"errcode": 93000, "errmsg": "robot has been stopped"})
+
+        result = notify_wecom("标题", "正文")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["attempts"], 3)
+        self.assertIn("93000", result["error"])
+        self.assertEqual(mocked_open.call_count, 3)
+
+    @patch.dict(os.environ, {"WECOM_WEBHOOK_URL": "https://example.invalid/hook"})
+    @patch("app.notify.urlopen")
+    def test_wecom_success_is_returned_after_one_attempt(self, mocked_open):
+        mocked_open.return_value = FakeResponse({"errcode": 0, "errmsg": "ok"})
+
+        result = notify_wecom("标题", "正文")
+
+        self.assertEqual(result, {"ok": True, "status": "sent", "attempts": 1})
+        self.assertEqual(mocked_open.call_count, 1)
 
 
 if __name__ == "__main__":

@@ -2310,8 +2310,11 @@ def notify_automation_stage(event:str,run:dict[str,Any],**details):
         'source':source,
         **details,
     }
-    try: transcriber_request('POST','/api/notifications/automation',json=payload)
-    except Exception: pass
+    try:
+        transcriber_request('POST','/api/notifications/automation',json=payload)
+    except Exception as exc:
+        print(f'[automation-notify] {event} 发送失败，run={run.get("id", "")}: {exc}',file=sys.stderr)
+        traceback.print_exc()
 
 def wait_transcriber(run_id:str,job_id:str):
     while True:
