@@ -666,6 +666,23 @@ class TitleIdentityTest(unittest.TestCase):
         self.assertFalse(identity_evidence_can_override(initial, too_short))
         self.assertFalse(identity_evidence_can_override(initial, too_close))
 
+    def test_recovery_prefers_more_word_anchors_for_same_song_within_one_point(self):
+        wrong = {
+            "candidate": {"candidate_id": "kugou:wrong", "title": "有你相随", "artist": "张瑶"},
+            "result": {"low_confidence": True, "score": 26.3, "core_anchors": [{}], "core_span_ms": 0},
+        }
+        netease = {
+            "candidate": {"candidate_id": "netease:254319", "title": "爱你不是两三天", "artist": "梁静茹"},
+            "result": {"low_confidence": False, "score": 372.654, "core_anchors": [{}] * 14, "core_span_ms": 207056,
+                       "word_anchor_count": 103, "word_residual_p90_ms": 250},
+        }
+        qq = {
+            "candidate": {"candidate_id": "qq:4830166", "title": "爱你不是两三天", "artist": "梁静茹"},
+            "result": {"low_confidence": False, "score": 372.364, "core_anchors": [{}] * 14, "core_span_ms": 207056,
+                       "word_anchor_count": 110, "word_residual_p90_ms": 268},
+        }
+        self.assertEqual(choose_identity_recovery_candidate([wrong, netease, qq], wrong), qq)
+
     def test_balanced_pool_reserves_space_for_every_query(self):
         groups = [[{"candidate_id": f"q{query}-{index}"} for index in range(8)] for query in range(3)]
         selected = balanced_candidate_pool(groups, 12)
