@@ -683,6 +683,23 @@ class TitleIdentityTest(unittest.TestCase):
         }
         self.assertEqual(choose_identity_recovery_candidate([wrong, netease, qq], wrong), qq)
 
+    def test_recovery_can_select_the_better_supported_artist_release_of_same_title(self):
+        wrong = {
+            "candidate": {"candidate_id": "qq:wrong", "title": "苦情歌", "artist": "周传雄"},
+            "result": {"low_confidence": True, "score": 19.986, "core_anchors": [{}], "core_span_ms": 0},
+        }
+        cover = {
+            "candidate": {"candidate_id": "qq:502770095", "title": "小孩", "artist": "苏星婕"},
+            "result": {"low_confidence": False, "score": 291.782, "core_anchors": [{}] * 11, "core_span_ms": 185696,
+                       "word_anchor_count": 84, "word_residual_p90_ms": 583},
+        }
+        original = {
+            "candidate": {"candidate_id": "qq:495408131", "title": "小孩", "artist": "罗森涛"},
+            "result": {"low_confidence": False, "score": 291.493, "core_anchors": [{}] * 11, "core_span_ms": 185696,
+                       "word_anchor_count": 87, "word_residual_p90_ms": 616},
+        }
+        self.assertEqual(choose_identity_recovery_candidate([wrong, cover, original], wrong), original)
+
     def test_balanced_pool_reserves_space_for_every_query(self):
         groups = [[{"candidate_id": f"q{query}-{index}"} for index in range(8)] for query in range(3)]
         selected = balanced_candidate_pool(groups, 12)

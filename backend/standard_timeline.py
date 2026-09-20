@@ -428,18 +428,16 @@ def choose_identity_recovery_candidate(items: list[dict[str, Any]], initial: dic
             float(item.get("result", {}).get("score", 0)),
         ),
     )
-    # Providers often publish the same recording with nearly identical line
-    # scores.  Inside a one-point tie for the same title and artist, prefer the
+    # Providers often publish the same song with nearly identical line scores.
+    # Inside a one-point tie for the same title, prefer the
     # version supported by more provider-word anchors; this chooses the richer
     # standard timeline without weakening the cross-title correction gate.
     challenger_title = normalize_identity(challenger.get("candidate", {}).get("title", ""))
-    challenger_artist = normalize_identity(challenger.get("candidate", {}).get("artist", ""))
     challenger_score = float(challenger.get("result", {}).get("score", 0) or 0)
     equivalent = [
         item for item in items
         if not bool(item.get("result", {}).get("low_confidence", True))
         and normalize_identity(item.get("candidate", {}).get("title", "")) == challenger_title
-        and normalize_identity(item.get("candidate", {}).get("artist", "")) == challenger_artist
         and float(item.get("result", {}).get("score", 0) or 0) >= challenger_score - 1.0
     ]
     if equivalent:
