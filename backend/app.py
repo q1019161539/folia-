@@ -12,7 +12,7 @@ from song_identity_diagnostics import acrcloud_identify_window
 import ai_slot
 from pipeline_eta import estimate_asr, estimate_songs
 from standard_timeline import build_review_assessment, build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, clamp_forced_words, confidence_output_folder, estimate_untimed_timeline, find_suspect_anchor_regions, is_high_confidence, is_lyric_metadata, lyric_render_window, normalize_identity, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, song_identity_suspicious, title_similarity as compare_titles
-from word_timeline import apply_hybrid_words, normalize_provider_rows, score_provider_timeline, separation_retry_needed, timed_rows, word_anchor_coverage
+from word_timeline import apply_shifted_provider_words, normalize_provider_rows, score_provider_timeline, separation_retry_needed, timed_rows, word_anchor_coverage
 from automation import MIN_RECORDING_BYTES, automation_transcriber_payload, broadcaster_directories, eligible_recording, parse_ai_json, project_transcript, recording_choices, restore_completed_clip_paths, transcript_for_ai, transcript_segments, validate_detected_songs
 from folia_native import FOLIA_EFFECTS, FOLIA_RENDERER_REVISION, apply_folia_preview_profile, build_folia_config, normalized_folia_settings
 from song_identity import backfill_identity, identity_fields, matched_candidate_fields, resolve_search_identity
@@ -1183,7 +1183,7 @@ def auto_standard_timeline_task(jid:str):
             mode='standard-piecewise'; shift_ms=int(result['shift_ms']); lyrics=[row['text'] for row in chosen['timed']]
             word_counts={'qwen_exact':0,'qwen_corrected':0,'lddc_standard':0,'interpolated':0,'rejected':0}
             if chosen.get('provider_rows') and candidate.get('timing_type')=='verbatim':
-                word_counts=apply_hybrid_words(lines,chosen['provider_rows'],result.get('word_anchors') or [],shift_ms)
+                word_counts=apply_shifted_provider_words(lines,chosen['provider_rows'],shift_ms)
         else:
             need_ai_help=True; suspect_regions=[]
             lines=estimate_untimed_timeline(chosen['plain'],chosen['evidence'],duration_ms)
@@ -1621,8 +1621,6 @@ def force_align_task_locked(jid:str,language:str='Chinese'):
         for row in build_render_timeline(lines,0):
             index=row['index']; line=row['line']
             if line.get('status')=='asr': continue
-            if line.get('word_timing_source')=='qwen-lddc-hybrid' and len(line.get('anchors') or [])>0 and forced_words_quality(line.get('words') or [],str(line.get('text',''))) and ''.join(str(word.get('text','')) for word in line.get('words') or [])==line.get('text',''):
-                preserved+=1; continue
             asr_start=int(line.get('asr_start_ms',row['start'])); asr_end=int(line.get('asr_end_ms',row['end']))
             fixed=has_standard_timeline(line)
             if fixed:
@@ -1638,8 +1636,8 @@ def force_align_task_locked(jid:str,language:str='Chinese'):
                 # sheet's 6585ms to 3520ms while stretching 《我一心只想 王宝钏》
                 # from 9152ms to 12160ms -- rows the sheet itself had spaced
                 # evenly, now sweeping at wildly different speeds. Where real
-                # character times exist they already came from the release and
-                # from apply_hybrid_words during the timeline stage.
+                # character times exist they come from the release and receive
+                # exactly the same whole-song shift as the line.
                 preserved+=1; continue
             # Only rows without a standard timeline reach here -- ASR-derived rows
             # and hand-pasted lyrics, which have nothing but this stage to time
@@ -1656,7 +1654,7 @@ def force_align_task_locked(jid:str,language:str='Chinese'):
         base={**old,'asr_segments':old.get('asr_segments',[]),'lines':lines,'offset_ms':old.get('offset_ms',0)}
         if not candidates:
             order_repairs=normalize_aligned_line_order(lines)
-            report={'succeeded':succeeded,'total':original_total,'failed':[],'model':model_name,'order_repairs':order_repairs,'global_error':'','coarse_mode':'qwen-lddc-hybrid'}
+            report={'succeeded':succeeded,'total':original_total,'failed':[],'model':'LDDC standard timeline','order_repairs':order_repairs,'global_error':'','coarse_mode':'provider-global-shift'}
             progress.update({'status':'completed','done':original_total,'succeeded':succeeded,'failed':0,'current':original_total,'current_text':'','percent':100,'phase':'已复用整场 Qwen 与 LDDC 融合逐字时间','finished_at':time.time()})
             update(jid,status='alignment_review',alignment={**base,'aligner':report,'aligner_progress':progress},error=''); return
         if use_asr_bounded:

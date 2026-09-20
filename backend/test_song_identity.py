@@ -179,6 +179,11 @@ class StandardTimelineIsFinalTest(unittest.TestCase):
         stage = APP.split("def force_align_task_locked", 1)[1].split("if not candidates and not preserved", 1)[0]
         self.assertIn("'fixed_timeline':False", stage)
 
+    def test_standard_verbatim_words_are_not_replaced_by_qwen_anchors(self):
+        timeline_stage = APP.split("def auto_standard_timeline_task", 1)[1].split("def standard_timeline_auto", 1)[0]
+        self.assertIn("apply_shifted_provider_words", timeline_stage)
+        self.assertNotIn("apply_hybrid_words", timeline_stage)
+
 
 if __name__ == "__main__":
     unittest.main()

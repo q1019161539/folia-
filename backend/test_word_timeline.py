@@ -2,7 +2,7 @@
 
 from standard_timeline import build_shifted_timeline
 from word_timeline import (
-    apply_hybrid_words,
+    apply_shifted_provider_words,
     normalize_provider_rows,
     provider_char_count,
     score_provider_timeline,
@@ -81,16 +81,22 @@ class WordTimelineTests(unittest.TestCase):
         self.assertGreaterEqual(result["word_anchor_count"], 18)
         self.assertFalse(result["low_confidence"])
 
-    def test_hybrid_uses_qwen_and_standard_for_missing_character(self):
+    def test_selected_verbatim_timeline_uses_only_provider_times_plus_global_shift(self):
         row = provider_row("春风吹过", 10000)
         asr = live_segment("春风过", 10000)
         score = score_provider_timeline([row], [asr])
         timeline = build_shifted_timeline([row], 5000, 30000, anchors=score.get("evidence_anchors"))
-        counts = apply_hybrid_words(timeline, [row], score.get("word_anchors") or [], 5000)
+        counts = apply_shifted_provider_words(timeline, [row], 5000)
         self.assertEqual("".join(word["text"] for word in timeline[0]["words"]), "春风吹过")
-        self.assertGreater(counts["qwen_exact"], 0)
+        self.assertEqual(counts["qwen_exact"], 0)
+        self.assertEqual(counts["qwen_corrected"], 0)
         self.assertGreater(counts["lddc_standard"], 0)
-        self.assertTrue(all(timeline[0]["start_ms"] <= word["start_ms"] < word["end_ms"] <= timeline[0]["end_ms"] for word in timeline[0]["words"]))
+        self.assertEqual(
+            [(word["start_ms"], word["end_ms"]) for word in timeline[0]["words"]],
+            [(15000, 15400), (15400, 15800), (15800, 16200), (16200, 16600)],
+        )
+        self.assertEqual(timeline[0]["anchors"], [])
+        self.assertEqual(timeline[0]["word_timing_source"], "provider-global-shift")
 
     def test_lines_do_not_follow_a_drifting_performance_one_by_one(self):
         # A performance that drifts further out of step with every line: +5s,
@@ -120,11 +126,10 @@ class WordTimelineTests(unittest.TestCase):
         self.assertGreaterEqual(result["word_anchor_count"], 18)
         timeline = build_shifted_timeline(rows, result["shift_ms"], 50000, anchors=result["evidence_anchors"])
         self.assertEqual([line["local_shift_ms"] for line in timeline], [result["shift_ms"]] * 3)
-        apply_hybrid_words(timeline, rows, result["word_anchors"], result["shift_ms"])
+        apply_shifted_provider_words(timeline, rows, result["shift_ms"])
         self.assertEqual([line["start_ms"] for line in timeline], [15000, 25000, 35000])
-        # The character times are still real Qwen times inside each line -- what
-        # was removed is their ability to move the line itself.
-        self.assertTrue(any(word["timing_source"] == "qwen-exact" for word in timeline[0]["words"]))
+        self.assertTrue(all(word["timing_source"] != "qwen-exact" for line in timeline for word in line["words"]))
+        self.assertEqual(result["timing_model"], "line_global")
 
     def test_word_evidence_far_from_a_line_can_never_drag_it_onto_its_neighbour(self):
         # The 《胭脂妆》 failure shape: a line whose word-level evidence sits
@@ -140,7 +145,7 @@ class WordTimelineTests(unittest.TestCase):
         ]
         timeline = build_shifted_timeline(rows, 0, 50000)
         starts_before = [line["start_ms"] for line in timeline]
-        apply_hybrid_words(timeline, rows, anchors, 0)
+        apply_shifted_provider_words(timeline, rows, 0)
         self.assertEqual([line["start_ms"] for line in timeline], starts_before)
         for left, right in zip(timeline, timeline[1:]):
             self.assertLessEqual(left["end_ms"], right["start_ms"])

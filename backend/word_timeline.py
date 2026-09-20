@@ -202,9 +202,7 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 
 def _line_delta_stats(exact_by_line: dict[int, list[int]]) -> dict[int, dict[str, Any]]:
-    """Per-line median/MAD of character deltas, for lines with enough chars to
-    vouch for themselves (>=2 -- the same bar `apply_hybrid_words` uses to trust
-    a line's own local shift over the global one)."""
+    """Per-line median/MAD of character deltas used to vote on one global shift."""
     return {
         line: {"median": statistics.median(deltas), "mad": mad_ms(deltas), "count": len(deltas)}
         for line, deltas in exact_by_line.items()
@@ -359,13 +357,9 @@ def score_provider_timeline(
     bootstrap = _bootstrap_word_shift(raw_exact, center)
     line_stats, cluster_lines = bootstrap["line_stats"], set(bootstrap["cluster_lines"])
     cluster_mad = mad_ms([line_stats[line]["median"] for line in cluster_lines]) if cluster_lines else 0
-    # Filtering is independent of whether the *global* bootstrap succeeded: a
-    # line with enough characters to vouch for itself keeps its own anchors on
-    # its own consensus regardless of what the rest of the song is doing (that
-    # consensus is exactly what apply_hybrid_words will trust as this line's own
-    # local_shift downstream). Only characters in lines too sparse to vouch for
-    # themselves fall back to the global word shift, or -- if that isn't trustworthy
-    # either -- the old per-anchor line-level interpolation, unchanged.
+    # Filtering is independent of whether the global bootstrap succeeded. These
+    # anchors are evidence for candidate ranking, the single whole-song shift and
+    # diagnostics only; they are never written into the selected lyric sheet.
     accepted_word_anchors = []
     for item in word_anchors:
         delta = item["qwen_start_ms"] - item["provider_start_ms"]
@@ -390,8 +384,9 @@ def score_provider_timeline(
     accepted_exact_counts: dict[int, int] = {}
     for item in exact:
         accepted_exact_counts[item["lyric_index"]] = accepted_exact_counts.get(item["lyric_index"], 0) + 1
-    # The same >=2 bar apply_hybrid_words uses downstream to trust a line's own
-    # local shift over whatever global shift_ms this reports.
+    # Lines with at least two exact characters can cast one vote in the global
+    # word model. The count remains diagnostic; it does not authorize a local
+    # shift or a character-level rewrite.
     local_shift_lines = {line for line, count in accepted_exact_counts.items() if count >= 2}
     shift_source = "word" if bootstrap["status"] == "accepted" else "line"
     shift_ms = bootstrap["word_shift_ms"] if shift_source == "word" else center
@@ -442,14 +437,10 @@ def score_provider_timeline(
     )
     lyric_characters = sum(len(normalized(row.get("text", ""))) for row in timed)
     coverage = len({(item["lyric_index"], item["standard_char_index"]) for item in exact}) / max(1, lyric_characters)
-    timing_model = "word_local_hybrid" if local_shift_lines else f"{shift_source}_global"
-    # Confidence is decided by line-level evidence alone. Word-level anchors stay
-    # as timing material (they drive the hybrid per-character merge) and as a
-    # ranking bonus, but they no longer vote on confidence: a live cover drifts
-    # away from a studio release character by character, so the word-level verdict
-    # swung on how closely this particular performance tracked that particular
-    # master rather than on whether the lyrics were the right ones, which made the
-    # reported confidence read wrong in both directions.
+    timing_model = f"{shift_source}_global"
+    # Confidence is decided by line-level evidence alone. Word-level anchors may
+    # choose the one global shift, contribute a ranking bonus and remain visible
+    # in diagnostics, but never replace timestamps in the selected lyric sheet.
     low_confidence = bool(line_result.get("low_confidence", True))
     score = float(line_result.get("score", 0)) + min(25, len(exact) / 2) + min(8, span_ms / 10000)
     if p90 is not None:
@@ -521,52 +512,25 @@ def _provider_character_times(row: dict[str, Any], start_ms: int, end_ms: int, s
     return output
 
 
-def apply_hybrid_words(
+def apply_shifted_provider_words(
     timeline: list[dict[str, Any]],
     rows: list[dict[str, Any]],
-    word_anchors: list[dict[str, Any]],
     shift_ms: int,
 ) -> dict[str, int]:
-    anchors_by_line: dict[int, dict[int, dict[str, Any]]] = {}
-    for anchor in word_anchors:
-        line = int(anchor["lyric_index"])
-        index = int(anchor["standard_char_index"])
-        current = anchors_by_line.setdefault(line, {}).get(index)
-        if current is None or (current.get("kind") == "corrected" and anchor.get("kind") == "exact"):
-            anchors_by_line[line][index] = anchor
+    """Attach the provider character timeline using exactly one global shift.
+
+    Qwen/ASR character timestamps are evidence for selecting a candidate and
+    calculating ``shift_ms``. Once a standard verbatim lyric is selected, its
+    internal line and character rhythm is authoritative: every provider timestamp
+    receives the same offset and no live character timestamp is copied into it.
+    """
     counts = {"qwen_exact": 0, "qwen_corrected": 0, "lddc_standard": 0, "interpolated": 0, "rejected": 0}
     for line in timeline:
         index = int(line.get("standard_line_index", -1))
         if not 0 <= index < len(rows):
             continue
-        line_anchors = anchors_by_line.get(index, {})
-        # The line keeps exactly the box build_shifted_timeline gave it: the whole
-        # lyric sheet moves by one shift and no line moves on its own.
-        #
-        # This used to give a line its own shift from its own matched characters,
-        # stretch its box to cover them, and then take the box from the first and
-        # last character. On real songs that moved neighbouring lines up to 2.2s
-        # apart and shipped 《胭脂妆》 with 16 pairs of overlapping subtitles, one
-        # line squeezed from 1785ms to 560ms. Measured across 64 shipped products,
-        # the ones with no overlap have lines that sit still (90th percentile
-        # deviation from their neighbours: 7ms) while every product that let lines
-        # move on their own has overlaps -- so per-line movement is switched off
-        # rather than merely bounded. Qwen times are still used for the characters
-        # inside the box, where they cannot move the line.
-        local_shift = int(line.get("local_shift_ms", shift_ms))
         start, end = int(line["start_ms"]), int(line["end_ms"])
-        words = _provider_character_times(rows[index], start, end, local_shift)
-        for char_index, anchor in line_anchors.items():
-            if not 0 <= char_index < len(words):
-                counts["rejected"] += 1
-                continue
-            qstart, qend = int(anchor["qwen_start_ms"]), int(anchor["qwen_end_ms"])
-            if qend <= qstart:
-                counts["rejected"] += 1
-                continue
-            source = "qwen-exact" if anchor.get("kind") == "exact" else "qwen-corrected"
-            words[char_index].update({"start_ms": qstart, "end_ms": qend, "timing_source": source})
-        words = clamp_forced_words(words, start, end)
+        words = _provider_character_times(rows[index], start, end, shift_ms)
         if not words or "".join(item["text"] for item in words) != line.get("text", ""):
             line["words"] = []
             line["anchors"] = []
@@ -575,9 +539,9 @@ def apply_hybrid_words(
         for word in words:
             counts[word["timing_source"].replace("-", "_")] += 1
         line["words"] = words
-        line["anchors"] = [word for word in words if word["timing_source"].startswith("qwen-")]
-        line["local_shift_ms"] = local_shift
+        line["anchors"] = []
+        line["local_shift_ms"] = shift_ms
         line["timing_precision"] = "forced-character"
-        line["word_timing_source"] = "qwen-lddc-hybrid"
-        line["aligner_model"] = "Qwen3-ForcedAligner-0.6B + LDDC"
+        line["word_timing_source"] = "provider-global-shift"
+        line["aligner_model"] = "LDDC standard timeline"
     return counts
