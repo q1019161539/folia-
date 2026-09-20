@@ -8,15 +8,16 @@ whose identity had been rewritten this way -- every single title that ever
 changed had changed into a candidate's title -- and 7 of 9 songs that looked
 "line-only" actually had verbatim releases waiting under their original name.
 
-So identity has exactly one owner. The identification stage (DeepSeek's reading
-of the full-recording ASR, or an audio fingerprint from Shazam / ACRCloud) writes
-`identified_title` / `identified_artist`. Lyric search, candidate scoring,
-alignment and rendering all read them and none of them may write. What a
-candidate knows about itself lives in the report under `matched_*`, where it can
-be inspected without pretending to be the song's name.
+So identity has exactly one owner. The recognition stage (DeepSeek's reading of
+the full-recording ASR, an audio fingerprint, or the strictly gated
+`evidence_consensus` recovery) writes `identified_title` / `identified_artist`.
+Ordinary lyric selection, alignment and rendering may only read it. What a
+candidate knows about itself lives in the report under `matched_*` unless it
+also passes the independent ASR evidence gate.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # Everything allowed to name a song. Recognition only: a lyric candidate is
@@ -25,8 +26,24 @@ from typing import Any
 # wearing a different hat -- letting it through the manual page would reopen the
 # loop by hand. Future automatic fusion of recognisers belongs here; nothing else
 # does.
-IDENTITY_SOURCES = ("shazam", "acrcloud", "deepseek", "automation_history_backfill", "legacy_fallback")
+IDENTITY_SOURCES = ("shazam", "acrcloud", "evidence_consensus", "deepseek", "automation_history_backfill", "legacy_fallback")
 FINGERPRINT_SOURCES = ("shazam", "acrcloud")
+
+
+def fingerprint_consensus(hits: list[dict[str, Any]], min_agreement: int = 2) -> dict[str, Any] | None:
+    """Return a fingerprint identity only after independent windows agree."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for hit in hits:
+        title = str(hit.get("title") or "").strip()
+        key = re.sub(r"[^\w㐀-鿿]+", "", title).casefold()
+        if key:
+            groups.setdefault(key, []).append(hit)
+    agreed = [group for group in groups.values() if len(group) >= min_agreement]
+    if not agreed:
+        return None
+    winner = max(agreed, key=lambda group: (len(group), max(float(hit.get("score") or 0) for hit in group)))
+    best = max(winner, key=lambda hit: float(hit.get("score") or 0))
+    return {**best, "agreement_count": len(winner), "hit_count": len(hits)}
 
 
 def identity_fields(title: str, artist: str = "", source: str = "") -> dict[str, Any]:

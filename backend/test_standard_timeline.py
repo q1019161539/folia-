@@ -4,12 +4,16 @@ from standard_timeline import (
     anchor_residual_stats,
     anchor_trend_stats,
     build_shifted_timeline,
+    balanced_candidate_pool,
     candidate_pool_quality,
     choose_best_timeline_candidate,
+    choose_identity_recovery_candidate,
     clamp_forced_words,
     estimate_untimed_timeline,
     find_suspect_anchor_regions,
     is_high_confidence,
+    identity_evidence_can_override,
+    identity_recheck_needed,
     lyric_render_window,
     max_anchor_drift_ms,
     normalize_identity,
@@ -638,6 +642,36 @@ class TitleIdentityTest(unittest.TestCase):
             },
         ]
         self.assertEqual(choose_best_timeline_candidate(items)["candidate"]["candidate_id"], "lrclib:30063400")
+
+    def test_low_confidence_recovery_can_overrule_a_wrong_fingerprint_title(self):
+        wrong = {
+            "candidate": {"candidate_id": "kugou:wrong", "title": "有你相随", "timing_type": "verbatim"},
+            "title_similarity": 1.0,
+            "result": {"low_confidence": True, "score": 26.3, "core_anchors": [{}], "core_span_ms": 0},
+        }
+        correct = {
+            "candidate": {"candidate_id": "qq:correct", "title": "爱你不是两三天", "timing_type": "verbatim"},
+            "title_similarity": 0.0,
+            "result": {"low_confidence": False, "score": 372.36, "core_anchors": [{}] * 14, "core_span_ms": 180000},
+        }
+        self.assertTrue(identity_recheck_needed(wrong))
+        self.assertTrue(identity_evidence_can_override(wrong, correct))
+        self.assertEqual(choose_identity_recovery_candidate([wrong, correct], wrong), correct)
+        self.assertFalse(identity_recheck_needed(correct))
+
+    def test_weak_different_title_never_rewrites_identity(self):
+        initial = {"result": {"low_confidence": True, "score": 26, "core_anchors": [{}]}}
+        too_short = {"result": {"low_confidence": False, "score": 200, "core_anchors": [{}] * 8, "core_span_ms": 9000}}
+        too_close = {"result": {"low_confidence": False, "score": 60, "core_anchors": [{}] * 8, "core_span_ms": 20000}}
+        self.assertFalse(identity_evidence_can_override(initial, too_short))
+        self.assertFalse(identity_evidence_can_override(initial, too_close))
+
+    def test_balanced_pool_reserves_space_for_every_query(self):
+        groups = [[{"candidate_id": f"q{query}-{index}"} for index in range(8)] for query in range(3)]
+        selected = balanced_candidate_pool(groups, 12)
+        self.assertEqual(len(selected), 12)
+        for query in range(3):
+            self.assertEqual(sum(item["candidate_id"].startswith(f"q{query}-") for item in selected), 4)
 
 
 if __name__ == "__main__":

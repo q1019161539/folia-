@@ -6,6 +6,7 @@ from pathlib import Path
 from song_identity import (
     IDENTITY_SOURCES,
     backfill_identity,
+    fingerprint_consensus,
     identity_fields,
     matched_candidate_fields,
     resolve_search_identity,
@@ -35,6 +36,21 @@ class IdentityOwnershipTest(unittest.TestCase):
         for source in ("candidate", "manual", "user"):
             with self.assertRaises(ValueError):
                 identity_fields("夏日の風", "", source)
+
+    def test_only_guarded_evidence_consensus_may_correct_a_recognizer(self):
+        self.assertIn("evidence_consensus", IDENTITY_SOURCES)
+        fields = identity_fields("爱你不是两三天", "梁静茹", "evidence_consensus")
+        self.assertEqual(fields["identity_source"], "evidence_consensus")
+
+    def test_fingerprint_consensus_needs_two_matching_windows(self):
+        wrong = {"title": "有你相随", "artist": "梁佳正", "score": 100, "matched_at_ms": 0}
+        correct_a = {"title": "爱你不是两三天", "artist": "梁静茹", "score": 92, "matched_at_ms": 25000}
+        correct_b = {"title": "爱你不是两三天", "artist": "梁静茹", "score": 96, "matched_at_ms": 50000}
+        self.assertIsNone(fingerprint_consensus([wrong]))
+        self.assertIsNone(fingerprint_consensus([wrong, correct_a]))
+        consensus = fingerprint_consensus([wrong, correct_a, correct_b])
+        self.assertEqual(consensus["title"], "爱你不是两三天")
+        self.assertEqual(consensus["agreement_count"], 2)
 
     def test_manual_song_choice_never_writes_identity(self):
         choose = APP.split("def choose_song", 1)[1].split("@app.post", 1)[0]

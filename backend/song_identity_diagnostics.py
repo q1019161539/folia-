@@ -143,14 +143,24 @@ def acrcloud_identify_window(
     behavior (see this project's rule that a second identification source must
     never be able to fail the whole automated task).
     """
+    return acrcloud_identify_window_result(
+        source, offset_ms, access_key, access_secret, host, probe_ms
+    )["hit"]
+
+
+def acrcloud_identify_window_result(
+    source: Path, offset_ms: int, access_key: str, access_secret: str, host: str, probe_ms: int = PROBE_MS,
+) -> dict[str, Any]:
+    """Return the hit plus an observable status for one production probe."""
     with tempfile.TemporaryDirectory(prefix="song_id_probe_") as tmp:
         wav = Path(tmp) / f"probe_{uuid.uuid4().hex}.wav"
         if not _extract_probe_wav(source, offset_ms, probe_ms, wav):
-            return None
+            return {"hit": None, "status": "extract_failed", "error": "ffmpeg 抽取音频窗口失败"}
         try:
-            return acrcloud_identify(wav, access_key, access_secret, host)
-        except Exception:
-            return None
+            hit = acrcloud_identify(wav, access_key, access_secret, host)
+            return {"hit": hit, "status": "hit" if hit else "no_match", "error": ""}
+        except Exception as exc:
+            return {"hit": None, "status": "error", "error": f"{type(exc).__name__}: {exc}"[:300]}
 
 
 def scan_windows(

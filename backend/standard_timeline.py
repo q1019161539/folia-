@@ -368,6 +368,69 @@ def choose_best_timeline_candidate(items: list[dict[str, Any]]) -> dict[str, Any
     )
 
 
+def balanced_candidate_pool(groups: list[list[dict[str, Any]]], limit: int = 12) -> list[dict[str, Any]]:
+    """Keep one successful search query from monopolising the candidate pool."""
+    groups = [group for group in groups if group]
+    if not groups or limit <= 0:
+        return []
+    quota = max(1, limit // len(groups))
+    selected: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for candidate in group[:quota]:
+            selected.setdefault(str(candidate.get("candidate_id") or ""), candidate)
+    # Duplicates can leave spare capacity. Fill it in query-round-robin order so
+    # title results still get more versions without starving lyric fragments.
+    index = quota
+    while len(selected) < limit:
+        added = False
+        for group in groups:
+            if index >= len(group):
+                continue
+            candidate = group[index]
+            before = len(selected)
+            selected.setdefault(str(candidate.get("candidate_id") or ""), candidate)
+            added = added or len(selected) > before
+            if len(selected) >= limit:
+                break
+        if not added and all(index >= len(group) - 1 for group in groups):
+            break
+        index += 1
+    return list(selected.values())[:limit]
+
+
+def identity_evidence_can_override(initial: dict[str, Any], challenger: dict[str, Any]) -> bool:
+    """Whether lyric/ASR agreement is strong enough to correct a weak identity."""
+    current = initial.get("result", {})
+    better = challenger.get("result", {})
+    return (
+        bool(current.get("low_confidence", True))
+        and not bool(better.get("low_confidence", True))
+        and len(better.get("core_anchors") or []) >= 5
+        and int(better.get("core_span_ms", 0) or 0) >= 10_000
+        and float(better.get("score", 0)) >= float(current.get("score", 0)) + 40
+    )
+
+
+def identity_recheck_needed(chosen: dict[str, Any]) -> bool:
+    """Only low-confidence initial matches enter the expensive identity recovery."""
+    return bool(chosen.get("result", {}).get("low_confidence", True))
+
+
+def choose_identity_recovery_candidate(items: list[dict[str, Any]], initial: dict[str, Any]) -> dict[str, Any]:
+    """Choose normally, except when overwhelming evidence disproves a weak identity."""
+    preferred = choose_best_timeline_candidate(items)
+    challenger = max(
+        items,
+        key=lambda item: (
+            not bool(item.get("result", {}).get("low_confidence", True)),
+            len(item.get("result", {}).get("core_anchors") or []),
+            int(item.get("result", {}).get("core_span_ms", 0) or 0),
+            float(item.get("result", {}).get("score", 0)),
+        ),
+    )
+    return challenger if identity_evidence_can_override(initial, challenger) else preferred
+
+
 def _timestamp_ms(minutes: str, seconds: str) -> int:
     return round((int(minutes) * 60 + float(seconds)) * 1000)
 

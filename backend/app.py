@@ -8,14 +8,14 @@ from opencc import OpenCC
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from song_identity_diagnostics import acrcloud_identify_window
+from song_identity_diagnostics import acrcloud_identify_window_result
 import ai_slot
 from pipeline_eta import estimate_asr, estimate_songs
-from standard_timeline import build_review_assessment, build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, clamp_forced_words, confidence_output_folder, estimate_untimed_timeline, find_suspect_anchor_regions, is_high_confidence, is_lyric_metadata, lyric_render_window, normalize_identity, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, song_identity_suspicious, title_similarity as compare_titles
+from standard_timeline import balanced_candidate_pool, build_review_assessment, build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, choose_identity_recovery_candidate, clamp_forced_words, confidence_output_folder, estimate_untimed_timeline, find_suspect_anchor_regions, identity_evidence_can_override, identity_recheck_needed, is_high_confidence, is_lyric_metadata, lyric_render_window, normalize_identity, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, title_similarity as compare_titles
 from word_timeline import apply_shifted_provider_words, normalize_provider_rows, score_provider_timeline, separation_retry_needed, timed_rows, word_anchor_coverage
 from automation import MIN_RECORDING_BYTES, automation_transcriber_payload, broadcaster_directories, eligible_recording, parse_ai_json, project_transcript, recording_choices, restore_completed_clip_paths, transcript_for_ai, transcript_segments, validate_detected_songs
 from folia_native import FOLIA_EFFECTS, FOLIA_RENDERER_REVISION, apply_folia_preview_profile, build_folia_config, normalized_folia_settings
-from song_identity import backfill_identity, identity_fields, matched_candidate_fields, resolve_search_identity
+from song_identity import backfill_identity, fingerprint_consensus, identity_fields, matched_candidate_fields, resolve_search_identity
 
 MEDIA=Path(os.getenv('MEDIA_ROOT','/media/bililive')).resolve()
 MEDIA_WRITE=Path(os.getenv('MEDIA_WRITE_ROOT','/media-output')).resolve()
@@ -45,7 +45,6 @@ FINGERPRINT_PROVIDER=os.getenv('FINGERPRINT_PROVIDER','acrcloud').strip().lower(
 # candidate pool (every version of the wrong title gets searched, none of them
 # is the real song), which reads differently from "the right song, a mediocre
 # lyric version" (one weak candidate among otherwise-reasonable ones).
-SONG_IDENTITY_MIN_ANCHOR_COUNT=3; SONG_IDENTITY_MAX_ZERO_SCORE_RATIO=0.5
 # Second identification source for a suspicious fingerprint hit. NetEase's own
 # audio_match needs a proprietary client-side fingerprint (audioFP) nobody has a
 # clean reusable implementation for -- the only known route is extracting NetEase's
@@ -904,7 +903,7 @@ async def fetch_netease_candidate_lyrics(song_id:str):
     except Exception: data=await platform_get('http://gateway:8080/netease',[('/lyric',{'id':song_id})])
     return T2S.convert((((data or {}).get('lrc') or {}).get('lyric') or '').strip())
 
-async def collect_standard_timeline_candidates(j:dict[str,Any],asr:list[dict[str,Any]],progress:dict[str,Any]):
+async def collect_standard_timeline_candidates(j:dict[str,Any],asr:list[dict[str,Any]],progress:dict[str,Any],balanced:bool=False):
     # Search from the identified name, never from the display title: the display
     # title is what a previous run's lyric candidate may have overwritten, and
     # searching under an overwritten name is what made the pool degenerate in the
@@ -920,7 +919,7 @@ async def collect_standard_timeline_candidates(j:dict[str,Any],asr:list[dict[str
     queries=[]
     for query in [title,*fragments]:
         if query and query not in queries: queries.append(query)
-    pool={}; lddc_ref=''; lddc_failed=False
+    search_groups=[]; pool={}; lddc_ref=''; lddc_failed=False
     for number,query in enumerate(queries,1):
         progress.update({'phase':f'正在搜索标准歌词：{query[:24]}','query':query,'queries_done':number-1,'queries_total':len(queries)})
         update(j['id'],status='timeline_matching',alignment={**(j.get('alignment') or {}),'timeline_match':progress},error='')
@@ -929,11 +928,13 @@ async def collect_standard_timeline_candidates(j:dict[str,Any],asr:list[dict[str
         except Exception:
             lddc_failed=True; found=await search_netease_candidates(query)
             found=[{**candidate,'candidate_ref':'','timing_type':'line','word_coverage':0} for candidate in found]
-        for candidate in found:
-            pool.setdefault(candidate['candidate_id'],candidate)
+        search_groups.append(found)
+        if not balanced:
+            for candidate in found:
+                pool.setdefault(candidate['candidate_id'],candidate)
+                if len(pool)>=12: break
             if len(pool)>=12: break
-        if len(pool)>=12: break
-    candidates=list(pool.values())[:12]
+    candidates=balanced_candidate_pool(search_groups,12) if balanced else list(pool.values())[:12]
     if not candidates: raise RuntimeError('没有搜索到可比较的标准歌词版本')
     semaphore=asyncio.Semaphore(3)
     async def load(candidate):
@@ -1098,7 +1099,7 @@ def auto_standard_timeline_task(jid:str):
         # 猜歌名同样不可靠（同一段文本换模型给出三个互相矛盾且都错的答案）。指纹识别
         # 直接认原曲，不受识别错字影响，认出来就直接采用、连切片文件名一起改正。
         # 识别不出来时保持原歌名，流程照常。
-        shazam_hit,fingerprint_provider=identify_song_fingerprint(MEDIA/j['source'],duration_ms,progress,jid,old)
+        shazam_hit,fingerprint_provider,fingerprint_trace=identify_song_fingerprint(MEDIA/j['source'],duration_ms,progress,jid,old)
         identified_by_fingerprint=bool(shazam_hit and normalize_identity(shazam_hit['title'])!=normalize_identity(str(j.get('title') or '')))
         if identified_by_fingerprint:
             progress.update({'phase':f'指纹识别到《{shazam_hit["title"][:20]}》，改用这个歌名'})
@@ -1107,66 +1108,72 @@ def auto_standard_timeline_task(jid:str):
         scored=asyncio.run(collect_standard_timeline_candidates(j,asr,progress))
         if not scored: raise RuntimeError('没有搜索到可比较的标准歌词版本')
         pool_quality=candidate_pool_quality(scored)
-        # Checked whenever this run had a fingerprint opinion at all, not only when
-        # it just renamed the job -- a job whose title was adopted from a *prior*
-        # run's (wrong) fingerprint hit re-identifies the same wrong title on every
-        # rerun, so gating on "changed this run" would never catch it again.
-        identity_suspicious=bool(shazam_hit) and song_identity_suspicious(pool_quality,min_anchor_count=SONG_IDENTITY_MIN_ANCHOR_COUNT,max_zero_score_ratio=SONG_IDENTITY_MAX_ZERO_SCORE_RATIO)
-        identity_rescanned=False
-        secondary_provider=None; secondary_title=''; secondary_used=False
-        # 一个"命中"不等于"歌曲身份已确认"：真实案例，指纹把一段切片先后认成《值得
-        # (Dj版)》《在他乡》，实际是云汐《离人赋》，而这一步的搜索结果早就暴露了异常
-        # ——12 个候选里 8 个零分零锚点，"赢家"也只挂了 1 个锚点。这种"候选池整体崩溃"
-        # 是歌曲身份本身搞错的信号，跟"歌是对的、只是这版歌词质量一般"完全不同，不该
-        # 被当成普通的低置信歌词就此了事。
-        # 命中质量存疑时，先问 ACRCloud 要第二意见（同一真实坏案例上实测：11 个窗口
-        # 扫过去，Shazam 5 次给出 5 个不同的错误歌名、从未认对，ACRCloud 10/11 认成了
-        # 某个版本的《离人赋》）；ACRCloud 没配置、没命中或者给不出更强候选时，退回
-        # Shazam 自己的恢复扫描当兜底。两条路都没能给出更强证据时，保留原候选池继续
-        # 往下走——现有 low_confidence/本地对齐兜底已经不会把它当高置信输出，这里只
-        # 负责把"很可能歌曲身份错了"这个事实如实报出来，不在这一步做阻断式人工复核。
-        if identity_suspicious:
-            progress.update({'phase':'指纹候选歌词证据薄弱，正在向 ACRCloud 询问第二意见'})
-            update(jid,status='timeline_matching',alignment={**old,'timeline_match':progress},error='')
-            probe_offset_ms=int(shazam_hit['matched_at_ms'])
-            acr_hit=None
-            if ACRCLOUD_ACCESS_KEY and ACRCLOUD_ACCESS_SECRET and ACRCLOUD_HOST:
-                acr_hit=acrcloud_identify_window(MEDIA/j['source'],probe_offset_ms,ACRCLOUD_ACCESS_KEY,ACRCLOUD_ACCESS_SECRET,ACRCLOUD_HOST)
-            if acr_hit and acr_hit.get('title') and normalize_identity(acr_hit['title'])!=normalize_identity(str(j.get('title') or '')):
-                secondary_provider,secondary_title='acrcloud',acr_hit['title']
-                acr_j=adopt_identified_song(jid,j,{'title':acr_hit['title'],'artist':acr_hit.get('artist','')},'acrcloud')
-                acr_scored=asyncio.run(collect_standard_timeline_candidates(acr_j,asr,progress))
-                acr_quality=candidate_pool_quality(acr_scored)
-                if acr_scored and acr_quality['best_anchor_count']>pool_quality['best_anchor_count']:
-                    j,scored,pool_quality=acr_j,acr_scored,acr_quality
-                    identity_suspicious=song_identity_suspicious(pool_quality,min_anchor_count=SONG_IDENTITY_MIN_ANCHOR_COUNT,max_zero_score_ratio=SONG_IDENTITY_MAX_ZERO_SCORE_RATIO)
-                    secondary_used=True
-            if identity_suspicious:
-                progress.update({'phase':'第二意见仍不理想，正在重新扫描指纹确认歌曲身份'})
-                update(jid,status='timeline_matching',alignment={**old,'timeline_match':progress},error='')
-                resume_from_ms=probe_offset_ms+SHAZAM_STEP_MS
-                rescan_hit,_=identify_song_fingerprint(MEDIA/j['source'],duration_ms,progress,jid,old,min_offset_ms=resume_from_ms)
-                identity_rescanned=True
-                if rescan_hit and normalize_identity(rescan_hit['title'])!=normalize_identity(str(j.get('title') or '')):
-                    rescan_j=adopt_identified_song(jid,j,rescan_hit,fingerprint_provider)
-                    rescan_scored=asyncio.run(collect_standard_timeline_candidates(rescan_j,asr,progress))
-                    rescan_quality=candidate_pool_quality(rescan_scored)
-                    if rescan_scored and rescan_quality['best_anchor_count']>pool_quality['best_anchor_count']:
-                        j,scored,pool_quality=rescan_j,rescan_scored,rescan_quality
-                        identity_suspicious=song_identity_suspicious(pool_quality,min_anchor_count=SONG_IDENTITY_MIN_ANCHOR_COUNT,max_zero_score_ratio=SONG_IDENTITY_MAX_ZERO_SCORE_RATIO)
-                        if not secondary_used: secondary_provider,secondary_title,secondary_used='shazam',rescan_hit['title'],True
         timed=[item for item in scored if item['timed'] and item['result'].get('core_anchors')]
         usable=timed or [item for item in scored if item['plain'] and item['result'].get('core_anchors')]
         # 零锚点候选不再直接判定硬失败：取综合分最高的候选（哪怕零锚点）继续往下走；
         # 真正的硬失败只剩"连一个候选都搜不到"或者补救链跑完仍然建不出任何时间轴
         # 这两种情况（下面 if not lines 那一行）。
-        chosen=choose_best_timeline_candidate(usable) if usable else max(scored,key=lambda x:float(x['result'].get('score',0)))
-        chosen,scored,asr,separation=maybe_retry_with_separated_vocals(jid,j,chosen,scored,asr,progress)
+        initial_chosen=choose_best_timeline_candidate(usable) if usable else max(scored,key=lambda x:float(x['result'].get('score',0)))
+        chosen=initial_chosen
+        identity_recheck={'triggered':False,'reason':'initial_high_confidence','fingerprint':fingerprint_trace,
+            'candidate_before':initial_chosen['candidate'].get('candidate_id'),'candidate_after':initial_chosen['candidate'].get('candidate_id'),
+            'corrected':False,'correction_source':''}
+        secondary_provider=None; secondary_title=''; secondary_used=False
+        initial_window_count=len(fingerprint_trace.get('windows') or [])
+        if identity_recheck_needed(initial_chosen):
+            identity_recheck.update({'triggered':True,'reason':'initial_low_confidence'})
+            consensus_hit=None
+            if fingerprint_provider=='acrcloud':
+                consensus_hit,fingerprint_trace=recheck_song_acrcloud(
+                    MEDIA/j['source'],duration_ms,fingerprint_trace,progress,jid,old)
+                identity_recheck['fingerprint']=fingerprint_trace
+            recovery_jobs=[j]
+            if consensus_hit and consensus_hit.get('title'):
+                secondary_provider='acrcloud'; secondary_title=str(consensus_hit.get('title') or '')
+                if normalize_identity(secondary_title)!=normalize_identity(resolve_search_identity(j)['title']):
+                    j=adopt_identified_song(jid,j,consensus_hit,'acrcloud')
+                    secondary_used=True
+                    recovery_jobs.append(j)
+            merged={item['candidate']['candidate_id']:item for item in scored}
+            for recovery_job in recovery_jobs:
+                recovered=asyncio.run(collect_standard_timeline_candidates(recovery_job,asr,progress,balanced=True))
+                for item in recovered:
+                    key=item['candidate']['candidate_id']
+                    previous=merged.get(key)
+                    if previous is None or float(item['result'].get('score',0))>float(previous['result'].get('score',0)):
+                        merged[key]=item
+            scored=list(merged.values())
+            pool_quality=candidate_pool_quality(scored)
+            recovery_timed=[item for item in scored if item['timed'] and item['result'].get('core_anchors')]
+            recovery_usable=recovery_timed or [item for item in scored if item['plain'] and item['result'].get('core_anchors')]
+            recovered_chosen=choose_identity_recovery_candidate(recovery_usable,initial_chosen) if recovery_usable else chosen
+            if identity_evidence_can_override(initial_chosen,recovered_chosen):
+                chosen=recovered_chosen
+                current_identity=resolve_search_identity(j)
+                if normalize_identity(chosen['candidate'].get('title',''))!=normalize_identity(current_identity['title']):
+                    j=adopt_identified_song(jid,j,{'title':chosen['candidate'].get('title',''),
+                        'artist':chosen['candidate'].get('artist','')},'evidence_consensus')
+                    identity_recheck.update({'corrected':True,'correction_source':'evidence_consensus'})
+            elif recovered_chosen is not initial_chosen:
+                chosen=recovered_chosen
+            identity_recheck.update({'candidate_after':chosen['candidate'].get('candidate_id'),
+                'recovered_high_confidence':not bool(chosen['result'].get('low_confidence',True))})
+        identity_rescanned=len(fingerprint_trace.get('windows') or [])>initial_window_count
+        identity_suspicious=bool(identity_recheck['triggered'] and chosen['result'].get('low_confidence',True))
+        if bool(chosen['result'].get('low_confidence',True)):
+            chosen,scored,asr,separation=maybe_retry_with_separated_vocals(jid,j,chosen,scored,asr,progress)
+        else:
+            separation={'applied':False,'reason':'not_needed_high_confidence','coverage':None}
         if separation.get('applied'):
             old={**old,'asr_segments':asr}
             update(jid,alignment={**old,'timeline_match':progress})
 
         candidate,result=chosen['candidate'],chosen['result']
+        current_identity=resolve_search_identity(j)
+        if identity_evidence_can_override(initial_chosen,chosen) and normalize_identity(candidate.get('title',''))!=normalize_identity(current_identity['title']):
+            j=adopt_identified_song(jid,j,{'title':candidate.get('title',''),'artist':candidate.get('artist','')},'evidence_consensus')
+            identity_recheck.update({'corrected':True,'correction_source':'evidence_consensus',
+                'candidate_after':candidate.get('candidate_id')})
         # 判定一律只读 core_anchors——那是核心锚点链，是这首歌的时钟；evidence_anchors
         # 是容忍窗宽达数秒的证据链，只负责把 ASR 行挂到歌词行上，拿它做任何质量判断
         # 都是拿一把松尺子量紧公差（历史教训见 standard_timeline.max_anchor_drift_ms）。
@@ -1216,7 +1223,7 @@ def auto_standard_timeline_task(jid:str):
             meta=item['candidate']; scored_result=item['result']
             summaries.append({'candidate_id':meta['candidate_id'],'platform':meta.get('platform','netease'),'title':meta.get('title',''),'artist':meta.get('artist',''),'album':meta.get('album',''),'timing_type':meta.get('timing_type','line'),'word_coverage':meta.get('word_coverage',0),'timed':bool(item['timed']),'score':round(float(scored_result.get('score',0)),3),'anchor_count':len(scored_result.get('core_anchors') or []),'word_anchor_count':int(scored_result.get('word_anchor_count',0)),'word_residual_p90_ms':scored_result.get('word_residual_p90_ms'),'low_confidence':bool(scored_result.get('low_confidence',True))})
         low_confidence=confidence_tier!='high'
-        report={'status':'completed','mode':mode,'platform':candidate.get('platform','netease'),'candidate_id':candidate['candidate_id'],'song_id':candidate.get('song_id',''),'lddc_ref':chosen.get('lddc_ref',''),'timing_type':candidate.get('timing_type','line'),'word_coverage':candidate.get('word_coverage',0),'title':candidate.get('title',''),'artist':candidate.get('artist',''),'album':candidate.get('album',''),'shift_ms':shift_ms,'shift_min_ms':result.get('shift_min_ms'),'shift_max_ms':result.get('shift_max_ms'),'shift_range_ms':result.get('shift_range_ms'),'anchor_count':len(core_anchors),'evidence_anchor_count':len(evidence_anchors),'evidence_added_count':len(evidence_anchors)-len(core_anchors),'anchor_span_ms':result.get('anchor_span_ms',0),'core_span_ms':result.get('core_span_ms',0),'residual_p90_ms':result.get('residual_p90_ms'),'median_abs_residual_ms':result.get('median_abs_residual_ms'),'mad_ms':result.get('mad_ms'),'max_anchor_drift_ms':result.get('max_anchor_drift_ms'),'long_baseline_pairs':result.get('long_baseline_pairs'),'drift_over_span_ms':result.get('drift_over_span_ms'),'direction_support':result.get('direction_support'),'affine_mad_ms':result.get('affine_mad_ms'),'mad_improvement_ratio':result.get('mad_improvement_ratio'),'suspect_regions':suspect_regions,'suspect_region_reasons':sorted({str(r.get('reason','')) for r in suspect_regions}),'shazam':shazam_hit,'song_identity_suspicious':identity_suspicious,'song_identity_rescanned':identity_rescanned,'song_identity_pool_size':pool_quality['candidate_count'],'song_identity_zero_score_ratio':pool_quality['zero_score_ratio'],'song_identity_best_anchor_count':pool_quality['best_anchor_count'],'song_identity_primary_provider':'shazam' if shazam_hit else None,'song_identity_primary_title':(shazam_hit or {}).get('title'),'song_identity_secondary_provider':secondary_provider,'song_identity_secondary_title':secondary_title or None,'song_identity_secondary_used':secondary_used,'confidence_tier':confidence_tier,'full_realign_used':full_realign_used,'line_shift_ms':result.get('line_shift_ms',shift_ms),'effective_shift_ms':result.get('effective_shift_ms',shift_ms),'shift_source':result.get('shift_source','line'),'timing_model':result.get('timing_model','line_global'),'word_bootstrap_status':result.get('word_bootstrap_status'),'word_eligible_line_count':int(result.get('word_eligible_line_count',0)),'word_dominant_cluster_line_count':int(result.get('word_dominant_cluster_line_count',0)),'word_local_shift_line_count':int(result.get('word_local_shift_line_count',0)),'word_anchor_count':int(result.get('word_anchor_count',0)),'word_anchor_raw_count':int(result.get('word_anchor_raw_count',0)),'word_anchor_rejected_count':int(result.get('word_anchor_rejected_count',0)),'word_anchor_lines':int(result.get('word_anchor_lines',0)),'word_anchor_span_ms':int(result.get('word_anchor_span_ms',0)),'word_residual_p90_ms':result.get('word_residual_p90_ms'),'word_median_abs_residual_ms':result.get('word_median_abs_residual_ms'),'word_mad_ms':result.get('word_mad_ms'),'word_model_shift_ms':result.get('word_model_shift_ms'),'word_model_median_abs_residual_ms':result.get('word_model_median_abs_residual_ms'),'word_model_mad_ms':result.get('word_model_mad_ms'),'word_model_inlier_ratio_500':result.get('word_model_inlier_ratio_500'),'word_model_coverage_ratio':result.get('word_model_coverage_ratio'),'word_vs_line_shift_diff_ms':result.get('word_vs_line_shift_diff_ms'),'cross_model_conflict':bool(result.get('cross_model_conflict',False)),'match_confidence':result.get('match_confidence','low' if low_confidence else 'high'),'timing_confidence':result.get('timing_confidence','unavailable'),'word_timing_counts':word_counts,'confidence':'low' if low_confidence else 'high','low_confidence':low_confidence,'reason':result.get('reason',''),'core_anchors':core_anchors,'evidence_anchors':evidence_anchors,'candidates':summaries,'finished_at':time.time()}
+        report={'status':'completed','mode':mode,'platform':candidate.get('platform','netease'),'candidate_id':candidate['candidate_id'],'song_id':candidate.get('song_id',''),'lddc_ref':chosen.get('lddc_ref',''),'timing_type':candidate.get('timing_type','line'),'word_coverage':candidate.get('word_coverage',0),'title':candidate.get('title',''),'artist':candidate.get('artist',''),'album':candidate.get('album',''),'shift_ms':shift_ms,'shift_min_ms':result.get('shift_min_ms'),'shift_max_ms':result.get('shift_max_ms'),'shift_range_ms':result.get('shift_range_ms'),'anchor_count':len(core_anchors),'evidence_anchor_count':len(evidence_anchors),'evidence_added_count':len(evidence_anchors)-len(core_anchors),'anchor_span_ms':result.get('anchor_span_ms',0),'core_span_ms':result.get('core_span_ms',0),'residual_p90_ms':result.get('residual_p90_ms'),'median_abs_residual_ms':result.get('median_abs_residual_ms'),'mad_ms':result.get('mad_ms'),'max_anchor_drift_ms':result.get('max_anchor_drift_ms'),'long_baseline_pairs':result.get('long_baseline_pairs'),'drift_over_span_ms':result.get('drift_over_span_ms'),'direction_support':result.get('direction_support'),'affine_mad_ms':result.get('affine_mad_ms'),'mad_improvement_ratio':result.get('mad_improvement_ratio'),'suspect_regions':suspect_regions,'suspect_region_reasons':sorted({str(r.get('reason','')) for r in suspect_regions}),'shazam':shazam_hit,'fingerprint_provider':fingerprint_provider,'fingerprint_trace':fingerprint_trace,'identity_recheck':identity_recheck,'song_identity_suspicious':identity_suspicious,'song_identity_rescanned':identity_rescanned,'song_identity_pool_size':pool_quality['candidate_count'],'song_identity_zero_score_ratio':pool_quality['zero_score_ratio'],'song_identity_best_anchor_count':pool_quality['best_anchor_count'],'song_identity_primary_provider':fingerprint_provider if shazam_hit else None,'song_identity_primary_title':(shazam_hit or {}).get('title'),'song_identity_secondary_provider':secondary_provider,'song_identity_secondary_title':secondary_title or None,'song_identity_secondary_used':secondary_used,'confidence_tier':confidence_tier,'full_realign_used':full_realign_used,'line_shift_ms':result.get('line_shift_ms',shift_ms),'effective_shift_ms':result.get('effective_shift_ms',shift_ms),'shift_source':result.get('shift_source','line'),'timing_model':result.get('timing_model','line_global'),'word_bootstrap_status':result.get('word_bootstrap_status'),'word_eligible_line_count':int(result.get('word_eligible_line_count',0)),'word_dominant_cluster_line_count':int(result.get('word_dominant_cluster_line_count',0)),'word_local_shift_line_count':int(result.get('word_local_shift_line_count',0)),'word_anchor_count':int(result.get('word_anchor_count',0)),'word_anchor_raw_count':int(result.get('word_anchor_raw_count',0)),'word_anchor_rejected_count':int(result.get('word_anchor_rejected_count',0)),'word_anchor_lines':int(result.get('word_anchor_lines',0)),'word_anchor_span_ms':int(result.get('word_anchor_span_ms',0)),'word_residual_p90_ms':result.get('word_residual_p90_ms'),'word_median_abs_residual_ms':result.get('word_median_abs_residual_ms'),'word_mad_ms':result.get('word_mad_ms'),'word_model_shift_ms':result.get('word_model_shift_ms'),'word_model_median_abs_residual_ms':result.get('word_model_median_abs_residual_ms'),'word_model_mad_ms':result.get('word_model_mad_ms'),'word_model_inlier_ratio_500':result.get('word_model_inlier_ratio_500'),'word_model_coverage_ratio':result.get('word_model_coverage_ratio'),'word_vs_line_shift_diff_ms':result.get('word_vs_line_shift_diff_ms'),'cross_model_conflict':bool(result.get('cross_model_conflict',False)),'match_confidence':result.get('match_confidence','low' if low_confidence else 'high'),'timing_confidence':result.get('timing_confidence','unavailable'),'word_timing_counts':word_counts,'confidence':'low' if low_confidence else 'high','low_confidence':low_confidence,'reason':result.get('reason',''),'core_anchors':core_anchors,'evidence_anchors':evidence_anchors,'candidates':summaries,'finished_at':time.time()}
         identity=resolve_search_identity(j)
         report.update({**matched_candidate_fields(candidate),'identified_title':identity['title'],
             'identified_artist':identity['artist'],'identity_source':identity['source'],
@@ -1378,7 +1385,7 @@ def sync_clip_rename_to_automation(old_path:Path,new_path:Path):
             except Exception: pass
 
 def adopt_identified_song(jid:str,j:dict[str,Any],hit:dict[str,Any],source:str='shazam')->dict[str,Any]:
-    """Take the fingerprinted title as this clip's real name, on disk as well as in the job.
+    """Adopt a recognised or strongly corroborated title for the job and clip.
 
     The slice was named from the automation stage's guess off the rough line-level
     ASR, which is how a recording of 《很任性》 ended up as 人人心.mp4. Renaming the
@@ -1389,9 +1396,9 @@ def adopt_identified_song(jid:str,j:dict[str,Any],hit:dict[str,Any],source:str='
     so a second song that fingerprints the same never overwrites the first.
     """
     source_rel=Path(str(j.get('source') or ''))
-    # A fingerprint is an identification, so this is one of the few places allowed
-    # to write identity -- and it writes the identity columns, not just the
-    # display title, so later lyric searches start from it.
+    # Recognition, including the guarded evidence_consensus recovery, is one of
+    # the few paths allowed to write identity. It updates the identity columns,
+    # not just the display title, so later lyric searches start from it.
     updates:dict[str,Any]={'title':hit['title'],**identity_fields(hit['title'],str(hit.get('artist') or ''),source)}
     target_name=safe_clip_name(hit['title'])+source_rel.suffix
     if source_rel.name and target_name!=source_rel.name:
@@ -1417,11 +1424,8 @@ def identify_song_shazam(source:Path,duration_ms:int,progress:dict[str,Any],jid:
     Best effort by design: several windows spread across the clip are tried and
     the first hit wins; no hit at all just leaves the existing title in place.
 
-    min_offset_ms skips ahead to resume scanning past a window whose hit already
-    turned out wrong (see SONG_IDENTITY_MIN_ANCHOR_COUNT) rather than starting
-    over from the clip's beginning -- a fresh, independent opinion from the rest
-    of the clip, at the cost of one more scan only when the first one was
-    actually in doubt.
+    min_offset_ms skips ahead when a caller explicitly resumes scanning rather
+    than starting over from the clip's beginning.
     """
     # A cover only fingerprints where the performance tracks the release closely
     # enough, which can be a single stretch of one chorus: spreading a handful of
@@ -1447,8 +1451,11 @@ def identify_song_shazam(source:Path,duration_ms:int,progress:dict[str,Any],jid:
         return None
     return payload if isinstance(payload,dict) and payload.get('title') else None
 
-def identify_song_acrcloud(source:Path,duration_ms:int,progress:dict[str,Any],jid:str='',old:dict[str,Any]|None=None,min_offset_ms:int=0)->dict[str,Any]|None:
-    """Walk the clip with ACRCloud, first hit wins.
+def acrcloud_probe_offsets(duration_ms:int,min_offset_ms:int=0)->list[int]:
+    return list(range(min_offset_ms,max(min_offset_ms+1,duration_ms-10000),SHAZAM_STEP_MS))[:24]
+
+def identify_song_acrcloud(source:Path,duration_ms:int,progress:dict[str,Any],jid:str='',old:dict[str,Any]|None=None,min_offset_ms:int=0):
+    """Run the normal fast path: stop at ACRCloud's first matching window.
 
     Same shape as the Shazam probe it replaces, and the same reasoning behind it:
     a cover only fingerprints where the performance tracks the release closely,
@@ -1462,28 +1469,77 @@ def identify_song_acrcloud(source:Path,duration_ms:int,progress:dict[str,Any],ji
     could not place the performance. Whether ACRCloud does better on live covers
     is what this switch is for.
 
-    Never raises and never fails the task: no hit leaves the existing title in place.
+    The trace is retained so a low-confidence result can continue from the next
+    untested window without repeating requests. High-confidence songs never pay
+    for that recovery scan.
     """
-    if not (ACRCLOUD_ACCESS_KEY and ACRCLOUD_ACCESS_SECRET and ACRCLOUD_HOST): return None
-    offsets=list(range(min_offset_ms,max(min_offset_ms+1,duration_ms-10000),SHAZAM_STEP_MS))[:24]
-    if not offsets: return None
+    trace={'provider':'acrcloud','windows':[],'hits':[],'exhausted':False}
+    if not (ACRCLOUD_ACCESS_KEY and ACRCLOUD_ACCESS_SECRET and ACRCLOUD_HOST):
+        return None,{**trace,'exhausted':True,'error':'not_configured'}
+    offsets=acrcloud_probe_offsets(duration_ms,min_offset_ms)
+    if not offsets: return None,{**trace,'exhausted':True}
     progress.update({'phase':'正在用音频指纹识别歌曲'})
     if jid:
         try: update(jid,status='timeline_matching',alignment={**(old or {}),'timeline_match':progress},error='')
         except Exception: pass
     deadline=time.monotonic()+240
+    for index,offset in enumerate(offsets):
+        if time.monotonic()>=deadline:
+            trace['error']='deadline_exceeded'; break
+        outcome=acrcloud_identify_window_result(source,offset,ACRCLOUD_ACCESS_KEY,ACRCLOUD_ACCESS_SECRET,ACRCLOUD_HOST,SHAZAM_PROBE_MS)
+        hit=outcome.get('hit')
+        row={'offset_ms':offset,'status':outcome.get('status','no_match')}
+        if outcome.get('error'): row['error']=outcome['error']
+        if hit:
+            hit={**hit,'matched_at_ms':offset}
+            trace['hits'].append(hit)
+            row.update({'title':hit.get('title',''),'artist':hit.get('artist',''),'score':hit.get('score')})
+        trace['windows'].append(row)
+        if hit:
+            trace['exhausted']=index==len(offsets)-1
+            return hit,trace
+    trace['exhausted']=len(trace['windows'])>=len(offsets)
+    return None,trace
+
+def recheck_song_acrcloud(source:Path,duration_ms:int,trace:dict[str,Any],progress:dict[str,Any],jid:str='',old:dict[str,Any]|None=None):
+    """Continue a low-confidence ACRCloud scan until two windows agree."""
+    if trace.get('exhausted') or not (ACRCLOUD_ACCESS_KEY and ACRCLOUD_ACCESS_SECRET and ACRCLOUD_HOST):
+        return None,trace
+    checked={int(row.get('offset_ms',-1)) for row in trace.get('windows') or []}
+    hits=list(trace.get('hits') or [])
+    progress.update({'phase':'歌词初选低置信，正在复查音频指纹','identity_recheck':True})
+    if jid:
+        try: update(jid,status='timeline_matching',alignment={**(old or {}),'timeline_match':progress},error='')
+        except Exception: pass
+    deadline=time.monotonic()+240
+    offsets=acrcloud_probe_offsets(duration_ms)
     for offset in offsets:
-        if time.monotonic()>=deadline: break
-        hit=acrcloud_identify_window(source,offset,ACRCLOUD_ACCESS_KEY,ACRCLOUD_ACCESS_SECRET,ACRCLOUD_HOST,SHAZAM_PROBE_MS)
-        if hit and str(hit.get('title') or '').strip():
-            return {**hit,'matched_at_ms':offset}
-    return None
+        if offset in checked: continue
+        if time.monotonic()>=deadline:
+            trace['error']='recheck_deadline_exceeded'; break
+        outcome=acrcloud_identify_window_result(source,offset,ACRCLOUD_ACCESS_KEY,ACRCLOUD_ACCESS_SECRET,ACRCLOUD_HOST,SHAZAM_PROBE_MS)
+        hit=outcome.get('hit')
+        row={'offset_ms':offset,'status':outcome.get('status','no_match')}
+        if outcome.get('error'): row['error']=outcome['error']
+        if hit:
+            hit={**hit,'matched_at_ms':offset}
+            hits.append(hit); trace.setdefault('hits',[]).append(hit)
+            row.update({'title':hit.get('title',''),'artist':hit.get('artist',''),'score':hit.get('score')})
+        trace.setdefault('windows',[]).append(row)
+        agreed=fingerprint_consensus(hits)
+        if agreed:
+            trace.update({'agreement_count':agreed['agreement_count'],'consensus_title':agreed.get('title','')})
+            return agreed,trace
+    trace['exhausted']=len({int(row.get('offset_ms',-1)) for row in trace.get('windows') or []})>=len(offsets)
+    return None,trace
 
 def identify_song_fingerprint(source:Path,duration_ms:int,progress:dict[str,Any],jid:str='',old:dict[str,Any]|None=None,min_offset_ms:int=0):
     """The identification stage's one fingerprint call, and which service answered it."""
     if FINGERPRINT_PROVIDER=='shazam':
-        return identify_song_shazam(source,duration_ms,progress,jid,old,min_offset_ms),'shazam'
-    return identify_song_acrcloud(source,duration_ms,progress,jid,old,min_offset_ms),'acrcloud'
+        hit=identify_song_shazam(source,duration_ms,progress,jid,old,min_offset_ms)
+        return hit,'shazam',{'provider':'shazam','windows':[],'hits':[hit] if hit else [],'exhausted':True}
+    hit,trace=identify_song_acrcloud(source,duration_ms,progress,jid,old,min_offset_ms)
+    return hit,'acrcloud',trace
 
 def align_single_asr_segment(source:Path,seg:dict[str,Any],duration_ms:int,padding_ms:int=500):
     """Best-effort local repair: force-align one ASR segment on its own narrow window.
