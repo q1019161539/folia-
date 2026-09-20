@@ -1170,7 +1170,14 @@ def auto_standard_timeline_task(jid:str):
 
         candidate,result=chosen['candidate'],chosen['result']
         current_identity=resolve_search_identity(j)
-        if identity_evidence_can_override(initial_chosen,chosen) and normalize_identity(candidate.get('title',''))!=normalize_identity(current_identity['title']):
+        candidate_artist=str(candidate.get('artist') or '').strip()
+        strong_title_override=(identity_evidence_can_override(initial_chosen,chosen)
+            and normalize_identity(candidate.get('title',''))!=normalize_identity(current_identity['title']))
+        evidence_artist_sync=(str(j.get('identity_source') or '')=='evidence_consensus'
+            and normalize_identity(candidate.get('title',''))==normalize_identity(current_identity['title'])
+            and candidate_artist
+            and normalize_identity(candidate_artist)!=normalize_identity(current_identity.get('artist','')))
+        if strong_title_override or evidence_artist_sync:
             j=adopt_identified_song(jid,j,{'title':candidate.get('title',''),'artist':candidate.get('artist','')},'evidence_consensus')
             identity_recheck.update({'corrected':True,'correction_source':'evidence_consensus',
                 'candidate_after':candidate.get('candidate_id')})
