@@ -4,5 +4,6 @@ httpx==0.28.1
 dashscope>=1.25.23,<2
 opencc-python-reimplemented==0.1.7
 python-multipart==0.0.20
+fonttools[woff]==4.60.1
 tzdata
 shazamio>=0.8,<1

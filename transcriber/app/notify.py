@@ -13,6 +13,7 @@ AUTOMATION_NOTIFICATION_TITLES = {
     "clips_completed": "✂️ Folia 切片完成",
     "render_queue_waiting": "⏳ Folia 渲染排队中",
     "outputs_completed": "🎬 Folia 成片处理完成",
+    "folia_update_available": "⬆️ Folia 稳定版可更新",
 }
 
 # Sent as plain text, not markdown: a text message is readable in ordinary
@@ -187,6 +188,17 @@ def automation_notification(payload: dict[str, object]) -> tuple[str, str]:
     if event == "outputs_completed":
         return AUTOMATION_NOTIFICATION_TITLES[event], _fit(
             _outputs_body(payload), MAX_NOTIFICATION_BYTES)
+
+    if event == "folia_update_available":
+        lines = [
+            f"当前：{_clip(payload.get('current_release'), 40)} / Stack {_clip(payload.get('current_stack'), 40)}",
+            f"最新：{_clip(payload.get('latest_release'), 40)} / Stack {_clip(payload.get('latest_stack'), 40)}",
+            "已发现稳定版，等待候选镜像回归；不会自动替换正式容器。",
+        ]
+        url = _clip(payload.get("release_url"), 400)
+        if url:
+            lines.append(url)
+        return AUTOMATION_NOTIFICATION_TITLES[event], "\n".join(lines)
 
     lines = [f"主播：{broadcaster}", f"录播：{recording}"]
     if event == "asr_started":

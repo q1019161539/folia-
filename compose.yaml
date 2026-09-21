@@ -35,7 +35,6 @@ services:
     restart: unless-stopped
     environment:
       MEDIA_ROOT: /media/bililive
-      SEPARATION_RETRY_COVERAGE: "0.10"
       MEDIA_WRITE_ROOT: /media-output
       MEDIA_HOST_PATH: /vol1/1000/docker/bililive-tool/video
       DATA_ROOT: /data
@@ -96,6 +95,7 @@ services:
     volumes:
       - /vol1/1000/docker/bililive-tool/video:/media/bililive:ro
       - /vol1/1000/video/Folia成片:/output
+      - ./data/fonts:/fonts:ro
     devices:
       - /dev/dri/renderD128:/dev/dri/renderD128
     group_add:
@@ -136,7 +136,6 @@ services:
       WHISPER_DEVICE: cpu
       WHISPER_COMPUTE_TYPE: int8
       HF_HOME: /models/huggingface
-      HF_HUB_OFFLINE: "1"
     volumes:
       - ./models:/models
     healthcheck:
@@ -169,7 +168,6 @@ services:
       FOLIA_FRIENDLY_OUTPUT_DISPLAY_ROOT: /vol1/1000/docker/folia-asr-mvp/output/recordings
       FOLIA_LOCAL_WORKER_URL: http://local-worker:8001
       HF_HOME: /models/huggingface
-      HF_HUB_OFFLINE: "1"
       HUGGINGFACE_HUB_CACHE: /models/huggingface/hub
       TORCH_HOME: /models/torch
       XDG_CACHE_HOME: /models/cache

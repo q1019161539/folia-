@@ -1,6 +1,21 @@
 # Folia 歌词视频工坊交接（Claude Code）
 
-日期：2026-09-14
+原始交接日期：2026-09-14；本次更新：2026-09-21
+
+## 2026-09-21 接管快照（请优先阅读）
+
+以下内容覆盖本文件后面的旧交接状态；旧记录保留用于历史背景，不要按旧日期的“接手后优先事项”重复操作。
+
+- 当前本地项目仍是 `C:\Users\34862\Documents\飞牛\folia-video-studio`；NAS 部署目录是 `/vol1/1000/docker/folia-video-studio`，入口 `http://100.111.1.11:18081/`。
+- 已正式部署 Folia `v0.7.7` / Docker Stack `1.0.26`，原生渲染器 revision `80c073490482303d4283d1d5205be7707c96179d`，补丁 profile `studio-font-outline-v1`。正式 API、网页、转录服务和原生渲染器均已健康。
+- 效果页现在只保留 classic 和 Folia 原生；Folia 原生保留 13 个模式。历史 AMLL/Kinetic/旧 Folia 效果不改数据库，加载时回退 classic。
+- Folia 原生新增统一主歌词描边：默认开启、黑色、3 px，可关闭，宽度 0–12 px，可调颜色；新增内置思源黑体/宋体/中文等宽字体、字重和 TTF/OTF/WOFF2 上传；预览、快速 MP4、透明 MOV 共用字体配置。
+- 已切换新版 transcriber 镜像，事件 `folia_update_available` 已在正式容器中加载。用户授权过“打断再续”：切换时当前整场 ASR 没有从零重跑，已读取现成 transcript 并完成，后续自动队列已恢复。不要为验证再次取消、重跑或重新切片已有录播。
+- 已做正式镜像回归，使用独立测试项目《离人赋_v077正式回归》，没有覆盖旧项目和旧成品：快速样片 1920×1080、30fps、H.264 + AAC，15 秒 450 帧经 `mpdecimate` 保留 417 帧；2:04.5 无全屏灰层，3 px 黑色主歌词描边可见；透明样片为 ProRes 4444 `yuva444p12le`、30fps、无音轨，2:04.5 Alpha 平均值约 0.8%，不是实色画布。测试输出：`/vol1/1000/video/Folia成片/芒芒_Mou/2026-09-21/高置信/离人赋_v077正式回归/`。
+- 备份在 `/vol1/1000/docker/folia-video-studio-backups/20260921-v077/`，包括 compose、数据库、版本信息和字体目录。不要删除旧 `1.0.19` 镜像、旧成品、录播或切片。
+- GitHub 尚未同步本次升级。NAS 上另有 git 工作副本 `/vol1/1000/docker/folia-git`，远端是私有仓库 `q1019161539/folia-`，当前 `main` 与 `origin/main` 停在 `b13078a`（2026-09-20）；部署目录 `/vol1/1000/docker/folia-video-studio` 本身不是 git 仓库。本次源码和文档需要先整理进正确仓库，再由用户明确授权后提交、推送；不要把 `.env`、`data/`、`models/`、`work/`、备份、媒体或密钥带入提交。
+- 本次新增/修改的关键文件包括：`backend/folia_native.py`、`backend/font_assets.py`、`backend/folia_upstream.py`、`folia-renderer/patch_upstream_source.py`、`folia-renderer/Dockerfile`、`web/index.html`、`web/app.js`、`compose.yaml` 及相关 docs。正式部署前已通过后端 188 项、transcriber 30 项、前端语法和上游源码补丁校验；不要把压缩 bundle 字符串替换作为后续更新方式。
+- 接手第一步应先重新读取 `AGENTS.md`、`docs/STATUS.md`、`docs/README.md` 和本文件，然后只读检查 NAS 容器和队列。不要重复构建、重启或渲染，除非先确认当前队列/重任务槽状态并得到用户授权。
 
 ## 开始前
 

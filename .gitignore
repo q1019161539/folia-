@@ -8,4 +8,4 @@ backend/__pycache__/
 *.tar.gz
 *.tgz
 .remote-live/
-
+.tmp-*/

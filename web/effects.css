@@ -1,13 +1,10 @@
-#amllLayer{position:absolute;inset:0;z-index:4;width:100%;height:100%;border:0;background:transparent;pointer-events:none;opacity:0;visibility:hidden;transition:opacity .18s}
-.stage.amll-flow #amllLayer,.stage.amll-focus #amllLayer,.stage.kinetic-bounce #amllLayer,.stage.kinetic-cinema #amllLayer,.stage.kinetic-neon #amllLayer,.stage.kinetic-stack #amllLayer{opacity:1;visibility:visible}
-.stage.amll-flow #lyricsLayer,.stage.amll-focus #lyricsLayer,.stage.kinetic-bounce #lyricsLayer,.stage.kinetic-cinema #lyricsLayer,.stage.kinetic-neon #lyricsLayer,.stage.kinetic-stack #lyricsLayer{display:none}
 #effectBadge{padding:5px 8px;border:1px solid #c7ff5844;border-radius:99px;color:#c7ff58;font-size:10px;white-space:nowrap}
 #foliaNativeLayer{position:absolute;inset:0;z-index:5;width:100%;height:100%;border:0;background:transparent;pointer-events:none;opacity:0;visibility:hidden}
 .stage.folia-native #foliaNativeLayer{opacity:1;visibility:visible}
 .stage.folia-native.folia-loading #foliaNativeLayer,.stage.folia-native.folia-error #foliaNativeLayer{opacity:0}
-.stage.folia-native.folia-loading::after,.stage.folia-native.folia-error::after{content:'Fonia 原生特效加载中…';position:absolute;z-index:7;left:50%;top:50%;transform:translate(-50%,-50%);padding:10px 16px;border:1px solid #c7ff5866;border-radius:999px;background:#07100de6;color:#c7ff58;font-size:13px;box-shadow:0 8px 28px #0008;pointer-events:none}
-.stage.folia-native.folia-error::after{content:'Fonia 原生特效加载失败，请刷新页面';border-color:#ff6b6b88;color:#ff9b9b}
-.stage.folia-native #lyricsLayer,.stage.folia-native #amllLayer{display:none}
+.stage.folia-native.folia-loading::after,.stage.folia-native.folia-error::after{content:'Folia 原生特效加载中…';position:absolute;z-index:7;left:50%;top:50%;transform:translate(-50%,-50%);padding:10px 16px;border:1px solid #c7ff5866;border-radius:999px;background:#07100de6;color:#c7ff58;font-size:13px;box-shadow:0 8px 28px #0008;pointer-events:none}
+.stage.folia-native.folia-error::after{content:'Folia 原生特效加载失败，请刷新页面';border-color:#ff6b6b88;color:#ff9b9b}
+.stage.folia-native #lyricsLayer{display:none}
 #foliaNativeControls{margin-top:14px;padding-top:2px;border-top:1px solid #ffffff14}
 .native-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}
 .native-grid button{min-height:48px}
@@ -17,3 +14,5 @@
 .native-advanced label{display:block;margin-top:9px}
 .native-json-label textarea{box-sizing:border-box;width:100%;margin-top:6px;resize:vertical;border:1px solid #ffffff20;border-radius:7px;background:#080b0a;color:#dfe9e2;font:11px/1.45 ui-monospace,monospace;padding:8px}
 #cancelRender{width:100%;margin-top:8px}
+.font-upload{display:grid;gap:6px;margin-top:10px}
+.folia-version{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px}

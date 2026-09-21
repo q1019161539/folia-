@@ -5,7 +5,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 import httpx
 from opencc import OpenCC
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from song_identity_diagnostics import acrcloud_identify_window_result
@@ -14,13 +14,17 @@ from pipeline_eta import estimate_asr, estimate_songs
 from standard_timeline import balanced_candidate_pool, build_review_assessment, build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, choose_identity_recovery_candidate, clamp_forced_words, confidence_output_folder, estimate_untimed_timeline, find_suspect_anchor_regions, identity_evidence_can_override, identity_recheck_needed, is_high_confidence, is_lyric_metadata, lyric_render_window, normalize_identity, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, title_similarity as compare_titles
 from word_timeline import apply_shifted_provider_words, normalize_provider_rows, score_provider_timeline, separation_retry_needed, timed_rows, word_anchor_coverage
 from automation import MIN_RECORDING_BYTES, automation_transcriber_payload, broadcaster_directories, eligible_recording, parse_ai_json, project_transcript, recording_choices, restore_completed_clip_paths, transcript_for_ai, transcript_segments, validate_detected_songs
-from folia_native import FOLIA_EFFECTS, FOLIA_RENDERER_REVISION, apply_folia_preview_profile, build_folia_config, normalized_folia_settings
+from folia_native import FOLIA_DOCKER_STACK, FOLIA_EFFECTS, FOLIA_PATCH_PROFILE, FOLIA_RELEASE, FOLIA_RENDERER_REVISION, apply_folia_fast_profile, apply_folia_preview_profile, build_folia_config, normalized_folia_settings
+from font_assets import list_fonts, resolve_font, store_font
+from folia_upstream import UpstreamStatusStore
 from song_identity import backfill_identity, fingerprint_consensus, identity_fields, matched_candidate_fields, resolve_search_identity
+from recording_metadata import copy_recording_metadata_sidecar
 
 MEDIA=Path(os.getenv('MEDIA_ROOT','/media/bililive')).resolve()
 MEDIA_WRITE=Path(os.getenv('MEDIA_WRITE_ROOT','/media-output')).resolve()
 MEDIA_HOST=Path(os.getenv('MEDIA_HOST_PATH','/vol1/1000/docker/bililive-tool/video'))
 DATA=Path(os.getenv('DATA_ROOT','/data')).resolve(); WORK=Path(os.getenv('WORK_ROOT','/work')).resolve(); OUTPUT=Path(os.getenv('OUTPUT_ROOT','/output')).resolve()
+FONTS=DATA/'fonts'; FONTS.mkdir(parents=True,exist_ok=True)
 DB=DATA/'studio.db'; LOCAL_WORKER=os.getenv('LOCAL_WORKER_URL','http://local-worker:8001'); DASHSCOPE_KEY=os.getenv('DASHSCOPE_API_KEY','')
 TRANSCRIBER_URL=os.getenv('TRANSCRIBER_URL','http://transcriber:8080').rstrip('/')
 LYRICS_SERVICE_URL=os.getenv('LYRICS_SERVICE_URL','http://lyrics-service:8090').rstrip('/')
@@ -74,8 +78,44 @@ job_tasks_lock=threading.Lock()
 JOB_BUSY_STATUSES=('recognizing','force_aligning','timeline_matching','rendering','queued')
 JOB_TASK_STALE_SECONDS=1800
 automation_wakeup=threading.Event(); automation_started=False
+folia_upstream_wakeup=threading.Event()
+folia_upstream_store=UpstreamStatusStore(DATA/'folia-upstream-status.json')
 stage_active:dict[str,Any]={'job_id':None,'position_ms':0,'duration_ms':0,'paused':True}
 stage_clients:set[WebSocket]=set()
+SUPPORTED_STUDIO_EFFECTS={'classic','folia-native'}
+
+def normalize_studio_style(raw:dict[str,Any]|None)->dict[str,Any]:
+    style=dict(raw or {})
+    effect=str(style.get('effect') or 'classic')
+    if effect not in SUPPORTED_STUDIO_EFFECTS:
+        style['legacy_effect']=effect
+        style['effect']='classic'
+        style['preset']='直播清晰'
+        style['compatibility_warning']=f'旧效果 {effect} 已停用，当前使用直播清晰'
+    if style.get('effect')=='folia-native':
+        style['folia']=normalized_folia_settings(style.get('folia'))
+    return style
+
+def folia_version_info()->dict[str,Any]:
+    return {
+        'release':FOLIA_RELEASE,'revision':FOLIA_RENDERER_REVISION,
+        'docker_stack':FOLIA_DOCKER_STACK,
+        'docker_amd64_digest':'sha256:b22965dc050b0602b86fe4e22e77b61720cd3f428ac8491ce5f6bc7d890ac994',
+        'patch_profile':FOLIA_PATCH_PROFILE,
+    }
+
+def notify_folia_update(status:dict[str,Any]):
+    try:
+        transcriber_request('POST','/api/notifications/automation',json={'event':'folia_update_available',**status})
+    except Exception as exc:
+        print(f'[folia-upstream] 企业微信提醒失败：{exc}',file=sys.stderr,flush=True)
+
+def folia_upstream_loop():
+    # Do not make API startup depend on GitHub or Docker Hub availability.
+    if folia_upstream_wakeup.wait(60): return
+    while True:
+        folia_upstream_store.refresh(folia_version_info(),notify_folia_update)
+        if folia_upstream_wakeup.wait(24*60*60): return
 CANDIDATE_PROMPT='''# Role
 你是现场翻唱歌曲候选判断器。
 
@@ -370,7 +410,9 @@ def aligner_items_quality(items:list[dict[str,Any]],text:str,window_start:int,wi
 def getjob(jid):
     with db() as c: r=c.execute('SELECT * FROM jobs WHERE id=?',(jid,)).fetchone()
     if not r: raise HTTPException(404,'任务不存在')
-    return rowdict(r)
+    result=rowdict(r)
+    result['style']=normalize_studio_style(result.get('style'))
+    return result
 # Named columns, and only the ones a new job actually sets: jobs has just gained
 # three columns by migration, and the positional VALUES(...) form that used to be
 # here is the exact shape that silently broke every automation insert once the
@@ -483,12 +525,31 @@ def startup():
         automation_started=True
         threading.Thread(target=automation_scan_loop,daemon=True,name='automation-scan').start()
         threading.Thread(target=automation_worker_loop,daemon=True,name='automation-worker').start()
+        threading.Thread(target=folia_upstream_loop,daemon=True,name='folia-upstream').start()
 @app.get('/healthz')
 def health(): return {'ok':True,'media':MEDIA.exists(),'render_busy':render_lock.locked(),'automation':True,'lyrics_service':True,'folia_native':True,'folia_renderer_revision':FOLIA_RENDERER_REVISION,'deepseek_configured':bool(DEEPSEEK_KEY)}
 @app.get('/api/config')
 def config(): return {'local_worker':True,'cloud_configured':bool(DASHSCOPE_KEY),'deepseek_configured':bool(DEEPSEEK_KEY),'deepseek_model':DEEPSEEK_MODEL,'media_root':str(MEDIA),'output_root':str(OUTPUT)}
 @app.get('/api/folia/effects')
-def folia_effects(): return {'renderer_revision':FOLIA_RENDERER_REVISION,'width':1920,'height':1080,'fps':30,'effects':FOLIA_EFFECTS}
+def folia_effects(): return {'release':FOLIA_RELEASE,'docker_stack':FOLIA_DOCKER_STACK,'renderer_revision':FOLIA_RENDERER_REVISION,'patch_profile':FOLIA_PATCH_PROFILE,'width':1920,'height':1080,'fps':30,'effects':FOLIA_EFFECTS}
+@app.get('/api/fonts')
+def fonts(): return {'fonts':list_fonts(FONTS)}
+@app.post('/api/fonts')
+async def upload_font(file:UploadFile=File(...),family:str=Form('')):
+    content=await file.read(20*1024*1024+1)
+    try: item=store_font(FONTS,file.filename or 'font',family,content)
+    except ValueError as exc: raise HTTPException(400,str(exc)) from exc
+    return item
+@app.get('/api/fonts/{font_id}')
+def font_file(font_id:str):
+    try: path,metadata=resolve_font(FONTS,font_id)
+    except (OSError,ValueError,KeyError,json.JSONDecodeError): raise HTTPException(404,'字体不存在')
+    media_type={'.ttf':'font/ttf','.otf':'font/otf','.woff2':'font/woff2'}.get(path.suffix.lower(),'application/octet-stream')
+    return FileResponse(path,media_type=media_type,filename=metadata.get('filename') or path.name)
+@app.get('/api/folia/upstream')
+def folia_upstream_status(): return folia_upstream_store.load() or {'ok':False,'status':'not_checked'}
+@app.post('/api/folia/upstream/check')
+def folia_upstream_check(): return folia_upstream_store.refresh(folia_version_info(),notify_folia_update)
 @app.get('/api/prompts')
 def prompts(): return {'candidate_ranking':CANDIDATE_PROMPT,'time_mapping':MAPPING_PROMPT,'guardrail':'AI 只能排序或返回 segment_id；歌词正文和时间戳均不采纳 AI 生成值。'}
 
@@ -587,7 +648,9 @@ def clip_batch_task(bid:str):
                     if current_temp.exists(): current_temp.unlink()
                     item.update(status='failed',error='输出文件验证失败'); failed+=1
                 else:
-                    current_temp.replace(output); current_temp=None; item.update(status='completed',size=output.stat().st_size,internal_path=str(output)); completed+=1
+                    current_temp.replace(output); current_temp=None
+                    metadata_sidecar=copy_recording_metadata_sidecar(source,output)
+                    item.update(status='completed',size=output.stat().st_size,internal_path=str(output),metadata_sidecar=str(metadata_sidecar) if metadata_sidecar else None); completed+=1
             updateclip(bid,items=items,current_index=index,progress=round((position+1)/max(1,len(enabled))*100,1),log=getclip(bid).get('log','')+(f'完成：{item.get("output_name")}\n' if item['status']=='completed' else f'失败：{item.get("title")} · {item.get("error")}\n'))
         status='completed' if not failed else ('completed_with_errors' if completed else 'failed')
         updateclip(bid,status=status,progress=100,items=items,current_index=-1,error='' if not failed else f'{failed} 个片段失败',log=getclip(bid).get('log','')+f'批量切片结束：成功 {completed}，失败 {failed}。\n')
@@ -1810,7 +1873,7 @@ def save_alignment(jid:str,body:AlignmentIn):
     j=getjob(jid); old=j.get('alignment') or {}; asr=old.get('asr_segments',[]) if isinstance(old,dict) else []
     return update(jid,status='styling',alignment={**(old if isinstance(old,dict) else {}),'asr_segments':asr,'offset_ms':max(-5000,min(5000,body.offset_ms)),'lines':body.lines})
 @app.put('/api/jobs/{jid}/style')
-def save_style(jid:str,body:StyleIn): getjob(jid); return update(jid,status='styling',style=body.model_dump())
+def save_style(jid:str,body:StyleIn): getjob(jid); return update(jid,status='styling',style=normalize_studio_style(body.model_dump()))
 @app.get('/api/jobs/{jid}/preview-session')
 def preview_session(jid:str):
     j=getjob(jid); return {'job':j,'media_url':'/api/media/'+fid(MEDIA/j['source'])}
@@ -1820,7 +1883,7 @@ def folia_renderer_request(method:str,path:str,**kwargs):
         with httpx.Client(timeout=15) as client: response=client.request(method,FOLIA_RENDERER_URL+path,**kwargs)
         if response.status_code>=400: raise RuntimeError((response.json().get('detail') if response.headers.get('content-type','').startswith('application/json') else response.text) or f'HTTP {response.status_code}')
         return response.json()
-    except httpx.HTTPError as exc: raise RuntimeError(f'Fonia 原生渲染器不可用：{exc}') from exc
+    except httpx.HTTPError as exc: raise RuntimeError(f'Folia 原生渲染器不可用：{exc}') from exc
 
 @app.post('/api/jobs/{jid}/folia-preview-session')
 def folia_preview_session(jid:str,body:FoliaPreviewIn):
@@ -2017,12 +2080,12 @@ def render_folia_native_locked(jid:str,j:dict[str,Any],sample:bool,start_ms:int,
         line=row['line']
         if is_lyric_metadata(str(line.get('text','')),str(j.get('title') or ''),str(j.get('artist') or '')): continue
         rows.append(row)
-    if not rows: raise RuntimeError('没有可供 Fonia 原生渲染的有效歌词行')
+    if not rows: raise RuntimeError('没有可供 Folia 原生渲染的有效歌词行')
     if sample:
         trim_start_ms=max(0,min(source_duration_ms-1,int(start_ms))); trim_end_ms=min(source_duration_ms,trim_start_ms+15000)
     else:
         trim_start_ms,trim_end_ms=lyric_render_window([{'start':row['start'],'end':row['end']} for row in rows],source_duration_ms)
-    if trim_end_ms<=trim_start_ms: raise RuntimeError('Fonia 原生渲染范围无效')
+    if trim_end_ms<=trim_start_ms: raise RuntimeError('Folia 原生渲染范围无效')
     parts=Path(j['source']).parts; anchor=(parts[1] if parts and parts[0].lower() in ('bilibili','douyin','huya','douyu') and len(parts)>1 else (parts[0] if parts else '未分类'))
     day=datetime.now(BEIJING_TZ).strftime('%Y-%m-%d'); song_folder=safe_clip_name(str(j.get('title') or source.stem)); confidence_tier=str((al.get('timeline_match') or {}).get('confidence_tier') or ('deepseek' if bool((al.get('timeline_match') or {}).get('low_confidence')) else 'high')) if isinstance(al,dict) else 'high'; confidence_folder=confidence_output_folder(al)
     outdir=OUTPUT/anchor/day/confidence_folder/song_folder; outdir.mkdir(parents=True,exist_ok=True)
@@ -2030,6 +2093,7 @@ def render_folia_native_locked(jid:str,j:dict[str,Any],sample:bool,start_ms:int,
     if output_mode not in ('fast','alpha'): raise RuntimeError('未知原生输出方式')
     base=f'{source.stem}_folia_{native_mode}{suffix}'; alpha_path=outdir/(base+'_alpha.mov'); mp4_path=outdir/(base+('_fast' if output_mode=='fast' else '')+'.mp4'); manifest_path=outdir/(base+('.fast' if output_mode=='fast' else '')+'.render.json')
     config=build_folia_config(j,settings,rows)
+    if output_mode=='fast': config=apply_folia_fast_profile(config)
     request_body={'source':str(source),'alpha_output':str(alpha_path),'mp4_output':str(mp4_path),'manifest_output':str(manifest_path),'start_ms':trim_start_ms,'duration_ms':trim_end_ms-trim_start_ms,'config':config,'output_mode':output_mode}
     created=folia_renderer_request('POST','/api/renders',json=request_body); rid=created['id']
     with folia_active_lock: folia_active_renders[jid]=rid
@@ -2042,7 +2106,7 @@ def render_folia_native_locked(jid:str,j:dict[str,Any],sample:bool,start_ms:int,
                 renderer='folia-native-realtime-v1' if output_mode=='fast' else 'folia-native-browser-v1'; previous_progress=progress; update(jid,status='rendering',error='',output={'renderer':renderer,'render_id':rid,'sample':sample,'output_mode':output_mode,'progress':progress,'phase':state.get('phase','正在渲染'),'alpha_path':str(alpha_path) if output_mode=='alpha' else None,'path':str(mp4_path)})
             if state.get('status')=='completed':
                 result=state.get('result') or {}; renderer='folia-native-realtime-v1' if output_mode=='fast' else 'folia-native-browser-v1'; update(jid,status='completed',error='',output={**result,'renderer':renderer,'renderer_revision':FOLIA_RENDERER_REVISION,'effect':native_mode,'sample':sample,'output_mode':output_mode,'progress':100,'confidence_tier':confidence_tier,'trim_start_ms':trim_start_ms,'trim_end_ms':trim_end_ms}); return
-            if state.get('status') in ('failed','cancelled'): raise RuntimeError(state.get('error') or ('任务已中止' if state.get('status')=='cancelled' else 'Fonia 原生渲染失败'))
+            if state.get('status') in ('failed','cancelled'): raise RuntimeError(state.get('error') or ('任务已中止' if state.get('status')=='cancelled' else 'Folia 原生渲染失败'))
             time.sleep(1)
     finally:
         with folia_active_lock: folia_active_renders.pop(jid,None)
@@ -2166,7 +2230,7 @@ def render(jid:str,body:RenderIn):
 def cancel_render(jid:str):
     getjob(jid)
     with folia_active_lock: rid=folia_active_renders.get(jid)
-    if not rid: raise HTTPException(409,'这个项目当前没有可中止的 Fonia 原生渲染')
+    if not rid: raise HTTPException(409,'这个项目当前没有可中止的 Folia 原生渲染')
     try: folia_renderer_request('POST',f'/api/renders/{rid}/cancel',json={})
     except RuntimeError as exc: raise HTTPException(503,str(exc)) from exc
     return update(jid,status='rendering',output={**(getjob(jid).get('output') or {}),'phase':'正在中止'})
@@ -2563,7 +2627,7 @@ def create_imported_song_job(song:dict[str,Any],segments:list[dict[str,Any]],pro
     asr=project_transcript(segments,int(song['clip_start_ms']),int(song['clip_end_ms']))
     if not asr: raise RuntimeError('歌曲范围内没有可复用的 ASR 句段')
     for line in asr: line['anchors']=character_anchors(line.get('words') or [])
-    jid=uuid.uuid4().hex; now=time.time(); style=profile.get('style') or StyleIn().model_dump()
+    jid=uuid.uuid4().hex; now=time.time(); style=normalize_studio_style(profile.get('style') or StyleIn().model_dump())
     with db() as c:
         # The automation stage read the whole-recording ASR and named this song;
         # that is an identification, so it seeds identity as well as the title.
@@ -2767,7 +2831,7 @@ def create_automation_profile(body:AutomationProfileIn):
     if path!=MEDIA and MEDIA not in path.parents or not path.is_dir(): raise HTTPException(400,'主播目录不存在或超出媒体范围')
     if not .5<=body.min_confidence<=1: raise HTTPException(400,'AI 置信度必须在 0.5 到 1 之间')
     if not 0<=body.padding_seconds<=30: raise HTTPException(400,'切片余量必须在 0 到 30 秒之间')
-    profile_id=uuid.uuid4().hex; now=time.time(); name=body.name.strip() or path.name; style=(body.style or StyleIn()).model_dump()
+    profile_id=uuid.uuid4().hex; now=time.time(); name=body.name.strip() or path.name; style=normalize_studio_style((body.style or StyleIn()).model_dump())
     with db() as c:
         c.execute('INSERT INTO automation_profiles VALUES(?,?,?,?,?,?,?,?,?,?,?)',(profile_id,now,now,name,relative,0,None,MIN_RECORDING_BYTES,body.min_confidence,body.padding_seconds,json.dumps(style,ensure_ascii=False))); c.commit()
     return get_automation_profile(profile_id)
@@ -2778,7 +2842,7 @@ def update_automation_profile(profile_id:str,body:AutomationProfileIn):
     if path!=MEDIA and MEDIA not in path.parents or not path.is_dir(): raise HTTPException(400,'主播目录不存在或超出媒体范围')
     if not .5<=body.min_confidence<=1: raise HTTPException(400,'AI 置信度必须在 0.5 到 1 之间')
     if not 0<=body.padding_seconds<=30: raise HTTPException(400,'切片余量必须在 0 到 30 秒之间')
-    style=(body.style or StyleIn(**(current.get('style') or {}))).model_dump(); now=time.time()
+    style=normalize_studio_style((body.style or StyleIn(**(current.get('style') or {}))).model_dump()); now=time.time()
     with db() as c:
         c.execute('UPDATE automation_profiles SET updated_at=?,name=?,path=?,min_confidence=?,padding=?,style=? WHERE id=?',(now,body.name.strip() or path.name,relative,body.min_confidence,body.padding_seconds,json.dumps(style,ensure_ascii=False),profile_id)); c.commit()
     return get_automation_profile(profile_id)

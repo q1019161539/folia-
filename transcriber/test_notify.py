@@ -120,6 +120,17 @@ class OutputsNotificationTests(unittest.TestCase):
 
 
 class StageNotificationTests(unittest.TestCase):
+    def test_folia_update_notice_names_both_versions_and_no_auto_upgrade(self):
+        title, content = automation_notification({
+            "event": "folia_update_available", "current_release": "v0.7.7",
+            "current_stack": "1.0.26", "latest_release": "v0.8.0",
+            "latest_stack": "1.0.30", "release_url": "https://example.invalid/release",
+        })
+        self.assertIn("Folia", title)
+        self.assertIn("v0.7.7", content)
+        self.assertIn("v0.8.0", content)
+        self.assertIn("不会自动替换", content)
+
     def test_start_says_how_long_the_recording_is_and_when_asr_should_end(self):
         _, content = automation_notification({
             "event": "asr_started", "broadcaster": "小红泡", "recording": "2026-09-17",

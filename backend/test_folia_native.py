@@ -1,6 +1,6 @@
 import unittest
 
-from folia_native import FOLIA_EFFECT_MODES, FOLIA_RENDERER_REVISION, apply_folia_preview_profile, build_folia_config, normalized_folia_settings
+from folia_native import FOLIA_EFFECT_MODES, FOLIA_RENDERER_REVISION, apply_folia_fast_profile, apply_folia_preview_profile, build_folia_config, normalized_folia_settings
 
 
 class FoliaNativeTests(unittest.TestCase):
@@ -35,13 +35,29 @@ class FoliaNativeTests(unittest.TestCase):
         self.assertEqual(cfg["lyrics"]["lines"][0]["words"][1]["endTime"], 2.1)
 
     def test_settings_are_pinned_and_bounded(self):
-        cfg = normalized_folia_settings({"renderer_revision": "wrong", "mode": "wrong", "lyrics_font_scale": 99, "position_x": -8, "position_y": 108})
+        cfg = normalized_folia_settings({"renderer_revision": "wrong", "mode": "wrong", "lyrics_font_scale": 99, "position_x": -8, "position_y": 108, "text_outline": {"width_px": 99, "color": "bad", "scope": "everything"}})
         self.assertEqual(cfg["renderer_revision"], FOLIA_RENDERER_REVISION)
         self.assertEqual(cfg["mode"], "classic")
         self.assertEqual(cfg["lyrics_font_scale"], 2.0)
         self.assertFalse(cfg["alpha_mov_audio"])
         self.assertEqual(cfg["position_x"], 0)
         self.assertEqual(cfg["position_y"], 100)
+        self.assertTrue(cfg["text_outline"]["enabled"])
+        self.assertEqual(cfg["text_outline"]["width_px"], 12)
+        self.assertEqual(cfg["text_outline"]["color"], "#000000")
+        self.assertEqual(cfg["text_outline"]["scope"], "primary")
+
+    def test_font_and_outline_are_forwarded_to_native_theme(self):
+        job = {"id": "font", "alignment": {"lines": []}}
+        cfg = build_folia_config(job, {
+            "font_asset_id": "a" * 64,
+            "theme": {"fontFamily": "测试字体", "fontWeight": 500},
+            "text_outline": {"enabled": True, "width_px": 8, "color": "#123456"},
+        })
+        self.assertEqual(cfg["theme"]["studioFontAssetUrl"], f"/fonts/{'a' * 64}")
+        self.assertEqual(cfg["theme"]["fontFamily"], "测试字体")
+        self.assertEqual(cfg["theme"]["fontWeight"], 500)
+        self.assertEqual(cfg["theme"]["studioTextOutline"]["width_px"], 8)
 
     def test_tempera_is_a_transparent_foreground_with_exact_primary(self):
         job = {"id": "tempera", "title": "标题", "artist": "歌手", "alignment": {"lines": []}}
@@ -53,6 +69,7 @@ class FoliaNativeTests(unittest.TestCase):
         self.assertIsNone(cfg["song"])
         self.assertFalse(cfg["visualizerTunings"]["tempera"]["showBlocks"])
         self.assertFalse(cfg["visualizerTunings"]["tempera"]["textInversion"])
+        self.assertFalse(cfg["visualizerTunings"]["tempera"]["enableTransitions"])
         self.assertEqual(cfg["visualizerTunings"]["tempera"]["colorMode"], "duo")
         self.assertEqual(cfg["theme"]["primaryColor"], "#ff3366")
         # Tempera uses the contrast color as its secondary text face; the
@@ -76,6 +93,16 @@ class FoliaNativeTests(unittest.TestCase):
         preview = apply_folia_preview_profile(export)
         self.assertEqual(preview["visualizerTunings"]["tempera"]["textureResolution"], 0.5)
         self.assertFalse(preview["visualizerTunings"]["tempera"]["postProcessEnabled"])
+
+    def test_tempera_fast_profile_is_realtime_safe_without_mutating_export(self):
+        job = {"id": "fast", "alignment": {"lines": []}}
+        export = build_folia_config(job, normalized_folia_settings({"mode": "tempera"}))
+        fast = apply_folia_fast_profile(export)
+        self.assertEqual(fast["renderProfile"], "tempera-realtime")
+        self.assertEqual(fast["visualizerTunings"]["tempera"]["textureResolution"], 0.5)
+        self.assertFalse(fast["visualizerTunings"]["tempera"]["postProcessEnabled"])
+        self.assertEqual(export["visualizerTunings"]["tempera"]["textureResolution"], 1.5)
+        self.assertTrue(export["visualizerTunings"]["tempera"]["postProcessEnabled"])
 
 
 if __name__ == "__main__":

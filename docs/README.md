@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | ASR、漏字、Qwen、时间戳、进度 | `modules/asr-alignment.md` | `backend/worker.py`、`backend/app.py`、`web/app.js` |
 | LDDC、多平台搜索、标准逐字歌词 | `modules/lyrics-sources.md` | `lyrics-service/`、`backend/word_timeline.py` |
-| 歌词特效、透明叠加、预览、成片 | `modules/lyrics-preview-render.md` | `effects/src/`、`web/`、`backend/app.py` |
+| 歌词特效、透明叠加、字体、预览、成片 | `modules/lyrics-preview-render.md` | `folia-renderer/`、`backend/folia_native.py`、`backend/font_assets.py`、`web/` |
 | 时间轴文档、批量切歌、中止 | `modules/batch-clips.md` | `web/clips.js`、`backend/app.py` |
 | 主播监听、自动判歌、整套自动出片 | `modules/automation-pipeline.md` | `web/automation.js`、`backend/automation.py`、`backend/app.py` |
 | Docker、端口、挂载、升级、故障 | `modules/deployment.md` | `compose.yaml`、`backend/*file`、`nginx/` |

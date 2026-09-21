@@ -26,16 +26,18 @@ from fastapi.staticfiles import StaticFiles
 from websocket import create_connection
 
 
-REVISION = "34e6d2258225610a178dde6ed1c406b699336c8a"
+VERSION_INFO = json.loads((Path(__file__).with_name("folia-version.json")).read_text(encoding="utf-8"))
+REVISION = VERSION_INFO["revision"]
+RELEASE = VERSION_INFO["release"]
+DOCKER_STACK = VERSION_INFO["docker_stack"]
+TEXT_EDGE_PROFILE = VERSION_INFO["patch_profile"]
 STATIC_ROOT = Path(os.getenv("FOLIA_STATIC_ROOT", "/usr/share/nginx/html")).resolve()
+FONT_ROOT = Path(os.getenv("FONT_ROOT", "/fonts")).resolve()
 MEDIA_ROOT = Path(os.getenv("MEDIA_ROOT", "/media/bililive")).resolve()
 OUTPUT_ROOT = Path(os.getenv("OUTPUT_ROOT", "/output")).resolve()
 PORT = int(os.getenv("RENDER_PORT", "8091"))
 FPS, WIDTH, HEIGHT = 30, 1920, 1080
-VALID_MODES = {
-    "sonnet", "tempera", "classic", "cadenza", "partita", "fume", "tilt",
-    "claddagh", "monet", "pendolo", "cappella", "diorama", "still",
-}
+VALID_MODES = set(VERSION_INFO["modes"])
 
 app = FastAPI(title="Folia Native Renderer", version="1.0.0")
 state_lock = threading.Lock()
@@ -66,6 +68,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     config["background"] = {"mode": "common", "transparent": True}
     config["transparentBackground"] = True
     config["updatedAt"] = now_ms()
+    theme = dict(config.get("theme") or {})
+    font_url = str(theme.get("studioFontAssetUrl") or "")
+    if font_url and not font_url.startswith("/fonts/"):
+        raise ValueError("自定义字体地址无效")
+    config["theme"] = theme
     return config
 
 
@@ -89,6 +96,9 @@ def health() -> dict[str, Any]:
     return {
         "ok": True,
         "revision": REVISION,
+        "release": RELEASE,
+        "docker_stack": DOCKER_STACK,
+        "text_edge_profile": TEXT_EDGE_PROFILE,
         "render_busy": render_lock.locked(),
         "chromium": shutil.which("chromium") is not None,
         "ffmpeg": shutil.which("ffmpeg") is not None,
@@ -277,7 +287,14 @@ class ChromiumPage:
             time.sleep(0.05)
         else:
             self.close(); raise RuntimeError("Fonia 原生页面加载超时")
-        time.sleep(1.5)
+        for _ in range(300):
+            ready = self.evaluate("document.documentElement.dataset.studioFontReady === '1'")
+            if ready:
+                break
+            time.sleep(0.05)
+        else:
+            self.close(); raise RuntimeError("Folia 字体加载超时")
+        time.sleep(0.5)
         transform = studio_transform or {}
         x = max(0.0, min(100.0, float(transform.get("x", 50))))
         y = max(0.0, min(100.0, float(transform.get("y", 50))))
@@ -464,6 +481,7 @@ def render_fast_composite(
         os.replace(partial, mp4_path)
         manifest = {
             "renderer": "folia-native-realtime-v1", "renderer_revision": REVISION,
+            "text_edge_profile": TEXT_EDGE_PROFILE,
             "source": str(source), "output": str(mp4_path), "width": WIDTH, "height": HEIGHT,
             "fps": FPS, "start_ms": round(start_seconds * 1000), "duration_ms": round(duration_seconds * 1000),
             "output_mode": "fast", "config": config, "created_at": datetime.now(timezone.utc).isoformat(),
@@ -565,6 +583,7 @@ def render_worker(rid: str, body: dict[str, Any]) -> None:
         os.replace(mp4_partial, mp4_path)
         manifest = {
             "renderer": "folia-native-browser-v1", "renderer_revision": REVISION,
+            "text_edge_profile": TEXT_EDGE_PROFILE,
             "source": str(source), "alpha_output": str(alpha_path), "output": str(mp4_path),
             "width": WIDTH, "height": HEIGHT, "fps": FPS, "frames": frame_count,
             "start_ms": round(start_seconds * 1000), "duration_ms": round(duration_seconds * 1000),
@@ -607,6 +626,17 @@ def cancel_render(rid: str) -> dict[str, Any]:
     if event is None: raise HTTPException(404, "渲染任务不存在")
     event.set(); update_render(rid, phase="正在中止")
     return render_status(rid)
+
+
+@app.get("/fonts/{font_id}")
+def font_asset(font_id: str):
+    if not all(char in "0123456789abcdef" for char in font_id) or len(font_id) != 64:
+        raise HTTPException(404, "字体不存在")
+    for suffix, media_type in ((".ttf", "font/ttf"), (".otf", "font/otf"), (".woff2", "font/woff2")):
+        path = (FONT_ROOT / f"{font_id}{suffix}").resolve()
+        if path.is_file() and FONT_ROOT in path.parents:
+            return FileResponse(path, media_type=media_type, headers={"Cache-Control": "public, max-age=31536000, immutable"})
+    raise HTTPException(404, "字体不存在")
 
 
 app.mount("/assets", StaticFiles(directory=STATIC_ROOT / "assets"), name="assets")

@@ -5,12 +5,15 @@ from __future__ import annotations
 from typing import Any
 
 
-FOLIA_RENDERER_REVISION = "34e6d2258225610a178dde6ed1c406b699336c8a"
+FOLIA_RELEASE = "v0.7.7"
+FOLIA_DOCKER_STACK = "1.0.26"
+FOLIA_RENDERER_REVISION = "80c073490482303d4283d1d5205be7707c96179d"
+FOLIA_PATCH_PROFILE = "studio-font-outline-v1"
 
 FOLIA_EFFECTS = [
     {"mode": "sonnet", "label": "商籁", "description": "电影分镜与光束歌词"},
     {"mode": "tempera", "label": "Tempera", "description": "拼贴色块与动态排版"},
-    {"mode": "classic", "label": "Luminous", "description": "Fonia 经典逐字流光"},
+    {"mode": "classic", "label": "Luminous", "description": "Folia 经典逐字流光"},
     {"mode": "cadenza", "label": "Mindscape", "description": "沉浸式空间歌词"},
     {"mode": "partita", "label": "云阶", "description": "层叠云阶歌词"},
     {"mode": "fume", "label": "Fume", "description": "文章式烟雾排版"},
@@ -62,6 +65,9 @@ TEMPERA_FOREGROUND_TUNING = {
     "showBlocks": False,
     "textInversion": False,
     "colorMode": "duo",
+    # Tempera's transition wipe briefly paints an opaque full-frame paper
+    # layer. It is part of the scene background, not the lyric foreground.
+    "enableTransitions": False,
 }
 
 DEFAULT_FOLIA_SETTINGS: dict[str, Any] = {
@@ -72,6 +78,8 @@ DEFAULT_FOLIA_SETTINGS: dict[str, Any] = {
     "lyrics_font_scale": 1.0,
     "subtitle_font_scale": 1.0,
     "visualizer_opacity": 1.0,
+    "font_asset_id": None,
+    "text_outline": {"enabled": True, "width_px": 3.0, "color": "#000000", "scope": "primary"},
     "position_x": 50.0,
     "position_y": 50.0,
     "theme": {
@@ -81,6 +89,8 @@ DEFAULT_FOLIA_SETTINGS: dict[str, Any] = {
         "accentColor": "#f4f4f5",
         "secondaryColor": "#71717a",
         "fontStyle": "sans",
+        "fontFamily": "Noto Sans CJK SC",
+        "fontWeight": 700,
         "animationIntensity": "normal",
     },
     "visualizer_tunings": {},
@@ -97,6 +107,7 @@ def normalized_folia_settings(raw: dict[str, Any] | None, seed: str = "folia-vid
     result = {**DEFAULT_FOLIA_SETTINGS, **raw}
     result["theme"] = {**DEFAULT_FOLIA_SETTINGS["theme"], **(raw.get("theme") or {})}
     result["visualizer_tunings"] = raw.get("visualizer_tunings") or {}
+    result["text_outline"] = {**DEFAULT_FOLIA_SETTINGS["text_outline"], **(raw.get("text_outline") or {})}
     result["renderer_revision"] = FOLIA_RENDERER_REVISION
     result["schema_version"] = 1
     result["mode"] = result["mode"] if result["mode"] in FOLIA_EFFECT_MODES else "classic"
@@ -106,6 +117,13 @@ def normalized_folia_settings(raw: dict[str, Any] | None, seed: str = "folia-vid
     result["lyrics_font_scale"] = max(0.5, min(2.0, float(result.get("lyrics_font_scale", 1))))
     result["subtitle_font_scale"] = max(0.5, min(2.0, float(result.get("subtitle_font_scale", 1))))
     result["visualizer_opacity"] = max(0.0, min(1.0, float(result.get("visualizer_opacity", 1))))
+    result["font_asset_id"] = str(result.get("font_asset_id") or "") or None
+    outline = result["text_outline"]
+    outline["enabled"] = bool(outline.get("enabled", True))
+    outline["width_px"] = max(0.0, min(12.0, float(outline.get("width_px", 3))))
+    color = str(outline.get("color") or "#000000")
+    outline["color"] = color if len(color) == 7 and color.startswith("#") else "#000000"
+    outline["scope"] = "primary"
     result["position_x"] = max(0.0, min(100.0, float(result.get("position_x", 50))))
     result["position_y"] = max(0.0, min(100.0, float(result.get("position_y", 50))))
     intensity = result["theme"].get("animationIntensity")
@@ -177,6 +195,9 @@ def build_folia_config(
             }
         )
     theme = dict(cfg["theme"])
+    theme["studioTextOutline"] = dict(cfg["text_outline"])
+    if cfg.get("font_asset_id"):
+        theme["studioFontAssetUrl"] = f"/fonts/{cfg['font_asset_id']}"
     tunings = dict(cfg["visualizer_tunings"])
     song = {"id": str(job.get("id") or "studio"), "name": str(job.get("title") or "现场演唱")}
     song_artist = str(job.get("artist") or "现场演唱")
@@ -255,4 +276,19 @@ def apply_folia_preview_profile(config: dict[str, Any]) -> dict[str, Any]:
         tunings["tempera"] = tempera
     result["visualizerTunings"] = tunings
     result["previewProfile"] = "balanced"
+    return result
+
+
+def apply_folia_fast_profile(config: dict[str, Any]) -> dict[str, Any]:
+    """Keep real-time capture within the NAS software-rendering budget."""
+    result = dict(config)
+    tunings = dict(result.get("visualizerTunings") or {})
+    if result.get("visualizerMode") == "tempera":
+        supplied = tunings.get("tempera") if isinstance(tunings.get("tempera"), dict) else {}
+        tempera = dict(supplied)
+        tempera["textureResolution"] = min(0.5, max(0.35, float(tempera.get("textureResolution", 0.5))))
+        tempera["postProcessEnabled"] = False
+        tunings["tempera"] = tempera
+        result["renderProfile"] = "tempera-realtime"
+    result["visualizerTunings"] = tunings
     return result

@@ -53,10 +53,14 @@ DeepSeek 可以判断哪里是完整歌曲及歌名，但不能提供系统采�
 
 整场录播只跑一次 ASR 和 Qwen ForcedAligner；歌曲切片复用并平移对应逐句及逐字结果。只有 LDDC 没有可用逐字轴或旧任务缺少整场字文件时才逐首运行 Qwen。所有主播共用一个串行队列，这是 16 GB CPU-only 机器的稳定性边界。
 
-## Fonia 原生视觉固定版本并与旧效果隔离
+## Folia 原生视觉固定版本、源码补丁与最小效果面
 
-视频工坊新增的“Fonia 原生”固定使用 NAS 当前 Fonia 1.0.19 对应 revision `34e6d2258225610a178dde6ed1c406b699336c8a`，基础镜像同时固定到 digest。升级原 Fonia 播放器不得自动改变已保存项目的视觉。
+视频工坊固定使用 Folia 稳定 Release `v0.7.7`、revision `80c073490482303d4283d1d5205be7707c96179d`、Docker Stack `1.0.26`。镜像从该提交源码构建，再应用带提交校验的源码补丁；补丁不能干净应用时构建必须失败，不允许继续对压缩 bundle 做模糊字符串替换。
 
-旧“Folia 原版”、AMLL、Kinetic 和 ASS 渲染链保持原样。原生链只在 `style.effect=folia-native` 时启用，配置放在 `style.folia` 并记录 schema/revision。透明输出只关闭 Fonia 独立背景注册层，不通过删除 CSS 背景或跳过 visualizer 达成，以免破坏文字渐变和 Canvas/WebGL 特效。
+效果页只保留 `classic` 和 `folia-native`。classic 延续现有 ASS 链路；Folia 原生保留上游 13 个 visualizer。历史项目里的 Folia 旧预设、AMLL 和 Kinetic 值不改数据库，读取或重渲染时回退 classic 并提示一次。原生配置放在 `style.folia` 并记录 schema/revision。
+
+透明输出只关闭 Folia 独立背景注册层，不删除 CSS 背景或跳过 visualizer，避免破坏文字渐变、Canvas/Pixi/Three.js 特效。统一描边只作用于主歌词及逐字高亮；字体、字重和描边进入布局/纹理缓存键。字体资产以内容哈希保存在 `data/fonts`，渲染器只读挂载，历史项目依赖的字体不提供删除入口。
+
+上游升级只跟踪稳定 Release，并同时确认 amd64 Stack 镜像存在。发现新版只在页面和企业微信提醒，不自动上线；必须先构建候选镜像并通过字体、描边、透明和性能回归。
 
 原生导出固定 1080p30，并提供两个显式选择。默认“快速成片”让原视频与原生 visualizer 在 Xvfb 中实时合成，直接录制带原声音轨的 H.264 MP4；它不承诺 Alpha，目标是让 CPU-only NAS 的耗时接近片长。需要复用透明歌词层时选择“透明歌词 MOV + MP4”，继续逐帧生成无声 ProRes 4444 Alpha MOV，再叠回原视频；透明 MOV 是可复用母版，不因 MP4 合成成功而删除。两条链使用不同文件名，互不覆盖，也不得为了加速而降低或替换 visualizer 特效。第一版不接收自定义字体、头像、贴图或表情资源，只开放主题、缩放、透明度和原生 tuning JSON。

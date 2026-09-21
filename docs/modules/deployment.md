@@ -17,6 +17,7 @@ Web 代理使用 Docker 内置 DNS（`127.0.0.11`）动态解析 `studio-api` �
 | `local-worker` | Whisper 与 Qwen CPU 推理 | 无 |
 | `transcriber` | 录播 ASR、ForcedAligner、逐句时间戳文件 | 通过 `/transcriber/` |
 | `lyrics-service` | LDDC 多源逐字歌词搜索与解析 | 无 |
+| `folia-renderer` | 固定上游 Folia、透明/快速原生成片 | 仅本机 `18091`（候选）/ 容器 `8091` |
 | `chromium-cdp-proxy` | 动效预览浏览器桥接 | 仅主机 `19222` |
 
 飞牛容器列表使用固定的易读名称：`folia-video-web`、`folia-video-api`、`folia-video-ai`、`folia-video-transcriber`、`folia-video-preview`。这些服务都是单实例，固定名称意味着不能用 `docker compose --scale` 横向扩容。
@@ -66,6 +67,8 @@ docker compose exec lyrics-service curl -fsS http://127.0.0.1:8090/healthz
 4. 等待健康状态，不要在容器尚未 healthy 时判断页面失败。
 5. 做一个小样本真实验证。
 6. 把结果写回 `docs/STATUS.md`。
+
+Folia 上游升级额外遵守：只跟踪稳定 Release；将 Release、提交、Stack、amd64 digest、13 个模式和补丁版本写入 `folia-version.json`；从固定提交源码构建；先在独立端口和独立输出目录运行候选容器；队列为空后才切换正式服务。`data/fonts` 与数据库一起备份，渲染器对字体目录保持只读挂载。
 
 ## 数据保护
 
