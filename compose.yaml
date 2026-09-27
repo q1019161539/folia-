@@ -36,11 +36,24 @@ services:
     environment:
       MEDIA_ROOT: /media/bililive
       MEDIA_WRITE_ROOT: /media-output
-      MEDIA_HOST_PATH: /vol1/1000/docker/bililive-tool/video
+      MEDIA_HOST_PATH: /vol1/1000/docker/folia-video-studio/media-view
       DATA_ROOT: /data
       WORK_ROOT: /work
       OUTPUT_ROOT: /output
-      OUTPUT_HOST_PATH: /vol1/1000/video/Folia成片
+      OUTPUT_HOST_PATH: /vol2/1000/video/Folia成片
+      OUTPUT_LEGACY_ROOT: /output-legacy
+      OUTPUT_LEGACY_HOST_PATH: /vol1/1000/video/Folia成片
+      PUBLISH_ENABLED: "1"
+      AUTO_PUBLISH_ENABLED: "0"
+      BILILIVETOOL_BASE_URL: http://host.docker.internal:2333/api
+      BILILIVETOOL_PASSKEY: ${BILILIVETOOL_PASSKEY:-}
+      BILILIVETOOL_UID: "181647901"
+      BILILIVETOOL_PRESET_ID: s9iw1rmff2
+      BILILIVETOOL_OUTPUT_ROOT: /app/Folia成片
+      BILILIVETOOL_OUTPUT_LEGACY_ROOT: /app/历史Folia成片
+      COVER_TEMPLATE_ROOT: /cover-templates
+      COVER_OUTPUT_ROOT: /output/publish/covers
+      PUBLISH_RECONCILE_LOOKBACK_SECONDS: "86400"
       LOCAL_WORKER_URL: http://local-worker:8001
       TRANSCRIBER_URL: http://transcriber:8080
       LYRICS_SERVICE_URL: http://lyrics-service:8090
@@ -56,11 +69,14 @@ services:
     ports:
       - "127.0.0.1:18082:8000"
     volumes:
-      - /vol1/1000/docker/bililive-tool/video:/media/bililive:ro
-      - /vol1/1000/docker/bililive-tool/video:/media-output:rw
+      - /vol1/1000/docker/folia-video-studio/media-view:/media/bililive:ro
+      - /vol2/1000/video/Folia录播:/media-output:rw
       - ./data:/data
+      - /vol1/1000/docker/bililive-tool/data:/recorder-data:ro
       - ./work:/work
-      - /vol1/1000/video/Folia成片:/output
+      - /vol2/1000/video/Folia成片:/output
+      - /vol1/1000/video/Folia成片:/output-legacy:ro
+      - ./cover_templates:/cover-templates:ro
     devices:
       - /dev/dri/renderD128:/dev/dri/renderD128
     group_add:
@@ -88,14 +104,17 @@ services:
     container_name: folia-video-native-renderer
     build: ./folia-renderer
     restart: unless-stopped
+    cpu_shares: 2048
     environment:
       MEDIA_ROOT: /media/bililive
       OUTPUT_ROOT: /output
       RENDER_PORT: "8091"
     volumes:
-      - /vol1/1000/docker/bililive-tool/video:/media/bililive:ro
-      - /vol1/1000/video/Folia成片:/output
+      - /vol1/1000/docker/folia-video-studio/media-view:/media/bililive:ro
+      - /vol2/1000/video/Folia成片:/output
+      - /vol1/1000/video/Folia成片:/output-legacy:ro
       - ./data/fonts:/fonts:ro
+      - ./data/images:/images:ro
     devices:
       - /dev/dri/renderD128:/dev/dri/renderD128
     group_add:
@@ -156,6 +175,7 @@ services:
     container_name: folia-video-transcriber
     build: ./transcriber
     restart: unless-stopped
+    cpu_shares: 512
     env_file:
       - ../folia-asr-mvp/.env
     environment:
@@ -173,7 +193,7 @@ services:
       XDG_CACHE_HOME: /models/cache
       PORT: "8080"
     volumes:
-      - /vol1/1000/docker/bililive-tool/video:/input:ro
+      - /vol1/1000/docker/folia-video-studio/media-view:/input:ro
       - /vol1/1000/docker/folia-asr-mvp/output:/output
       - /vol1/1000/docker/folia-asr-mvp/work:/work
       - /vol1/1000/docker/folia-asr-mvp/models:/models

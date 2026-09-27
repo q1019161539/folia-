@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-EXPECTED_REVISION = "80c073490482303d4283d1d5205be7707c96179d"
+EXPECTED_REVISION = "9cf822015328e47ee5e22061213010a70b4ec5c9"
 
 
 def replace_once(path: Path, old: str, new: str) -> None:

@@ -1,0 +1,28 @@
+.center{align-self:start}
+.center>.preview{position:sticky;top:12px;z-index:3}
+.song-panel>.song{margin:16px 14px 8px}
+.song-panel .song input:first-child{max-width:none}
+.match-actions{display:flex;align-items:center;gap:14px;margin:0 14px 16px;flex-wrap:wrap}
+.match-actions .primary{width:auto;margin:0;min-width:220px}
+.match-actions small{line-height:1.5}
+.song-panel .timeline-match{margin:0 14px 16px}
+.timeline-panel .bar{align-items:flex-start;gap:12px}
+.timeline-panel .bar small{display:block;margin-top:4px}
+.timeline-offset{display:flex;align-items:center;gap:4px;white-space:nowrap;color:#ffffff99;font-size:12px}
+.timeline-offset button{border:1px solid var(--line);border-radius:6px;background:#ffffff0c;color:#ffffffc9;padding:5px}
+.timeline-offset b{min-width:52px;text-align:center;color:var(--lime)}
+.timeline-empty{margin:18px 14px;color:var(--muted);line-height:1.6}
+.timeline-columns,.timeline-panel .line{display:grid;grid-template-columns:38px 106px 106px minmax(180px,1fr)116px 44px;gap:8px;align-items:center}
+.timeline-columns{margin:14px 14px 0;padding:0 8px;color:var(--muted);font-size:11px}
+.timeline-panel .lines{max-height:none;overflow:visible;margin:8px 14px 0}
+.timeline-panel .line{padding:8px}
+.timeline-panel .line input{font-size:12px}
+.timeline-panel .line.deleted{opacity:.48}
+.timeline-panel .line.invalid{background:#ff615c22}
+.timeline-panel .line .delete{width:36px;min-height:32px}
+.timeline-footer{display:flex;align-items:center;justify-content:flex-end;gap:14px;margin:16px 14px}
+.timeline-footer .primary{margin:0}
+.timeline-footer span{font-size:12px;color:var(--muted)}
+.timeline-footer span.dirty{color:#ffe29a}
+@media(max-width:1250px){.timeline-panel .bar{flex-wrap:wrap}.timeline-columns,.timeline-panel .line{grid-template-columns:36px 94px 94px minmax(130px,1fr)100px 40px;gap:5px}}
+@media(max-width:760px){.center>.preview{position:static}.song-panel .song{flex-wrap:wrap}.song-panel .song input{flex-basis:calc(50% - 4px)}.timeline-offset{flex-wrap:wrap;white-space:normal}.timeline-columns{display:none}.timeline-panel .line{grid-template-columns:34px 1fr 1fr 40px;gap:6px}.timeline-panel .line .text-cell{grid-column:1/5;grid-row:2}.timeline-panel .line .conf{display:block;grid-column:1/4;grid-row:3;text-align:left}.timeline-panel .line .delete{display:block;grid-column:4;grid-row:1}.timeline-footer{align-items:stretch;flex-direction:column}.timeline-footer .primary{width:100%}}

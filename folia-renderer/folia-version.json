@@ -1,8 +1,22 @@
 {
-  "release": "v0.7.7",
-  "revision": "80c073490482303d4283d1d5205be7707c96179d",
-  "docker_stack": "1.0.26",
-  "docker_amd64_digest": "sha256:b22965dc050b0602b86fe4e22e77b61720cd3f428ac8491ce5f6bc7d890ac994",
+  "release": "v0.7.8",
+  "revision": "9cf822015328e47ee5e22061213010a70b4ec5c9",
+  "docker_stack": "1.0.27",
+  "docker_amd64_digest": "sha256:5329ff0d28f59a3dce40055ba9449a6009ef4de81db751b91e040e1373ecad15",
   "patch_profile": "studio-font-outline-v1",
-  "modes": ["sonnet", "tempera", "classic", "cadenza", "partita", "fume", "tilt", "claddagh", "monet", "pendolo", "cappella", "diorama", "still"]
+  "modes": [
+    "sonnet",
+    "tempera",
+    "classic",
+    "cadenza",
+    "partita",
+    "fume",
+    "tilt",
+    "claddagh",
+    "monet",
+    "pendolo",
+    "cappella",
+    "diorama",
+    "still"
+  ]
 }

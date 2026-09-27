@@ -2,11 +2,13 @@
 
 from standard_timeline import build_shifted_timeline
 from word_timeline import (
+    _qwen_chars,
     apply_shifted_provider_words,
     normalize_provider_rows,
     provider_char_count,
     score_provider_timeline,
     separation_retry_needed,
+    separation_retry_trigger,
     word_anchor_coverage,
 )
 
@@ -65,6 +67,40 @@ SIX_CLEAN_STARTS = [0, 20000, 40000, 60000, 80000, 100000]
 
 
 class WordTimelineTests(unittest.TestCase):
+    def test_reversed_word_start_excludes_row_from_alignment_and_output(self):
+        row = provider_row("春风吹过", 10000)
+        row["words"][2]["start_ms"] = 10100  # third character precedes the second
+        live = live_segment("春风吹过", 10000)
+        result = score_provider_timeline([row], [live])
+        self.assertEqual(result["word_anchor_count"], 0)
+        timeline = build_shifted_timeline([row], 5000, 30000)
+        counts = apply_shifted_provider_words(timeline, [row], 5000)
+        self.assertEqual(timeline[0]["words"], [])
+        self.assertEqual(counts["rejected"], len(row["text"]))
+
+    def test_reversed_qwen_word_start_excludes_segment(self):
+        segment = live_segment("春风吹过", 10000)
+        segment["words"][2]["start_ms"] = segment["words"][1]["start_ms"] - 100
+        self.assertEqual(_qwen_chars(segment), [])
+
+    def test_two_exact_characters_do_not_make_a_line_vote(self):
+        rows = [provider_row(text, start) for text, start in zip(SIX_CLEAN_LINES[:3], SIX_CLEAN_STARTS[:3])]
+        segments = [live_segment(text[:2], start) for text, start in zip(SIX_CLEAN_LINES[:3], SIX_CLEAN_STARTS[:3])]
+        result = score_provider_timeline(rows, segments)
+        self.assertEqual(result["word_eligible_line_count"], 0)
+
+    def test_zero_duration_forced_words_cannot_vote_for_offset(self):
+        # Real 金风玉蝶 separated ASR collapsed many consecutive characters at
+        # 02:03.360. They identify a character, but provide no character time.
+        segment = {
+            "words": [
+                {"text": "而", "start_ms": 123360, "end_ms": 123360, "timing_source": "qwen-forced-aligner"},
+                {"text": "我", "start_ms": 123360, "end_ms": 123360, "timing_source": "qwen-forced-aligner"},
+                {"text": "唱", "start_ms": 123920, "end_ms": 124080, "timing_source": "qwen-forced-aligner"},
+            ],
+        }
+        self.assertEqual([item["char"] for item in _qwen_chars(segment)], ["唱"])
+
     def test_qwen_words_refine_global_shift_and_raise_confidence(self):
         rows = [
             provider_row("春风吹过山岗", 10000),
@@ -129,7 +165,7 @@ class WordTimelineTests(unittest.TestCase):
         apply_shifted_provider_words(timeline, rows, result["shift_ms"])
         self.assertEqual([line["start_ms"] for line in timeline], [15000, 25000, 35000])
         self.assertTrue(all(word["timing_source"] != "qwen-exact" for line in timeline for word in line["words"]))
-        self.assertEqual(result["timing_model"], "line_global")
+        self.assertEqual(result["timing_model"], "word_unresolved")
 
     def test_word_evidence_far_from_a_line_can_never_drag_it_onto_its_neighbour(self):
         # The 《胭脂妆》 failure shape: a line whose word-level evidence sits
@@ -236,7 +272,7 @@ class WordTimelineTests(unittest.TestCase):
         ]
         result = score_provider_timeline(rows, asr, title_score=1)
         self.assertEqual(result["word_bootstrap_status"], "insufficient_lines")
-        self.assertEqual(result["shift_source"], "line")
+        self.assertEqual(result["shift_source"], "word_unresolved")
         self.assertEqual(result["word_anchor_rejected_count"], 0)
         # Corruption test 3: too little evidence to evaluate the word model at
         # all reads as "unavailable", not "low" -- there is no data to judge, as
@@ -255,43 +291,41 @@ class WordTimelineTests(unittest.TestCase):
         self.assertEqual(result["word_bootstrap_status"], "accepted")
         self.assertEqual(result["shift_source"], "word")
 
-    def test_bootstrap_refuses_a_cluster_far_from_the_line_shift(self):
-        # A tight, unanimous word-level cluster is still refused if it sits far
-        # from the line-level shift -- that combination showed up for real on a
-        # song with a chorus repeated three times, where four lines' word-level
-        # consensus sat ~9000ms away from (and opposite in sign to) the
-        # line-level shift while a fifth line's two levels agreed almost
-        # exactly. That pattern means a timestamp base mismatch somewhere, not a
-        # genuine multi-second performance offset, and the valve exists to keep
-        # it from ever taking over the global shift. It must still be visible in
-        # cluster_lines for diagnosis, and per-line filtering must not punish
-        # lines for it.
-        lines = ["春风吹过山岗", "我们一起歌唱", "直到夜色散场", "风起云涌变幻"]
-        starts = [0, 20000, 40000, 60000]
+    def test_bootstrap_promotes_four_of_six_tight_lines_far_from_line_shift(self):
+        # Four of six independent line votes clear the requested >60% rule.
+        # The other two lines disagree, so this exercises the share calculation
+        # rather than the trivial four-of-four case.
+        lines = SIX_CLEAN_LINES
+        starts = SIX_CLEAN_STARTS
+        rows = [provider_row(text, start) for text, start in zip(lines, starts)]
+        asr = [self._decoupled_segment(text, start, 3000, 13000 if index < 4 else 3000)
+               for index, (text, start) in enumerate(zip(lines, starts))]
+        result = score_provider_timeline(rows, asr, title_score=1)
+        self.assertEqual(result["word_bootstrap_status"], "accepted_far")
+        self.assertEqual(result["word_eligible_line_count"], 6)
+        self.assertEqual(result["word_dominant_cluster_line_count"], 4)
+        self.assertEqual(result["shift_source"], "word")
+        self.assertEqual(result["word_model_shift_ms"], 13000)
+        self.assertEqual(result["word_vs_line_shift_diff_ms"], 10000)
+        self.assertTrue(result["cross_model_conflict"])
+
+    def test_bootstrap_promotes_a_large_tight_cluster_despite_the_distance(self):
+        """《决定不想你》(6 lines, 5798ms away) and 《不为谁而作的歌》 (7 lines,
+        7259ms) were both refused on distance alone, and both were confirmed
+        better by eye once re-shifted. Enough lines agreeing tightly among
+        themselves now outweighs the distance from a line shift that -- on these
+        songs -- was itself built on text_score 0.13 anchor pairs."""
+        lines = ["春风吹过山岗", "我们一起歌唱", "直到夜色散场",
+                 "风起云涌变幻", "星河倒悬如练", "晨光照亮归途"]
+        starts = [0, 20000, 40000, 60000, 80000, 100000]
         rows = [provider_row(text, start) for text, start in zip(lines, starts)]
         asr = [self._decoupled_segment(text, start, 3000, 13000) for text, start in zip(lines, starts)]
         result = score_provider_timeline(rows, asr, title_score=1)
-        self.assertEqual(result["word_bootstrap_status"], "far_from_line_shift")
-        self.assertEqual(result["word_dominant_cluster_line_count"], 4)
-        self.assertEqual(result["shift_source"], "line")
-        self.assertEqual(result["word_anchor_rejected_count"], 0)
-        # This is the exact shape found on a real chorus-repeated-three-times song:
-        # the word model's own candidate is reported (not hidden just because it
-        # wasn't promoted), it disagrees with the line shift by the full 10000ms,
-        # and yet the word anchors are perfectly self-consistent against their own
-        # candidate -- "the word model disagrees with the line model" and "the word
-        # model is unreliable" are different facts, and only the old single
-        # effective-residual field could not tell them apart.
+        self.assertEqual(result["word_bootstrap_status"], "accepted_far")
+        self.assertEqual(result["shift_source"], "word")
+        self.assertEqual(result["word_dominant_cluster_line_count"], 6)
         self.assertEqual(result["word_model_shift_ms"], 13000)
-        self.assertEqual(result["word_vs_line_shift_diff_ms"], 10000)
-        self.assertEqual(result["word_model_median_abs_residual_ms"], 0)
-        self.assertGreater(result["word_median_abs_residual_ms"], 9000)
-        # Corruption test 4 (real-world instance): a whole-song offset between the
-        # word and line models must never by itself read as a word quality problem.
-        # The word model here is perfectly self-consistent, so timing_confidence
-        # must stay high; only the orthogonal conflict flag may fire.
-        self.assertEqual(result["timing_confidence"], "high")
-        self.assertTrue(result["cross_model_conflict"])
+        self.assertEqual(result["effective_shift_ms"], 13000)
 
     def _six_clean_lines(self, shift=5000):
         rows = [provider_row(text, start) for text, start in zip(SIX_CLEAN_LINES, SIX_CLEAN_STARTS)]
@@ -307,12 +341,9 @@ class WordTimelineTests(unittest.TestCase):
         self.assertEqual(result["word_model_inlier_ratio_500"], 1.0)
         self.assertFalse(result["cross_model_conflict"])
 
-    def test_corruption_1_scattered_character_jitter_degrades_confidence(self):
-        # +-1200~1800ms jitter on a third of the characters, confined to two of
-        # six otherwise-clean lines. Each jittered line's own *median* still
-        # lands near the true shift (jitter is roughly balanced positive/
-        # negative), so this specifically exercises spread (MAD/inlier), not
-        # the cluster vote itself.
+    def test_corruption_1_reversed_character_times_are_excluded(self):
+        # The large jitters reverse character order in two of six segments.
+        # Those segments must contribute no word anchors.
         rows = [provider_row(text, start) for text, start in zip(SIX_CLEAN_LINES, SIX_CLEAN_STARTS)]
         clean = [0, 0, 0, 0, 0, 0]
         jitter_a = [1500, -1800, 1200, -900, 1600, -1400]
@@ -323,13 +354,8 @@ class WordTimelineTests(unittest.TestCase):
             for text, start, jitters in zip(SIX_CLEAN_LINES, SIX_CLEAN_STARTS, jitter_sets)
         ]
         result = score_provider_timeline(rows, asr, title_score=1)
-        # MAD's own robustness (its breakdown point is 50%) means a third of the
-        # population jittering does not have to move it off zero -- that is
-        # correct behavior, not a blind spot, because inlier_ratio_500 exists
-        # precisely to catch what a robust spread statistic is designed to
-        # shrug off. Assert what actually has to change.
-        self.assertLess(result["word_model_inlier_ratio_500"], 0.8)
-        self.assertNotEqual(result["timing_confidence"], "high")
+        self.assertEqual(result["word_eligible_line_count"], 4)
+        self.assertEqual(result["word_anchor_lines"], 4)
 
     def test_corruption_2_an_even_split_leaves_no_dominant_cluster(self):
         # Three lines genuinely shifted one way, three genuinely shifted another
@@ -348,13 +374,9 @@ class WordTimelineTests(unittest.TestCase):
         self.assertEqual(result["word_model_coverage_ratio"], 0.5)
         self.assertEqual(result["timing_confidence"], "low")
 
-    def test_corruption_5_anchors_borrowed_from_the_wrong_occurrence(self):
-        # Two of one line's six characters are swapped for times lifted from a
-        # position 6000ms away (as if a repeated phrase pulled in the wrong
-        # occurrence's timing for part of the line), the other four characters
-        # and all other lines stay clean. A partial, localized corruption like
-        # this should still show up in the aggregate spread/inlier numbers even
-        # though it never dominates the vote.
+    def test_corruption_5_wrong_occurrence_reverses_time_and_is_excluded(self):
+        # Borrowed timestamps from another occurrence reverse word order in one
+        # segment. Its entire word sequence is excluded from the vote.
         rows = [provider_row(text, start) for text, start in zip(SIX_CLEAN_LINES, SIX_CLEAN_STARTS)]
         swapped = [0, 0, 6000, 6000, 0, 0]
         jitter_sets = [swapped, [0] * 6, [0] * 6, [0] * 6, [0] * 6, [0] * 6]
@@ -363,12 +385,8 @@ class WordTimelineTests(unittest.TestCase):
             for text, start, jitters in zip(SIX_CLEAN_LINES, SIX_CLEAN_STARTS, jitter_sets)
         ]
         result = score_provider_timeline(rows, asr, title_score=1)
-        clean_result = score_provider_timeline(*self._six_clean_lines())
-        # A 2-of-36-character corruption is a small minority, so a robust spread
-        # statistic (MAD) is not expected to move -- inlier_ratio_500 is the one
-        # built to notice a handful of anchors quietly missing their mark.
-        self.assertLess(result["word_model_inlier_ratio_500"], clean_result["word_model_inlier_ratio_500"])
-        self.assertGreaterEqual(result["word_model_mad_ms"], clean_result["word_model_mad_ms"])
+        self.assertEqual(result["word_eligible_line_count"], 5)
+        self.assertEqual(result["word_anchor_lines"], 5)
 
     def test_new_confidence_fields_appear_without_changing_existing_routing(self):
         # Thin contract test: the new fields show up, and confidence_tier's
@@ -443,6 +461,29 @@ class SeparationRetryTriggerTest(unittest.TestCase):
     def test_no_characters_means_no_verdict_rather_than_a_retry(self):
         self.assertIsNone(word_anchor_coverage(0, []))
         self.assertFalse(separation_retry_needed("verbatim", 0, [], 0.10))
+
+
+class SeparationTriggersAreIndependentTest(unittest.TestCase):
+    """The sparse-anchor rule used to sit inside the match-suspect branch, so a
+    confidently matched song could never reach it. Across the 21 songs of
+    赛蒂娅 2026-09-21 the coverage number was never computed once -- every one of
+    them reported not_needed_high_confidence with coverage None."""
+
+    def test_a_doubtful_match_asks_for_vocals_on_its_own(self):
+        self.assertEqual(separation_retry_trigger(True, False), "match_suspect")
+
+    def test_sparse_anchors_ask_for_vocals_even_when_the_match_is_certain(self):
+        """《心之火》: named beyond doubt, 7 anchors out of 432 characters."""
+        self.assertEqual(separation_retry_trigger(False, True), "sparse_word_anchors")
+
+    def test_both_reasons_are_reported_together(self):
+        self.assertEqual(separation_retry_trigger(True, True), "both")
+
+    def test_neither_reason_leaves_the_clip_alone(self):
+        self.assertEqual(separation_retry_trigger(False, False), "")
+
+    def test_unstable_word_model_asks_for_vocals_above_coverage_threshold(self):
+        self.assertEqual(separation_retry_trigger(False, False, True), "word_model_unstable")
 
 
 if __name__ == "__main__":

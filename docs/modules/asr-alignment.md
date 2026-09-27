@@ -23,8 +23,8 @@
 
 ## 标准歌词时间轴模式
 
-- `POST /api/jobs/{id}/standard-timeline/auto` 复用项目中已有的 `asr_segments`，不会重新识别原始文字，但会先调用 `ensure_word_level_asr`（`backend/app.py`）补一次逐字级 ASR：若 `asr_segments` 里还没有任何 `timing_source=='qwen-forced-aligner'` 的词（典型是手动 `/recognize` 得到的纯 Faster-Whisper 结果），就把整段 ASR 文本拼成一次性长文本、开一个大窗口送 `local-worker` 的 `/force-align` 做 Qwen 整体对齐，再按字符数切回各句段并打上标记；没对齐上的个别句段用 `align_single_asr_segment` 按自身粗时间窗口单独补救一次，失败静默跳过。自动流水线导入的歌曲整场转录时已经带这个标记，这一步直接跳过、不重复花钱。之后才按文件名搜索多源候选，不足时再用最长的两个 ASR 歌词片段补充搜索，比较最多 12 个去重候选。
-- 新转录任务在 `transcript.jsonl` 的逐句记录中保留 Qwen ForcedAligner 原始字时间，并额外生成 `transcript_words.jsonl`。自动切片把整场绝对时间换算为切片相对时间，不为每首重复运行 ASR。
+- `POST /api/jobs/{id}/standard-timeline/auto` 复用项目中已有的 `asr_segments`，不会重新识别原始文字，但会先调用 `ensure_word_level_asr`（`backend/app.py`）补一次逐字级 ASR：若切片的逐句转录还没有 `timing_source=='qwen-forced-aligner'` 的词，就只对这个歌曲片段运行 Qwen 对齐，再按字符数切回各句段；个别句段可在自身时间窗口内补救。之后才按文件名搜索多源候选，不足时再用 ASR 歌词片段补充搜索。
+- 自动流水线的整场 Faster-Whisper 只生成带真实起止时间的逐句 `transcript.jsonl`，不运行整场 Qwen，也不生成空的 `transcript_words.jsonl`。自动切片把整场绝对时间换算为切片相对时间；歌曲片段补 Qwen 字时间，不重复运行整场 ASR。手动转录的原有 Qwen 逐字输出仍按自身选项生成。
 - LDDC 逐字候选会用 Qwen 现场字锚点帮助版本评分、计算唯一全曲偏移并生成诊断。选定候选后，最终逐字轴只使用平台原始字时间加这个统一偏移；Qwen 字时间不写回成品时间轴。
 - `backend/standard_timeline.py` 解析标准 LRC 的毫秒时间、多时间标签和 `[offset]`；在评分前过滤作词/制作/乐器/录音室等名单、版权提示、平台广告和带已知歌名或歌手的标题横幅。随后通过多个 `ASR 起点 - LRC 起点` 锚点聚类、文字相似度、演唱顺序、时间残差、跨度和标题相似度选择版本。重复副歌由同一偏移聚类和单调顺序消歧。
 - **歌名先由音频指纹识别，低置信时再做证据复查**：补齐逐字 ASR 后，正常路径仍用 30 秒窗口 / 25 秒步进寻找 ACRCloud 首个命中，高置信歌曲到此为止。歌词初选低置信时才从下一个未检查窗口继续扫描；两个独立窗口返回同一归一化歌名即确认，扫描过程逐窗记录命中、无匹配和错误。复查还会均衡搜索当前身份和两个 ASR 歌词片段；若异名歌词与 ASR 形成严格强证据（高置信、核心锚点 ≥5、跨度 ≥10 秒、比分领先 ≥40），以 `evidence_consensus` 纠正身份并同步切片名。普通歌词候选仍不能写回身份。两条恢复路径都失败后才进入人声分离补证据。
@@ -65,8 +65,8 @@
 - Whisper：CPU/int8，默认 `large-v3-turbo`。
 - Qwen：CPU/float32，模型 `Qwen/Qwen3-ForcedAligner-0.6B`。
 - 视频工坊 worker 内的 Whisper 与 ForcedAligner 互斥常驻，切换时显式卸载并回收内存。
-- 整场转录服务使用独立的 Qwen3-ASR 进程。启动本地 ASR 前，转录服务必须调用视频工坊 worker `/unload`，等待闲置歌词模型释放并执行 `malloc_trim`，避免两个容器各自常驻一套 Qwen 导致 16 GB 主机 OOM。
-- 整场 ASR 每完成一个音频块就原子更新 `work/jobs/<run_id>/asr_chunks.json`。自动歌曲流水线禁用语音 VAD，使用连续 180 秒块，防止歌声被错误跳过；手动转录任务仍可选择 VAD。相同路径、offset 和时长的块在重试时直接复用；全部块都已存在时不会再次加载 ASR 模型。ASR 或后续对齐进程意外退出时，已经落盘的块不会丢失。
+- 自动整场转录使用现有 `local-worker` 的 Faster-Whisper，启动前先释放该 worker 上闲置的 Qwen/Whisper 模型；转录服务本身不再加载 Qwen3-ASR 或整场 ForcedAligner。切片后才在同一 worker 上加载 Qwen 处理该歌曲，避免两个大模型并存。
+- 整场 ASR 每完成一个 180 秒块就原子更新 `work/jobs/<run_id>/asr_chunks.json`。自动任务同时关闭外部分段和 Faster-Whisper 内部的语音 VAD，防止歌声被误删；手动转录任务保持原选项。复用断点还须校验引擎与模型，不能把旧 Qwen 块用作 Whisper 结果。
 
 ## 修改后的最低验证
 

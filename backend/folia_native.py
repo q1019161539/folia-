@@ -5,9 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 
-FOLIA_RELEASE = "v0.7.7"
-FOLIA_DOCKER_STACK = "1.0.26"
-FOLIA_RENDERER_REVISION = "80c073490482303d4283d1d5205be7707c96179d"
+FOLIA_RELEASE = "v0.7.8"
+FOLIA_DOCKER_STACK = "1.0.27"
+FOLIA_RENDERER_REVISION = "9cf822015328e47ee5e22061213010a70b4ec5c9"
 FOLIA_PATCH_PROFILE = "studio-font-outline-v1"
 
 FOLIA_EFFECTS = [
@@ -271,7 +271,9 @@ def apply_folia_preview_profile(config: dict[str, Any]) -> dict[str, Any]:
     elif result.get("visualizerMode") == "tempera":
         supplied = tunings.get("tempera") if isinstance(tunings.get("tempera"), dict) else {}
         tempera = dict(supplied)
-        tempera["textureResolution"] = min(0.5, max(0.35, float(tempera.get("textureResolution", 0.5))))
+        # Preview runs in the viewer's browser; half-size Pixi textures make
+        # glyph edges visibly soft when the canvas is scaled to the video.
+        tempera["textureResolution"] = 1.0
         tempera["postProcessEnabled"] = False
         tunings["tempera"] = tempera
     result["visualizerTunings"] = tunings

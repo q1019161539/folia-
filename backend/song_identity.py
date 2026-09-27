@@ -77,6 +77,9 @@ def resolve_search_identity(job: dict[str, Any]) -> dict[str, Any]:
     says so out loud: `legacy_fallback` is the marker that this query may be
     running on a title a candidate wrote.
     """
+    manual_title = str(job.get("manual_title") or "").strip()
+    if manual_title:
+        return {"title": manual_title, "artist": str(job.get("manual_artist") or "").strip(), "source": "manual"}
     title = str(job.get("identified_title") or "").strip()
     artist = str(job.get("identified_artist") or "").strip()
     if title:

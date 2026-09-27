@@ -4,22 +4,38 @@
 
 - 页面第四工作区“自动流水线”；前端为 `web/automation.js`。
 - 编排、SQLite 状态和 API 位于 `backend/app.py`，纯校验和时间投影位于 `backend/automation.py`。
-- 主播规则默认停用；启用时先把所有现有合格 MP4 记为基线，只处理之后新增的文件。
-- 主播选择由 `GET /api/automation/broadcasters` 动态读取录播根目录下的一级目录；页面使用下拉框，主播名称直接采用目录名。页面打开时读取一次，目录变化后由用户点击“刷新名单”，不做 5 秒轮询。
+- 主播规则默认停用；保存规则时同时锁定投稿使用的主播显示名，并从 BililiveTool 实时读取视频投稿模板供选择。启用时先把所有现有合格 MP4 记为基线，只处理之后新增的文件。
+- 主播选择由 `GET /api/automation/broadcasters` 合并媒体一级目录与录播机身份。主 API 只读挂载 bililive-tools 的 data 目录（含 SQLite WAL），从 `streamer` 和 `record_history` 按平台＋房间号关联录播目录，30 秒缓存；不写录播机配置或数据库。已有规则在唯一匹配时自动绑定，保存 `recorder_identity` 的房间号和历史目录。改名时显示最新录制目录名称，持续监听该身份的新旧目录；手动历史录播也合并查询。无记录或身份不明确的目录继续按目录监听，禁止用名字前缀猜身份。新发现目录中早于规则启用时间的文件进入基线，避免意外重跑历史。页面名单按房间号合并别名，显示绑定房间号；重复锁定同一身份拒绝创建。页面打开时读取一次，有新增时点击“刷新名单”。
+- 自动流水线工作区首次打开时读取规则、任务、队列、主播目录及当前主播录播；切走再返回保留已有表单和列表，不重复扫描主播目录和历史录播。页面可见时仅每 15 秒后台刷新任务与队列；规则、主播名单及录播由对应刷新按钮或编辑动作更新。
+- UI 的队列概览在桌面放在状态侧栏，手机放在任务列表最前；主播、规则、手动执行和任务记录在手机按单列页面滚动，任务记录默认显示前 10 条并可展开更多。此布局不改变首次加载、返回保留和后台刷新逻辑。
+- 页面顶部的真实统计来自 `GET /api/automation/summary`：当前启用的主播规则数、按 NAS 上海日期计算的当日任务数和成功完成数、全局当前排队数。统计查询使用全部 SQLite 记录，不受最近任务列表的分页限制；无任务时显示 0 与空状态。桌面与歌词制作共用左侧导航，流水线主按钮和状态使用绿色。
+- 主播选择、规则、当前队列与任务记录各为可折叠卡片。规则列表、任务列表和队列过长时在本卡片内部纵向滚动，标题及其他卡片不随之移动；切换工作区仍沿用首次加载和后台状态刷新行为。
 - 已锁定的主播可以通过“手动执行以前的录播”选择历史 MP4。历史文件不受“启用时只监听未来新增文件”的基线限制，也不受自动监听的 1 GiB 门槛限制，但仍必须位于该主播目录、不是 `歌曲切片/`、不是 partial 文件且通过 `ffprobe`。手动任务复用完全相同的串行流水线；同一文件已有活动任务时拒绝重复加入，已结束任务允许再次手动执行。
 - 只接收 `.mp4`、至少 1 GiB、连续两次扫描大小不变且 `ffprobe` 成功的录播；永远排除 `歌曲切片/`。
 
 ## 串行流程
 
 1. 每 30 秒扫描所有已启用主播目录，并把新录播写入 `automation_runs`。
-2. 调用 `folia-video-transcriber` 完成整场本地 ASR 和 Qwen ForcedAligner；自动任务固定设置 `no_vad=true`，整场音频按 180 秒块顺序送入 ASR，避免语音 VAD 把轻声、拖长音或伴奏中的歌声当成非语音跳过。人声分离关闭，源时间 offset 保持不变。逐句文件保留原始字时间，并另存 `transcript_words.jsonl`。转录工作台的手动任务仍保留 VAD 选项。
+2. 调用 `folia-video-transcriber` 将整场音频按 180 秒块送入现有 Faster-Whisper worker；关闭语音 VAD 和逐字时间计算，直接取得块内逐句时间并加回源时间 offset。整场不运行 Qwen ForcedAligner，也不发布空的逐字文件。关闭 VAD 避免把歌声误删；转录工作台的手动任务保持原选项。
 3. 将逐句转录交给 DeepSeek V4 Flash。模型只能返回歌名与首尾 ASR `segment_id`；后端根据真实句段计算时间，低于规则阈值、重叠、过短、过长或无效 ID 均跳过。
    - 校验后的结果在切片前同时发布到 ASR 的录播名目录：`<录播名>_歌曲分析.json` 保存毫秒时间、segment ID、置信度、理由和未采用候选；`<录播名>_歌曲时间轴.txt` 是可读时间轴。两者用于人工审阅，实际切片仍读取同一份已校验数据写入的数据库批次，避免手工文件被篡改后绕过校验。
 4. 使用 FFmpeg 流复制把完整歌曲写入原录播同级 `歌曲切片/`，默认前后 5 秒，不覆盖同名文件。自动模式不使用 `-avoid_negative_ts make_zero`，保留隐藏关键帧预卷，使可见起点对应请求时间。
 5. 将整场 ASR 句段减去切片起点后导入歌曲项目，不重复运行 Whisper。切片时长低于 90 秒直接跳过整套歌词渲染流程（状态 `lyrics_skipped_short_clip`），计入结束时的汇总通知，不搜索候选、不补逐字 ASR、不渲染。
-6. 每首依次执行 LDDC 多源标准时间轴匹配、Qwen 现场字与平台逐字融合和完整渲染，详见 `docs/modules/asr-alignment.md` 的"标准歌词时间轴模式"一节（逐字 ASR 前置、行级/逐字级置信度或门、AI 选歌校验+全曲重排的多级补救链）。零锚点候选不再直接跳过，也会送进补救链；只有连候选都搜不到或补救链跑完仍建不出时间轴才是真正的失败。**不再有"低置信照常出片"这一说**：本地够格直接判高置信，AI 帮忙对齐了时间轴（不管本地原本是高是低置信）就归入 `DeepSeek 版`，渲染输出目录第二级相应命名为 `高置信`/`DeepSeek版`（替代旧的 `低置信`，旧目录和历史文件不删除）。已有整场 Qwen 字时间时不为切片重复加载模型。
+6. 每首切片进入标准时间轴匹配时，仅对该歌曲片段补 Qwen 现场逐字时间，再用它与平台逐字歌词评分、对齐并渲染，详见 `docs/modules/asr-alignment.md`。零锚点候选仍进入补救链；只有连候选都搜不到或补救链后仍建不出时间轴才失败。高置信与 `DeepSeek版` 的现有分类保持不变。
 
 所有主播共享一个后台执行队列，避免 Whisper、Qwen 和渲染同时占用内存。一首失败不会阻止同录播中的其他歌曲。
+
+## 成片后投稿准备（Phase 1）
+
+完整 MP4 渲染成功后，API 以项目 ID 幂等创建 `publish_jobs`。投稿任务只快照识别层的 `identified_title`、`identified_artist`、`identity_source`，以及自动规则已经锁定的主播显示名和 BililiveTool preset ID；歌词候选、手工显示标题和 LLM 不得覆盖这些值。旧规则没有选择 preset 时不创建准备任务，避免误用另一位主播的全局默认模板；保存选择后由常驻对账补建。
+
+自动流水线页面通过 `GET /api/publish-presets` 代理 BililiveTool 的 `GET /api/preset/video`，显示模板名称和简介摘要；保存或编辑主播规则时，API 再次读取指定 preset，防止保存不存在的 ID。准备 worker 生成固定标题、tags 与 1920×1080 封面，将 `/output` 和 `/output-legacy` 映射到 BililiveTool 已挂载的 `/app/Folia成片` 和 `/app/历史Folia成片`。简介优先继承所选 preset 的 `config.desc`，通过 BililiveTool 真实的 `POST /api/bili/formatDesc` 展开直播时间等模板变量；preset 没有简介时才使用 Folia 的确定性简介。随后仅覆盖 `title/desc/tag/cover`，持久化不含 PassKey 的完整 payload 快照，再调用 `POST /api/bili/validUploadParams`。成功后停在 `ready`。
+
+payload 一经快照便保持不变：临时网络失败重试同一份快照，后来修改规则或 BililiveTool preset 不会静默改写已经 `ready` 的历史任务。
+
+Phase 1 固定 `AUTO_PUBLISH_ENABLED=0`，代码中不存在 `/api/bili/upload` 调用。BililiveTool 无法访问或 5xx 会按退避时间保留为 `pending`；缺失歌曲身份、封面或参数校验失败为 `failed`。任何这类错误都不改变原自动任务和 MP4 的完成状态。检查接口为 `GET /api/publish-jobs`、`GET /api/publish-jobs/{id}`，准备失败可用 `POST /api/publish-jobs/{id}/retry` 重试。历史验收只能显式调用 `POST /api/publish-jobs/backfill?limit=2`，单次最多补建两个；常驻对账使用 SQLite 持久化水位，不会在每次重启时扫遍历史成片。
+
+整场任务仅在歌曲实际处理失败时记为 `completed_with_errors`。切片短于 90 秒、歌词锚点不足等按规则跳过的歌曲仍逐首保留原因；如果其余歌曲均完成，整场记为 `completed`，页面显示“完成（跳过 N 首）”，不计入失败。转录服务状态查询遇到短暂断线或超时会重试；如果后台任务随后报告 `SIGKILL`，整场错误直接显示“疑似内存不足”及转录服务给出的具体原因。`SIGKILL` 本身不证明内核 OOM，需结合系统日志判断。
 
 ## 企业微信通知
 
@@ -38,7 +54,7 @@
 - `GET /api/automation/runs`、`GET /api/automation/runs/{id}`
 - `POST /api/automation/runs/{id}/cancel|retry`
 
-SQLite 表：`automation_profiles`、`automation_seen`、`automation_runs`。运行记录保存转录服务任务 ID、转录、歌曲子任务、视频工坊项目 ID 和输出链接。重试复用已经完成的转录、切片和项目；若切片完成后的路径交接曾中断，会从原批次恢复内部路径而不重复切片。公开切片响应只在数据副本中移除内部路径，不能修改后台继续处理所需的原批次对象。自动任务的新 ASR 与 ASR 阶段续跑都保持 `no_vad=true`。整场 ASR 每完成一块即更新 `asr_chunks.json`，相同无 VAD 分块可跳过已完成块，全部 ASR 块完成后则只重新执行 align。启动本地整场 ASR 前还会让 `folia-video-ai` 释放闲置 Qwen 模型，避免跨容器内存叠加。
+SQLite 表：`automation_profiles`、`automation_seen`、`automation_runs`。运行记录保存转录服务任务 ID、转录、歌曲子任务、视频工坊项目 ID 和输出链接。重试复用已经完成的转录、切片和项目；若切片完成后的路径交接曾中断，会从原批次恢复切片路径。自动任务固定使用 `asr_engine=whisper`、`skip_alignment=true`、`no_vad=true`。整场 ASR 每完成一块即更新 `asr_chunks.json`；缓存按引擎及模型校验，旧 Qwen 块不能被 Whisper 复用。失败重试从已有音频进入 ASR 阶段，不再返回整场逐字对齐阶段。
 
 ## 安全配置
 

@@ -52,6 +52,21 @@ class StandardTimelineTests(unittest.TestCase):
         self.assertTrue(is_lyric_metadata("心之火 - F.I.R.飞儿乐团/彭佳慧", "心之火", "F.I.R.飞儿乐团 / 彭佳慧"))
         self.assertFalse(is_lyric_metadata("爱是一场漫长旅行", "心之火", "彭佳慧"))
 
+    def test_credits_the_old_keyword_list_let_through(self):
+        """《小宇》 opened on "长笛：张洪禄" -- 笛子 was listed, 长笛 was not, so the
+        credit rendered as the song's first lyric over the intro."""
+        for value in ("长笛：张洪禄", "竹笛：某人", "短笛：某人", "音乐项目总监：某人",
+                      "中提琴：某人", "萨克斯：某人", "手风琴：某人", "打击乐：某人",
+                      "架子鼓：某人", "唢呐：某人", "Written by：某人", "Music by：某人"):
+            self.assertTrue(is_lyric_metadata(value), value)
+
+    def test_a_singer_whose_name_contains_an_instrument_word_still_sings(self):
+        """CREDIT_KEYWORD matches the label as a substring and drops the row even
+        when lyrics follow, so one-character instrument stems (笛 箫 阮 鼓) must
+        stay out of it -- 阮 alone is a common surname."""
+        for value in ("阮经天：我在等你回来", "王笛：夜色温柔如水", "萧鼓：风起时我想你"):
+            self.assertFalse(is_lyric_metadata(value), value)
+
     def test_a_high_tier_song_can_still_need_checking_first(self):
         # 《胭脂妆》 shipped as tier=high with match and timing confidence both
         # high, and carried sixteen places where two subtitle lines were on
@@ -189,6 +204,24 @@ class StandardTimelineTests(unittest.TestCase):
              "result": {"score": 300, "low_confidence": False, "anchors": list(range(9))}},
             {"candidate": {"timing_type": "line"}, "title_similarity": 1.0,
              "result": {"score": 150, "low_confidence": False, "anchors": list(range(6))}},
+        ]
+        self.assertIs(choose_best_timeline_candidate(items), items[1])
+
+    def test_shortened_title_verbatim_beats_exact_title_line_only(self):
+        items = [
+            {"candidate": {"timing_type": "line"}, "title_similarity": 1.0,
+             "result": {"score": 300, "low_confidence": False, "core_anchors": [{}] * 8}},
+            {"candidate": {"timing_type": "verbatim"}, "title_similarity": 0.55,
+             "result": {"score": 120, "low_confidence": True, "core_anchors": [{}] * 5}},
+        ]
+        self.assertIs(choose_best_timeline_candidate(items), items[1])
+
+    def test_verbatim_candidates_use_evidence_score(self):
+        items = [
+            {"candidate": {"timing_type": "verbatim"}, "title_similarity": 1.0,
+             "result": {"score": 120, "low_confidence": False, "core_anchors": [{}] * 5}},
+            {"candidate": {"timing_type": "verbatim"}, "title_similarity": 1.0,
+             "result": {"score": 160, "low_confidence": True, "core_anchors": [{}] * 6}},
         ]
         self.assertIs(choose_best_timeline_candidate(items), items[1])
 
@@ -627,6 +660,33 @@ class TitleIdentityTest(unittest.TestCase):
             },
         ]
         self.assertEqual(choose_best_timeline_candidate(items)["candidate"]["candidate_id"], "qq:1130991")
+
+    def test_cover_credit_does_not_hide_the_singers_word_timed_lyrics(self):
+        # Real 《烟花易冷》 case: a line-only cover upload was selected although
+        # the fingerprinted singer had a word-timed release with 30 anchors.
+        title = "烟花易冷 (cover: 周杰伦)"
+        self.assertEqual(title_similarity(title, "烟花易冷"), 1.0)
+        self.assertEqual(title_similarity(title, "烟花易冷（Cover 周杰伦）"), 1.0)
+        items = [
+            {"candidate": {"candidate_id": "qq:other", "timing_type": "verbatim"},
+             "title_similarity": title_similarity(title, "烟花易冷"), "artist_similarity": 0,
+             "result": {"low_confidence": False, "score": 177.041, "core_anchors": [{}] * 6}},
+            {"candidate": {"candidate_id": "qq:fingerprinted-singer", "timing_type": "verbatim"},
+             "title_similarity": title_similarity(title, "烟花易冷"), "artist_similarity": 1.0,
+             "result": {"low_confidence": False, "score": 176.606, "core_anchors": [{}] * 6}},
+            {"candidate": {"candidate_id": "netease:line-only", "timing_type": "line"},
+             "title_similarity": title_similarity(title, "烟花易冷（Cover 周杰伦）"),
+             "artist_similarity": 0,
+             "result": {"low_confidence": False, "score": 127.769, "core_anchors": [{}] * 5}},
+        ]
+        self.assertEqual(choose_best_timeline_candidate(items)["candidate"]["candidate_id"],
+                         "qq:fingerprinted-singer")
+        items[0]["result"]["score"] = 185
+        self.assertEqual(choose_best_timeline_candidate(items)["candidate"]["candidate_id"],
+                         "qq:other")
+
+    def test_non_cover_parenthetical_remains_part_of_song_title(self):
+        self.assertLess(title_similarity("十年（漫长的告别）", "十年"), 1.0)
 
     def test_title_floor_still_blocks_a_verbatim_release_of_another_song(self):
         items = [

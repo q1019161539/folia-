@@ -7,6 +7,9 @@ function showWorkspace(name){
  const studio=!clips&&!transcriber&&!automation;
  $('#studioPage').hidden=!studio;$('#studioNav').style.display=studio?'':'none';$('#clipPage').hidden=!clips;$('#transcriberPage').hidden=!transcriber;$('#automationPage').hidden=!automation;
  $('#showStudio').classList.toggle('active',studio);$('#showClips').classList.toggle('active',clips);$('#showTranscriber').classList.toggle('active',transcriber);$('#showAutomation').classList.toggle('active',automation);
+ document.body.dataset.workspace=name;
+ try{sessionStorage.setItem('folia-workspace',name)}catch{}
+ for(const [key,id] of [['studio','showStudio'],['clips','showClips'],['transcriber','showTranscriber'],['automation','showAutomation']]){$('#'+id).setAttribute('aria-current',key===name?'page':'false')}
  if(clips)loadClipFiles().catch(e=>toast(e.message));
  if(automation)openAutomation();
 }
@@ -33,7 +36,7 @@ async function parseTimelineDocument(){
 function renderClipRows(){
  let padding=Math.max(0,Math.min(30,Number($('#clipPadding').value)||0));let body=$('#clipRows');body.innerHTML='';
  clipSegments.forEach((item,index)=>{let row=document.createElement('tr');row.className=item.kind==='suspected'?'suspected':'';let effective=`${clipHms(Math.max(0,item.start_seconds-padding))}–${clipHms(item.end_seconds+padding)}`;
-  row.innerHTML=`<td><input class="enabled" type="checkbox" ${item.enabled?'checked':''}></td><td class="kind">${item.kind==='official'?'正式':'疑似'}</td><td><input class="clip-title" type="text" value="${esc(item.title)}"></td><td><input class="time start-time" value="${clipHms(item.start_seconds)}"></td><td><input class="time end-time" value="${clipHms(item.end_seconds)}"></td><td class="effective">${effective}</td>`;
+  row.innerHTML=`<td data-label="使用"><input class="enabled" type="checkbox" aria-label="使用这段" ${item.enabled?'checked':''}></td><td class="kind" data-label="类型">${item.kind==='official'?'正式':'疑似'}</td><td data-label="歌曲"><input class="clip-title" type="text" aria-label="歌曲名" value="${esc(item.title)}"></td><td data-label="开始"><input class="time start-time" aria-label="开始时间" value="${clipHms(item.start_seconds)}"></td><td data-label="结束"><input class="time end-time" aria-label="结束时间" value="${clipHms(item.end_seconds)}"></td><td class="effective" data-label="有效范围">${effective}</td>`;
   row.querySelector('.enabled').onchange=e=>{item.enabled=e.target.checked;updateClipStartButton()};row.querySelector('.clip-title').onchange=e=>item.title=e.target.value.trim();row.querySelector('.start-time').onchange=e=>{let value=clipSeconds(e.target.value);if(Number.isFinite(value))item.start_seconds=value;renderClipRows()};row.querySelector('.end-time').onchange=e=>{let value=clipSeconds(e.target.value);if(Number.isFinite(value))item.end_seconds=value;renderClipRows()};body.append(row)});
 }
 function collectClipRows(){

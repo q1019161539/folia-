@@ -1,5 +1,6 @@
-﻿import asyncio, base64, contextlib, difflib, json, math, os, re, sqlite3, subprocess, sys, threading, time, traceback, uuid
-from datetime import datetime
+import asyncio, base64, contextlib, difflib, hashlib, json, math, os, re, sqlite3, subprocess, sys, threading, time, traceback, uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -10,27 +11,42 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from song_identity_diagnostics import acrcloud_identify_window_result
 import ai_slot
+from recorder_identity import recorder_catalog, bind_identity, profile_paths, broadcaster_choices
 from pipeline_eta import estimate_asr, estimate_songs
 from standard_timeline import balanced_candidate_pool, build_review_assessment, build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, choose_identity_recovery_candidate, clamp_forced_words, confidence_output_folder, estimate_untimed_timeline, find_suspect_anchor_regions, identity_evidence_can_override, identity_recheck_needed, is_high_confidence, is_lyric_metadata, lyric_render_window, normalize_identity, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, title_similarity as compare_titles
-from word_timeline import apply_shifted_provider_words, normalize_provider_rows, score_provider_timeline, separation_retry_needed, timed_rows, word_anchor_coverage
+from word_timeline import apply_shifted_provider_words, normalize_provider_rows, score_provider_timeline, separation_retry_needed, separation_retry_trigger, timed_rows, word_anchor_coverage
 from automation import MIN_RECORDING_BYTES, automation_transcriber_payload, broadcaster_directories, eligible_recording, parse_ai_json, project_transcript, recording_choices, restore_completed_clip_paths, transcript_for_ai, transcript_segments, validate_detected_songs
 from folia_native import FOLIA_DOCKER_STACK, FOLIA_EFFECTS, FOLIA_PATCH_PROFILE, FOLIA_RELEASE, FOLIA_RENDERER_REVISION, apply_folia_fast_profile, apply_folia_preview_profile, build_folia_config, normalized_folia_settings
 from font_assets import list_fonts, resolve_font, store_font
+from image_assets import MAX_UPLOAD_BYTES, list_images, resolve_image, resolve_tempera_pool, store_image
 from folia_upstream import UpstreamStatusStore
 from song_identity import backfill_identity, fingerprint_consensus, identity_fields, matched_candidate_fields, resolve_search_identity
 from recording_metadata import copy_recording_metadata_sidecar
+from publishing import (BililiveToolClient, PublishPrepareError, PublishRetryableError,
+    PublishSettings, build_description, build_payload, build_tags, build_title,
+    choose_cover_template, json_text, map_to_bililive_path, merge_preset_config,
+    preset_description_template, render_cover, retry_delay_seconds, streamer_from_source)
 
 MEDIA=Path(os.getenv('MEDIA_ROOT','/media/bililive')).resolve()
 MEDIA_WRITE=Path(os.getenv('MEDIA_WRITE_ROOT','/media-output')).resolve()
 MEDIA_HOST=Path(os.getenv('MEDIA_HOST_PATH','/vol1/1000/docker/bililive-tool/video'))
 DATA=Path(os.getenv('DATA_ROOT','/data')).resolve(); WORK=Path(os.getenv('WORK_ROOT','/work')).resolve(); OUTPUT=Path(os.getenv('OUTPUT_ROOT','/output')).resolve()
 FONTS=DATA/'fonts'; FONTS.mkdir(parents=True,exist_ok=True)
+IMAGES=DATA/'images'; IMAGES.mkdir(parents=True,exist_ok=True)
+THUMBNAILS=DATA/'thumbnails'; THUMBNAILS.mkdir(parents=True,exist_ok=True)
+thumbnail_executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix='studio-thumbnail')
+thumbnail_pending:set[str]=set()
+thumbnail_failed:dict[str,float]={}
+thumbnail_lock=threading.Lock()
 DB=DATA/'studio.db'; LOCAL_WORKER=os.getenv('LOCAL_WORKER_URL','http://local-worker:8001'); DASHSCOPE_KEY=os.getenv('DASHSCOPE_API_KEY','')
 TRANSCRIBER_URL=os.getenv('TRANSCRIBER_URL','http://transcriber:8080').rstrip('/')
 LYRICS_SERVICE_URL=os.getenv('LYRICS_SERVICE_URL','http://lyrics-service:8090').rstrip('/')
 DEEPSEEK_KEY=os.getenv('DEEPSEEK_API_KEY','').strip(); DEEPSEEK_BASE=os.getenv('DEEPSEEK_BASE_URL','https://api.deepseek.com').rstrip('/'); DEEPSEEK_MODEL=os.getenv('DEEPSEEK_MODEL','deepseek-v4-flash')
 FOLIA_RENDERER_URL=os.getenv('FOLIA_RENDERER_URL','http://folia-renderer:8091').rstrip('/')
+OUTPUT_LEGACY=Path(os.getenv('OUTPUT_LEGACY_ROOT','/output-legacy')).resolve()
+OUTPUT_LEGACY_HOST=Path(os.getenv('OUTPUT_LEGACY_HOST_PATH','/vol1/1000/video/Folia成片'))
 OUTPUT_HOST=Path(os.getenv('OUTPUT_HOST_PATH','/vol1/1000/video/Folia成片')); T2S=OpenCC('t2s')
+PUBLISH_SETTINGS=PublishSettings.from_env()
 NETEASE_HEADERS={'User-Agent':'Mozilla/5.0','Referer':'https://music.163.com/'}
 BEIJING_TZ=ZoneInfo('Asia/Shanghai')
 MIN_SONG_DURATION_MS=90_000
@@ -78,6 +94,7 @@ job_tasks_lock=threading.Lock()
 JOB_BUSY_STATUSES=('recognizing','force_aligning','timeline_matching','rendering','queued')
 JOB_TASK_STALE_SECONDS=1800
 automation_wakeup=threading.Event(); automation_started=False
+publish_wakeup=threading.Event(); publish_started=False
 folia_upstream_wakeup=threading.Event()
 folia_upstream_store=UpstreamStatusStore(DATA/'folia-upstream-status.json')
 stage_active:dict[str,Any]={'job_id':None,'position_ms':0,'duration_ms':0,'paused':True}
@@ -100,7 +117,7 @@ def folia_version_info()->dict[str,Any]:
     return {
         'release':FOLIA_RELEASE,'revision':FOLIA_RENDERER_REVISION,
         'docker_stack':FOLIA_DOCKER_STACK,
-        'docker_amd64_digest':'sha256:b22965dc050b0602b86fe4e22e77b61720cd3f428ac8491ce5f6bc7d890ac994',
+        'docker_amd64_digest':'sha256:5329ff0d28f59a3dce40055ba9449a6009ef4de81db751b91e040e1373ecad15',
         'patch_profile':FOLIA_PATCH_PROFILE,
     }
 
@@ -197,8 +214,52 @@ def ensure_schema(c):
     c.execute('CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,created_at REAL,updated_at REAL,status TEXT,source TEXT,engine TEXT,title TEXT,artist TEXT,lyrics TEXT,alignment TEXT,style TEXT,error TEXT,output TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS clip_batches(id TEXT PRIMARY KEY,created_at REAL,updated_at REAL,status TEXT,source TEXT,padding REAL,mode TEXT,items TEXT,current_index INTEGER,progress REAL,output_dir TEXT,error TEXT,log TEXT,cancel_requested INTEGER DEFAULT 0)')
     c.execute('CREATE TABLE IF NOT EXISTS automation_profiles(id TEXT PRIMARY KEY,created_at REAL,updated_at REAL,name TEXT,path TEXT,enabled INTEGER,enabled_at REAL,min_bytes INTEGER,min_confidence REAL,padding REAL,style TEXT)')
+    automation_profile_columns={r[1] for r in c.execute('PRAGMA table_info(automation_profiles)')}
+    if 'recorder_identity' not in automation_profile_columns:
+        c.execute("ALTER TABLE automation_profiles ADD COLUMN recorder_identity TEXT DEFAULT ''")
+    if 'publish_streamer' not in automation_profile_columns:
+        c.execute("ALTER TABLE automation_profiles ADD COLUMN publish_streamer TEXT DEFAULT ''")
+    if 'bililive_preset_id' not in automation_profile_columns:
+        c.execute("ALTER TABLE automation_profiles ADD COLUMN bililive_preset_id TEXT DEFAULT ''")
+    if 'bililive_preset_name' not in automation_profile_columns:
+        c.execute("ALTER TABLE automation_profiles ADD COLUMN bililive_preset_name TEXT DEFAULT ''")
     c.execute('CREATE TABLE IF NOT EXISTS automation_seen(profile_id TEXT,source TEXT,size INTEGER,mtime REAL,stable_count INTEGER,disposition TEXT,updated_at REAL,PRIMARY KEY(profile_id,source))')
     c.execute('CREATE TABLE IF NOT EXISTS automation_runs(id TEXT PRIMARY KEY,profile_id TEXT,created_at REAL,updated_at REAL,status TEXT,stage TEXT,source TEXT,size INTEGER,mtime REAL,transcriber_job_id TEXT,transcriber_run_id TEXT,transcript TEXT,songs TEXT,current_song INTEGER,error TEXT,cancel_requested INTEGER DEFAULT 0)')
+    c.execute('CREATE TABLE IF NOT EXISTS app_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+    c.execute('''CREATE TABLE IF NOT EXISTS publish_jobs(
+        id TEXT PRIMARY KEY,
+        source_job_id TEXT NOT NULL UNIQUE,
+        automation_run_id TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending','preparing','ready','submitting','uploading','completed','failed')),
+        publish_result TEXT CHECK(publish_result IN ('success','duplicate') OR publish_result IS NULL),
+        publish_attempts INTEGER NOT NULL DEFAULT 0,
+        publish_error TEXT,
+        next_retry_at REAL,
+        video_path TEXT NOT NULL,
+        video_size INTEGER,
+        video_mtime REAL,
+        cover_path TEXT,
+        streamer TEXT NOT NULL,
+        identified_title TEXT,
+        identified_artist TEXT,
+        identity_source TEXT,
+        title TEXT,
+        description TEXT,
+        tags_json TEXT,
+        bililive_preset_id TEXT,
+        bililive_uid INTEGER,
+        bililive_payload_json TEXT,
+        validation_result_json TEXT,
+        bililive_task_id TEXT UNIQUE,
+        aid TEXT,
+        bvid TEXT,
+        review_state INTEGER,
+        review_state_desc TEXT,
+        published_at REAL
+    )''')
+    c.execute('INSERT OR IGNORE INTO app_meta(key,value) VALUES(?,?)',('publish_reconcile_since',str(time.time())))
     # Stage timings, for estimating how long a run will take. created_at to
     # updated_at cannot answer that: it also counts time spent queueing behind
     # another render, so an estimator trained on it learns other runs' queues.
@@ -209,7 +270,7 @@ def ensure_schema(c):
     # candidate cannot reach it even by accident, and so an old job without one
     # is distinguishable from a job whose identity is genuinely empty.
     job_columns={row['name'] for row in c.execute('PRAGMA table_info(jobs)')}
-    for column in ('identified_title','identified_artist','identity_source'):
+    for column in ('identified_title','identified_artist','identity_source','manual_title','manual_artist'):
         if column not in job_columns: c.execute(f'ALTER TABLE jobs ADD COLUMN {column} TEXT')
     c.commit()
 def fid(path:Path): return base64.urlsafe_b64encode(str(path.relative_to(MEDIA)).encode()).decode().rstrip('=')
@@ -458,7 +519,8 @@ def publicclip(batch:dict[str,Any]):
 class JobIn(BaseModel): file_id:str; force_new:bool=False
 class RecognizeIn(BaseModel): engine:str='local'; language:str='zh'
 class SongIn(BaseModel): title:str; artist:str=''; lyrics:str; platform:str='manual'; candidate_id:str='manual'
-class AlignmentIn(BaseModel): lines:list[dict[str,Any]]; offset_ms:int=0
+class AlignmentIn(BaseModel): lines:list[dict[str,Any]]; offset_ms:int=0; title:str|None=None; artist:str|None=None
+class SongMetadataIn(BaseModel): title:str; artist:str=''
 class StyleIn(BaseModel):
     mode:str='overlay'; effect:str='classic'; preset:str='直播清晰'; resolution:str='1080p'; fps:int=30
     font_size:int=52; stroke:int=3; opacity:float=1; position:int=82; horizontal:int=50; width:int=84
@@ -474,6 +536,7 @@ class ClipSegmentIn(BaseModel): title:str; start_seconds:float; end_seconds:floa
 class ClipBatchIn(BaseModel): file_id:str; segments:list[ClipSegmentIn]; padding_seconds:float=5; mode:str='copy'
 class AutomationProfileIn(BaseModel):
     name:str=''; path:str; min_confidence:float=.8; padding_seconds:float=5; style:StyleIn|None=None
+    publish_streamer:str=''; bililive_preset_id:str=''
 class AutomationManualRunIn(BaseModel): source:str
 
 def backfill_job_identity():
@@ -509,10 +572,11 @@ def backfill_job_identity():
 
 @app.on_event('startup')
 def startup():
-    global automation_started
+    global automation_started,publish_started
     with db() as c:
         c.execute("UPDATE clip_batches SET status='interrupted',error='服务重启，任务已中断',updated_at=? WHERE status IN ('queued','running','cancelling')",(time.time(),)); c.commit()
         c.execute("UPDATE automation_runs SET status='queued',updated_at=? WHERE status IN ('running','cancelling')",(time.time(),)); c.commit()
+        c.execute("UPDATE publish_jobs SET status='pending',publish_error='服务重启，已恢复准备任务',next_retry_at=NULL,updated_at=? WHERE status='preparing'",(time.time(),)); c.commit()
     # Off by default, and deliberately so. A dry run over 95 historical jobs showed
     # that "recoverable" is not the same as "correct": 《很任性》 would be pushed back
     # to the 人人心 guess its fingerprint had already corrected, one fingerprint
@@ -526,8 +590,11 @@ def startup():
         threading.Thread(target=automation_scan_loop,daemon=True,name='automation-scan').start()
         threading.Thread(target=automation_worker_loop,daemon=True,name='automation-worker').start()
         threading.Thread(target=folia_upstream_loop,daemon=True,name='folia-upstream').start()
+    if PUBLISH_SETTINGS.enabled and not publish_started:
+        publish_started=True
+        threading.Thread(target=publish_worker_loop,daemon=True,name='publish-worker').start()
 @app.get('/healthz')
-def health(): return {'ok':True,'media':MEDIA.exists(),'render_busy':render_lock.locked(),'automation':True,'lyrics_service':True,'folia_native':True,'folia_renderer_revision':FOLIA_RENDERER_REVISION,'deepseek_configured':bool(DEEPSEEK_KEY)}
+def health(): return {'ok':True,'media':MEDIA.exists(),'render_busy':render_lock.locked(),'automation':True,'publish_enabled':PUBLISH_SETTINGS.enabled,'auto_publish_enabled':PUBLISH_SETTINGS.auto_publish_enabled,'lyrics_service':True,'folia_native':True,'folia_renderer_revision':FOLIA_RENDERER_REVISION,'deepseek_configured':bool(DEEPSEEK_KEY)}
 @app.get('/api/config')
 def config(): return {'local_worker':True,'cloud_configured':bool(DASHSCOPE_KEY),'deepseek_configured':bool(DEEPSEEK_KEY),'deepseek_model':DEEPSEEK_MODEL,'media_root':str(MEDIA),'output_root':str(OUTPUT)}
 @app.get('/api/folia/effects')
@@ -546,6 +613,53 @@ def font_file(font_id:str):
     except (OSError,ValueError,KeyError,json.JSONDecodeError): raise HTTPException(404,'字体不存在')
     media_type={'.ttf':'font/ttf','.otf':'font/otf','.woff2':'font/woff2'}.get(path.suffix.lower(),'application/octet-stream')
     return FileResponse(path,media_type=media_type,filename=metadata.get('filename') or path.name)
+@app.get('/api/jobs/{jid}/folia-images')
+def folia_images(jid:str):
+    getjob(jid)
+    return {'images':list_images(IMAGES/jid)}
+@app.post('/api/jobs/{jid}/folia-images')
+async def upload_folia_image(jid:str,file:UploadFile=File(...)):
+    getjob(jid)
+    content=await file.read(MAX_UPLOAD_BYTES+1)
+    try: return store_image(IMAGES/jid,file.filename or '图片',content)
+    except ValueError as exc: raise HTTPException(400,str(exc)) from exc
+
+@app.delete('/api/jobs/{jid}/folia-images/{image_id}')
+def delete_folia_image(jid:str,image_id:str):
+    j=getjob(jid)
+    if render_lock.locked(): raise HTTPException(409,'正在渲染，请稍后删除图片')
+    try: path,_=resolve_image(IMAGES/jid,image_id)
+    except (OSError,ValueError,KeyError,json.JSONDecodeError): raise HTTPException(404,'当前项目没有这张图片')
+    style=dict(j.get('style') or {})
+    folia=dict(style.get('folia') or {})
+    tunings=dict(folia.get('visualizer_tunings') or {})
+    tempera=dict(tunings.get('tempera') or {})
+    saved_pool=tempera.get('layerImages') or []
+    tempera['layerImages']=[item for item in saved_pool if isinstance(item,dict) and item.get('id')!=image_id] if isinstance(saved_pool,list) else []
+    tunings['tempera']=tempera
+    folia['visualizer_tunings']=tunings
+    style['folia']=folia
+    update(jid,style=style)
+    path.unlink()
+    (IMAGES/jid/f'{image_id}.json').unlink()
+    return {'ok':True}
+
+def attach_tempera_images(config:dict[str,Any],jid:str)->dict[str,Any]:
+    if config.get('visualizerMode')!='tempera': return config
+    tunings=dict(config.get('visualizerTunings') or {})
+    tempera=dict(tunings.get('tempera') or {})
+    placements,assets=resolve_tempera_pool(IMAGES/jid,tempera.get('layerImages',[]),jid)
+    depth=tempera.get('layerImageDepth','back')
+    if depth not in ('back','front'): raise ValueError('Tempera 图片层级无效')
+    try: frequency=float(tempera.get('layerImageFrequency',0.6))
+    except (TypeError,ValueError) as exc: raise ValueError('Tempera 图片出现频率无效') from exc
+    if not 0<=frequency<=1: raise ValueError('Tempera 图片出现频率超出范围')
+    tempera.update(layerImages=placements,layerImageDepth=depth,layerImageFrequency=frequency)
+    tunings['tempera']=tempera
+    config['visualizerTunings']=tunings
+    config['temperaLayerImageAssets']=assets
+    return config
+
 @app.get('/api/folia/upstream')
 def folia_upstream_status(): return folia_upstream_store.load() or {'ok':False,'status':'not_checked'}
 @app.post('/api/folia/upstream/check')
@@ -604,7 +718,7 @@ def media_duration(path:Path):
 
 def unique_clip_path(directory:Path,title:str):
     stem=safe_clip_name(title); candidate=directory/(stem+'.mp4'); number=2
-    while candidate.exists():
+    while candidate.exists() or (MEDIA/candidate.relative_to(MEDIA_WRITE)).exists():
         candidate=directory/(f'{stem}_{number:02d}.mp4'); number+=1
     return candidate
 
@@ -697,7 +811,9 @@ def clip_batch_file(bid:str,index:int):
     batch=getclip(bid); items=batch.get('items') or []
     if index<0 or index>=len(items) or items[index].get('status')!='completed': raise HTTPException(404,'切片文件不存在')
     name=items[index].get('output_name',''); path=(Path(batch['output_dir'])/name).resolve()
-    if MEDIA_WRITE not in path.parents or not path.is_file(): raise HTTPException(404,'切片文件不存在')
+    if MEDIA_WRITE not in path.parents: raise HTTPException(404,'切片路径无效')
+    if not path.is_file(): path=(MEDIA/path.relative_to(MEDIA_WRITE)).resolve()
+    if not path.is_file(): raise HTTPException(404,'切片文件不存在')
     return FileResponse(path,filename=path.name,content_disposition_type='inline')
 
 @app.get('/api/files')
@@ -746,6 +862,38 @@ def browse(path:str='',q:str='',clips_only:bool=True):
 
 @app.get('/api/media/{id}')
 def media(id:str): return FileResponse(fpath(id),content_disposition_type='inline')
+
+def extract_thumbnail(source:Path,target:Path,key:str,at_ms:int):
+    temp=target.with_name(target.stem+'.partial.jpg')
+    try:
+        subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-ss',f'{at_ms/1000:.3f}',
+                        '-i',str(source),'-frames:v','1','-vf','scale=240:-2','-q:v','5',
+                        '-f','image2','-update','1','-y',str(temp)],
+                       check=True,timeout=30,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+        if not temp.is_file() or temp.stat().st_size<100: raise RuntimeError('没有可用画面')
+        temp.replace(target)
+    except Exception as exc:
+        with thumbnail_lock: thumbnail_failed[key]=time.time()+300
+        print(f'[thumbnail] {source.name} @ {at_ms} ms: {exc}',file=sys.stderr,flush=True)
+    finally:
+        temp.unlink(missing_ok=True)
+        with thumbnail_lock: thumbnail_pending.discard(key)
+
+@app.get('/api/media/{id}/thumbnail')
+def media_thumbnail(id:str,at_ms:int=Query(1000,ge=0,le=28_800_000)):
+    source=fpath(id)
+    if source.suffix.lower() not in ('.mp4','.flv','.mkv','.mov'):
+        raise HTTPException(400,'文件不是可预览视频')
+    stat=source.stat()
+    key=hashlib.sha256(f'{source.relative_to(MEDIA)}:{stat.st_size}:{stat.st_mtime_ns}:{at_ms}'.encode()).hexdigest()
+    target=THUMBNAILS/(key+'.jpg')
+    if target.is_file(): return FileResponse(target,media_type='image/jpeg',headers={'Cache-Control':'private, max-age=3600'})
+    with thumbnail_lock:
+        if thumbnail_failed.get(key,0)>time.time(): return JSONResponse({'status':'failed'},status_code=422)
+        if key not in thumbnail_pending:
+            thumbnail_pending.add(key)
+            thumbnail_executor.submit(extract_thumbnail,source,target,key,at_ms)
+    return JSONResponse({'status':'pending'},status_code=202,headers={'Retry-After':'1'})
 @app.get('/api/jobs')
 def jobs():
     with db() as c: rows=c.execute('SELECT * FROM jobs ORDER BY created_at DESC LIMIT 50').fetchall()
@@ -1014,10 +1162,16 @@ async def collect_standard_timeline_candidates(j:dict[str,Any],asr:list[dict[str
         progress.update({'phase':f'正在比较歌词版本 {number}/{len(loaded)}','candidates_done':number,'candidates_total':len(loaded)})
         update(j['id'],status='timeline_matching',alignment={**(j.get('alignment') or {}),'timeline_match':progress},error='')
         title_similarity=compare_titles(title,candidate.get('title','')) if title else 0
+        artist_similarity=compare_titles(identity.get('artist',''),candidate.get('artist','')) if identity.get('artist') else 0
         provider_rows=normalized_lddc_rows(provider_data or {})
         timed=timed_rows(provider_rows) if provider_rows else parse_lrc(raw_lrc)
         plain=[row['text'] for row in provider_rows] if provider_rows else plain_lyric_lines(raw_lrc)
         provider_timing_type=(provider_data or {}).get('timing_type',candidate.get('timing_type','line'))
+        if provider_timing_type=='verbatim' and not any(
+            word.get('start_ms') is not None and word.get('end_ms') is not None
+            for row in timed for word in row.get('words') or []
+        ):
+            provider_timing_type='line'
         if timed and provider_rows and provider_timing_type=='verbatim':
             result=score_provider_timeline(timed,asr,title_score=title_similarity)
             evidence=[]
@@ -1028,7 +1182,7 @@ async def collect_standard_timeline_candidates(j:dict[str,Any],asr:list[dict[str
             evidence=align_standard_lyrics(plain,asr) if plain else []
             result={'score':len(evidence)*20+sum(float(x.get('confidence',0)) for x in evidence)*6,'anchors':evidence,'anchor_count':len(evidence),'low_confidence':True,'confidence':'low','reason':'歌词版本没有标准时间戳'}
         candidate={**candidate,'timing_type':provider_timing_type,'word_coverage':float((provider_data or {}).get('word_coverage',candidate.get('word_coverage',0)) or 0)}
-        scored.append({'candidate':candidate,'raw_lrc':raw_lrc,'provider_rows':timed if provider_rows else [],'timed':timed,'plain':plain,'evidence':evidence,'result':result,'title_similarity':title_similarity,'lddc_ref':str((provider_data or {}).get('lddc_ref') or lddc_ref)})
+        scored.append({'candidate':candidate,'raw_lrc':raw_lrc,'provider_rows':timed if provider_rows else [],'timed':timed,'plain':plain,'evidence':evidence,'result':result,'title_similarity':title_similarity,'artist_similarity':artist_similarity,'lddc_ref':str((provider_data or {}).get('lddc_ref') or lddc_ref)})
     progress['lddc_fallback']=lddc_failed
     return scored
 
@@ -1067,8 +1221,15 @@ def wait_transcriber_job(jid:str,job_id:str,progress:dict[str,Any],old:dict[str,
         time.sleep(10)
 
 def maybe_retry_with_separated_vocals(jid:str,j:dict[str,Any],chosen:dict[str,Any],scored:list[dict[str,Any]],
-        asr:list[dict[str,Any]],progress:dict[str,Any]):
-    """Re-read this one clip from separated vocals when its word anchors are too sparse.
+        asr:list[dict[str,Any]],progress:dict[str,Any],match_suspect:bool=False):
+    """Re-read this one clip from separated vocals when the mixed-down read failed it.
+
+    Two independent reasons to pay for this, and they must stay independent: the
+    match itself is doubtful (no candidate fits the words we heard), or the match
+    is certain but the word anchors are too sparse to time it. Gating the second
+    behind the first is what made this a dead feature until 2026-09-21 -- a song
+    can be identified beyond doubt and still hand over 7 anchors for 432
+    characters, which is precisely the case worth separating.
 
     The whole call holds the single big-model slot, separation included. The two
     must not get a lock each: separation peaks around 9 GiB and the ASR
@@ -1079,15 +1240,21 @@ def maybe_retry_with_separated_vocals(jid:str,j:dict[str,Any],chosen:dict[str,An
     that won -- better evidence can change which release fits best, and rescoring
     costs nothing because the lyric sheets are already in hand.
     """
-    report={'applied':False,'reason':'','coverage':None}
+    report={'applied':False,'reason':'','coverage':None,'trigger':''}
     candidate,result=chosen['candidate'],chosen['result']
     rows=chosen.get('provider_rows') or []
     coverage=word_anchor_coverage(int(result.get('word_anchor_count',0)),rows) if rows else None
     report['coverage']=round(coverage,4) if coverage is not None else None
-    if not separation_retry_needed(str(candidate.get('timing_type','')),int(result.get('word_anchor_count',0)),
-            rows,SEPARATION_RETRY_COVERAGE):
+    sparse=separation_retry_needed(str(candidate.get('timing_type','')),int(result.get('word_anchor_count',0)),
+        rows,SEPARATION_RETRY_COVERAGE)
+    weak_word_model=(str(candidate.get('timing_type',''))=='verbatim'
+        and (str(result.get('word_bootstrap_status','')) not in ('accepted','accepted_far')
+            or str(result.get('timing_confidence','')) in ('low','unavailable')))
+    trigger=separation_retry_trigger(match_suspect,sparse,weak_word_model)
+    if not trigger:
         report['reason']='not_needed'
         return chosen,scored,asr,report
+    report['trigger']=trigger
     clip=MEDIA/str(j.get('source') or '')
     try: key=separation_cache_key(clip)
     except OSError:
@@ -1098,7 +1265,9 @@ def maybe_retry_with_separated_vocals(jid:str,j:dict[str,Any],chosen:dict[str,An
         # Already read from vocals; the segments in hand are that result.
         report.update({'reason':'already_applied','key':key})
         return chosen,scored,asr,report
-    progress.update({'phase':f'逐字证据不足（{coverage:.1%}），正在用人声分离重新识别','separation_retry':True})
+    why=('逐字证据不足（%.1f%%）'%(coverage*100) if sparse and coverage is not None
+        else '逐字对齐证据不稳定' if weak_word_model else '歌曲匹配存疑')
+    progress.update({'phase':f'{why}，正在用人声分离重新识别','separation_retry':True})
     try: update(jid,alignment={**(j.get('alignment') or {}),'timeline_match':progress})
     except Exception: pass
     try:
@@ -1145,6 +1314,7 @@ def auto_standard_timeline_task(jid:str):
     progress={'status':'running','phase':'正在准备标准歌词候选','started_at':time.time(),'queries_done':0,'queries_total':0,'candidates_done':0,'candidates_total':0}
     try:
         j=getjob(jid); old=j.get('alignment') or {}; asr=old.get('asr_segments',[]) if isinstance(old,dict) else []
+        previous_separation=old.get('separation_retry') or {}
         if not asr: raise RuntimeError('这个项目没有可用的 ASR 原始时间数据')
         duration_ms=round(media_duration(MEDIA/j['source'])*1000)
         if duration_ms<MIN_SONG_DURATION_MS:
@@ -1223,15 +1393,17 @@ def auto_standard_timeline_task(jid:str):
                 'recovered_high_confidence':not bool(chosen['result'].get('low_confidence',True))})
         identity_rescanned=len(fingerprint_trace.get('windows') or [])>initial_window_count
         identity_suspicious=bool(identity_recheck['triggered'] and chosen['result'].get('low_confidence',True))
-        if bool(chosen['result'].get('low_confidence',True)):
-            chosen,scored,asr,separation=maybe_retry_with_separated_vocals(jid,j,chosen,scored,asr,progress)
-        else:
-            separation={'applied':False,'reason':'not_needed_high_confidence','coverage':None}
+        chosen,scored,asr,separation=maybe_retry_with_separated_vocals(jid,j,chosen,scored,asr,progress,
+            match_suspect=bool(chosen['result'].get('low_confidence',True)))
         if separation.get('applied'):
             old={**old,'asr_segments':asr}
             update(jid,alignment={**old,'timeline_match':progress})
 
         candidate,result=chosen['candidate'],chosen['result']
+        if candidate.get('timing_type')=='verbatim' and not int(result.get('word_anchor_raw_count',0)):
+            raise RuntimeError('逐字歌词没有可用逐字锚点；已尝试人声分离，无法进行逐字对齐')
+        if candidate.get('timing_type')=='verbatim' and result.get('word_bootstrap_status') not in ('accepted','accepted_far'):
+            raise RuntimeError('逐字锚点未形成可靠的对齐组；已尝试人声分离，保留原时间轴等待人工校对')
         current_identity=resolve_search_identity(j)
         candidate_artist=str(candidate.get('artist') or '').strip()
         strong_title_override=(identity_evidence_can_override(initial_chosen,chosen)
@@ -1255,7 +1427,9 @@ def auto_standard_timeline_task(jid:str):
             core_anchors=result.get('core_anchors') or []
             evidence_anchors=result.get('evidence_anchors') or core_anchors
             suspect_regions=find_suspect_anchor_regions(core_anchors,chosen['timed'],asr)
-            need_ai_help=not is_high_confidence(result)
+            need_ai_help=(not is_high_confidence(result)
+                or candidate.get('timing_type')=='verbatim'
+                and result.get('timing_confidence') not in ('high','medium'))
             lines=build_shifted_timeline(chosen['timed'],int(result['shift_ms']),duration_ms,anchors=evidence_anchors)
             mode='standard-piecewise'; shift_ms=int(result['shift_ms']); lyrics=[row['text'] for row in chosen['timed']]
             word_counts={'qwen_exact':0,'qwen_corrected':0,'lddc_standard':0,'interpolated':0,'rejected':0}
@@ -1306,13 +1480,28 @@ def auto_standard_timeline_task(jid:str):
         # is reported as matched_* and nothing downstream treats it as identity.
         update(jid,status='alignment_review',lyrics='\n'.join(lyrics),
             alignment={'asr_segments':asr,'lines':lines,'offset_ms':0,'timeline_match':report,
-                **({'separation_retry':separation} if separation.get('applied') else {})},error='')
+                **({'separation_retry':separation if separation.get('applied') else previous_separation}
+                    if separation.get('applied') or previous_separation.get('key') else {})},error='')
     except Exception as exc:
         progress.update({'status':'failed','phase':'标准歌词时间轴匹配失败','error':str(exc)[:1000],'finished_at':time.time()})
         try:
             current=getjob(jid); old=current.get('alignment') or {}
             update(jid,status='failed',alignment={**old,'timeline_match':progress},error=str(exc)[:1000])
         except Exception: pass
+
+def song_metadata_changes(j:dict[str,Any],title:str,artist:str)->dict[str,str]:
+    title=title.strip(); artist=artist.strip()
+    if not title: raise HTTPException(400,'请填写歌名')
+    if len(title)>200 or len(artist)>200: raise HTTPException(400,'歌名或歌手过长')
+    if title==str(j.get('title') or '') and artist==str(j.get('artist') or ''): return {}
+    return {'title':title,'artist':artist,'manual_title':title,'manual_artist':artist}
+
+@app.put('/api/jobs/{jid}/metadata')
+def save_song_metadata(jid:str,body:SongMetadataIn):
+    j=getjob(jid)
+    if job_task_running(j): raise HTTPException(409,'当前项目有任务正在运行')
+    changes=song_metadata_changes(j,body.title,body.artist)
+    return update(jid,**changes) if changes else j
 
 @app.post('/api/jobs/{jid}/standard-timeline/auto')
 def auto_standard_timeline(jid:str):
@@ -1465,6 +1654,10 @@ def adopt_identified_song(jid:str,j:dict[str,Any],hit:dict[str,Any],source:str='
     Renaming is skipped rather than forced when the target name is already taken,
     so a second song that fingerprints the same never overwrites the first.
     """
+    if str(j.get('manual_title') or '').strip():
+        # Keep the user's explicit title and source filename while retaining the
+        # recognition result for later review.
+        return update(jid,**identity_fields(hit['title'],str(hit.get('artist') or ''),source))
     source_rel=Path(str(j.get('source') or ''))
     # Recognition, including the guarded evidence_consensus recovery, is one of
     # the few paths allowed to write identity. It updates the identity columns,
@@ -1871,7 +2064,25 @@ def force_align(jid:str):
 @app.put('/api/jobs/{jid}/alignment')
 def save_alignment(jid:str,body:AlignmentIn):
     j=getjob(jid); old=j.get('alignment') or {}; asr=old.get('asr_segments',[]) if isinstance(old,dict) else []
-    return update(jid,status='styling',alignment={**(old if isinstance(old,dict) else {}),'asr_segments':asr,'offset_ms':max(-5000,min(5000,body.offset_ms)),'lines':body.lines})
+    if job_task_running(j): raise HTTPException(409,'当前项目有任务正在运行')
+    changes={}
+    if body.title is not None:
+        changes=song_metadata_changes(j,body.title,body.artist or '')
+    effective=[]
+    for line in body.lines:
+        if line.get('deleted') or line.get('status')=='asr': continue
+        if not (has_asr_evidence(line) or has_standard_timeline(line)): continue
+        lyric=str(line.get('text') or '').strip()
+        if not lyric: raise HTTPException(400,'时间轴有空歌词，请填写或移除该句')
+        try:
+            start=int(line['start_ms']); end=int(line['end_ms'])
+        except (KeyError,TypeError,ValueError): raise HTTPException(400,'时间轴包含无效时间')
+        if start<0 or end<=start: raise HTTPException(400,f'“{lyric[:12]}”的起止时间无效')
+        effective.append(line)
+    if body.title is not None and not effective: raise HTTPException(400,'请先完成自动匹配标准时间轴')
+    changes.update({'status':'styling','lyrics':'\n'.join(str(line['text']).strip() for line in effective),
+        'alignment':{**(old if isinstance(old,dict) else {}),'asr_segments':asr,'offset_ms':max(-5000,min(5000,body.offset_ms)),'lines':body.lines}})
+    return update(jid,**changes)
 @app.put('/api/jobs/{jid}/style')
 def save_style(jid:str,body:StyleIn): getjob(jid); return update(jid,status='styling',style=normalize_studio_style(body.model_dump()))
 @app.get('/api/jobs/{jid}/preview-session')
@@ -1894,7 +2105,8 @@ def folia_preview_session(jid:str,body:FoliaPreviewIn):
         line=row['line']
         if is_lyric_metadata(str(line.get('text','')),str(j.get('title') or ''),str(j.get('artist') or '')): continue
         rows.append(row)
-    config=apply_folia_preview_profile(build_folia_config(j,settings,rows))
+    try: config=attach_tempera_images(apply_folia_preview_profile(build_folia_config(j,settings,rows)),jid)
+    except ValueError as exc: raise HTTPException(400,str(exc)) from exc
     try: folia_renderer_request('PUT',f'/api/sessions/{jid}',json={'config':config})
     except RuntimeError as exc: raise HTTPException(503,str(exc)) from exc
     return {'ok':True,'token':jid,'url':f'/folia-native/obs?obs=1&token={jid}','renderer_revision':FOLIA_RENDERER_REVISION,'mode':settings['mode']}
@@ -1960,19 +2172,26 @@ async def stage_clock(body:dict[str,Any]):
     await apply_stage_clock(body)
     return {'ok':True,'clients':len(stage_clients)}
 
+def resolve_saved_output(raw:str)->Path:
+    path=Path(raw).resolve()
+    try: relative=path.relative_to(OUTPUT)
+    except ValueError: raise HTTPException(404,'输出路径无效')
+    if path.is_file(): return path
+    legacy=(OUTPUT_LEGACY/relative).resolve()
+    if OUTPUT_LEGACY in legacy.parents and legacy.is_file(): return legacy
+    raise HTTPException(404,'输出文件不存在')
+
 @app.get('/api/jobs/{jid}/output-file')
 def output_file(jid:str):
     j=getjob(jid); raw=(j.get('output') or {}).get('path')
     if not raw: raise HTTPException(404,'尚未生成样片或成片')
-    p=Path(raw).resolve()
-    if OUTPUT not in p.parents or not p.is_file(): raise HTTPException(404,'输出文件不存在')
+    p=resolve_saved_output(raw)
     return FileResponse(p,filename=p.name,content_disposition_type='inline')
 @app.get('/api/jobs/{jid}/output-alpha-file')
 def output_alpha_file(jid:str):
     j=getjob(jid); raw=(j.get('output') or {}).get('alpha_path')
     if not raw: raise HTTPException(404,'这个任务没有透明 MOV')
-    p=Path(raw).resolve()
-    if OUTPUT not in p.parents or not p.is_file(): raise HTTPException(404,'透明 MOV 不存在')
+    p=resolve_saved_output(raw)
     return FileResponse(p,filename=p.name,content_disposition_type='attachment')
 def ass_time(ms):
     ms=max(0,int(ms)); return f'{ms//3600000}:{ms//60000%60:02d}:{(ms//1000)%60:02d}.{ms//10%100:02d}'
@@ -2090,9 +2309,10 @@ def render_folia_native_locked(jid:str,j:dict[str,Any],sample:bool,start_ms:int,
     day=datetime.now(BEIJING_TZ).strftime('%Y-%m-%d'); song_folder=safe_clip_name(str(j.get('title') or source.stem)); confidence_tier=str((al.get('timeline_match') or {}).get('confidence_tier') or ('deepseek' if bool((al.get('timeline_match') or {}).get('low_confidence')) else 'high')) if isinstance(al,dict) else 'high'; confidence_folder=confidence_output_folder(al)
     outdir=OUTPUT/anchor/day/confidence_folder/song_folder; outdir.mkdir(parents=True,exist_ok=True)
     settings=normalized_folia_settings(style.get('folia'),jid); native_mode=settings['mode']; suffix='_sample' if sample else ''
-    if output_mode not in ('fast','alpha'): raise RuntimeError('未知原生输出方式')
-    base=f'{source.stem}_folia_{native_mode}{suffix}'; alpha_path=outdir/(base+'_alpha.mov'); mp4_path=outdir/(base+('_fast' if output_mode=='fast' else '')+'.mp4'); manifest_path=outdir/(base+('.fast' if output_mode=='fast' else '')+'.render.json')
-    config=build_folia_config(j,settings,rows)
+    if output_mode not in ('fast','smooth','alpha'): raise RuntimeError('未知原生输出方式')
+    renderer={'fast':'folia-native-realtime-v1','smooth':'folia-native-frames-v1','alpha':'folia-native-browser-v1'}[output_mode]
+    base=f'{source.stem}_folia_{native_mode}{suffix}'; alpha_path=outdir/(base+'_alpha.mov'); mp4_suffix={'fast':'_fast','smooth':'_smooth','alpha':''}[output_mode]; manifest_suffix={'fast':'.fast','smooth':'.smooth','alpha':''}[output_mode]; mp4_path=outdir/(base+mp4_suffix+'.mp4'); manifest_path=outdir/(base+manifest_suffix+'.render.json')
+    config=attach_tempera_images(build_folia_config(j,settings,rows),jid)
     if output_mode=='fast': config=apply_folia_fast_profile(config)
     request_body={'source':str(source),'alpha_output':str(alpha_path),'mp4_output':str(mp4_path),'manifest_output':str(manifest_path),'start_ms':trim_start_ms,'duration_ms':trim_end_ms-trim_start_ms,'config':config,'output_mode':output_mode}
     created=folia_renderer_request('POST','/api/renders',json=request_body); rid=created['id']
@@ -2103,9 +2323,9 @@ def render_folia_native_locked(jid:str,j:dict[str,Any],sample:bool,start_ms:int,
             state=folia_renderer_request('GET',f'/api/renders/{rid}')
             progress=float(state.get('progress') or 0)
             if progress!=previous_progress:
-                renderer='folia-native-realtime-v1' if output_mode=='fast' else 'folia-native-browser-v1'; previous_progress=progress; update(jid,status='rendering',error='',output={'renderer':renderer,'render_id':rid,'sample':sample,'output_mode':output_mode,'progress':progress,'phase':state.get('phase','正在渲染'),'alpha_path':str(alpha_path) if output_mode=='alpha' else None,'path':str(mp4_path)})
+                previous_progress=progress; update(jid,status='rendering',error='',output={'renderer':renderer,'render_id':rid,'sample':sample,'output_mode':output_mode,'progress':progress,'phase':state.get('phase','正在渲染'),'alpha_path':str(alpha_path) if output_mode=='alpha' else None,'path':str(mp4_path)})
             if state.get('status')=='completed':
-                result=state.get('result') or {}; renderer='folia-native-realtime-v1' if output_mode=='fast' else 'folia-native-browser-v1'; update(jid,status='completed',error='',output={**result,'renderer':renderer,'renderer_revision':FOLIA_RENDERER_REVISION,'effect':native_mode,'sample':sample,'output_mode':output_mode,'progress':100,'confidence_tier':confidence_tier,'trim_start_ms':trim_start_ms,'trim_end_ms':trim_end_ms}); return
+                result=state.get('result') or {}; update(jid,status='completed',error='',output={**result,'renderer':renderer,'renderer_revision':FOLIA_RENDERER_REVISION,'effect':native_mode,'sample':sample,'output_mode':output_mode,'progress':100,'confidence_tier':confidence_tier,'trim_start_ms':trim_start_ms,'trim_end_ms':trim_end_ms}); return
             if state.get('status') in ('failed','cancelled'): raise RuntimeError(state.get('error') or ('任务已中止' if state.get('status')=='cancelled' else 'Folia 原生渲染失败'))
             time.sleep(1)
     finally:
@@ -2261,7 +2481,41 @@ def automation_profile_row(row):
     try: item['style']=json.loads(item.get('style') or '{}')
     except Exception: item['style']={}
     item['enabled']=bool(item.get('enabled'))
+    previous=item.get('recorder_identity') or ''
+    identity=bind_identity(item['path'],item['name'],previous,recorder_catalog('/recorder-data/app.db'))
+    encoded=json.dumps(identity,ensure_ascii=False,sort_keys=True)
+    if identity.get('room_id') and encoded!=previous:
+        with db() as c:
+            c.execute('UPDATE automation_profiles SET recorder_identity=? WHERE id=?',(encoded,item['id'])); c.commit()
+    item['recorder_identity']=identity
+    roots=profile_paths(item,MEDIA)
+    item['recording_paths']=[r.relative_to(MEDIA).as_posix() for r in roots]
+    if roots and identity.get('room_id'):
+        item['path']=roots[0].relative_to(MEDIA).as_posix(); item['name']=roots[0].name
+    item['publish_streamer']=str(item.get('publish_streamer') or item.get('name') or '').strip()
+    item['bililive_preset_id']=str(item.get('bililive_preset_id') or '').strip()
     return item
+
+def bililive_preset(preset_id:str):
+    preset_id=str(preset_id or '').strip()
+    if not preset_id: raise HTTPException(400,'请选择 BililiveTool 投稿模板')
+    client=None
+    try:
+        client=BililiveToolClient(PUBLISH_SETTINGS.bililive_base_url,PUBLISH_SETTINGS.bililive_passkey)
+        preset=client.get_video_preset(preset_id)
+    except PublishRetryableError as exc:
+        raise HTTPException(503,str(exc)) from exc
+    except PublishPrepareError as exc:
+        raise HTTPException(400,str(exc)) from exc
+    finally:
+        if client: client.close()
+    return preset
+
+def bililive_preset_summary(preset:dict[str,Any]):
+    config=preset.get('config') if isinstance(preset.get('config'),dict) else {}
+    return {'id':str(preset.get('id') or ''),'name':str(preset.get('name') or preset.get('id') or ''),
+            'title':str(config.get('title') or ''),'description':str(config.get('desc') or ''),
+            'tags':config.get('tag') if isinstance(config.get('tag'),list) else [],'tid':config.get('tid')}
 
 def automation_run_row(row,include_transcript:bool=False):
     item=dict(row)
@@ -2298,16 +2552,16 @@ def probe_media_ok(path:Path):
     except ValueError: return False
 
 def scan_automation_profile(profile:dict[str,Any]):
-    root=(MEDIA/profile['path']).resolve()
-    if root!=MEDIA and MEDIA not in root.parents or not root.is_dir(): return
+    roots=profile_paths(profile,MEDIA)
     now=time.time()
-    for path in root.rglob('*.mp4'):
+    for path in (p for root in roots for p in root.rglob('*.mp4')):
         if not eligible_recording(path,MEDIA,int(profile.get('min_bytes') or MIN_RECORDING_BYTES)): continue
         relative=path.relative_to(MEDIA).as_posix(); stat=path.stat()
         with db() as c: seen=c.execute('SELECT * FROM automation_seen WHERE profile_id=? AND source=?',(profile['id'],relative)).fetchone()
         if not seen:
+            disposition='baseline' if stat.st_mtime<float(profile.get('enabled_at') or 0) else 'observing'
             with db() as c:
-                c.execute('INSERT OR IGNORE INTO automation_seen VALUES(?,?,?,?,?,?,?)',(profile['id'],relative,stat.st_size,stat.st_mtime,1,'observing',now)); c.commit()
+                c.execute('INSERT OR IGNORE INTO automation_seen VALUES(?,?,?,?,?,?,?)',(profile['id'],relative,stat.st_size,stat.st_mtime,1,disposition,now)); c.commit()
             continue
         seen=dict(seen)
         if seen['disposition']!='observing': continue
@@ -2444,12 +2698,24 @@ def notify_automation_stage(event:str,run:dict[str,Any],**details):
         traceback.print_exc()
 
 def wait_transcriber(run_id:str,job_id:str):
+    request_failures=0
     while True:
         if automation_cancelled(run_id):
             try: transcriber_request('POST',f'/api/jobs/{job_id}/cancel',json={})
             except Exception: pass
             raise RuntimeError('任务已中止')
-        job=transcriber_request('GET',f'/api/jobs/{job_id}').json()
+        try:
+            job=transcriber_request('GET',f'/api/jobs/{job_id}').json()
+        except httpx.RequestError as exc:
+            # The ASR subprocess can be killed while the transcriber HTTP
+            # service stays alive. Its job record is updated a few seconds
+            # later; retrying lets the actual SIGKILL/OOM reason reach the UI.
+            request_failures+=1
+            if request_failures>=3:
+                raise RuntimeError(f'转录服务连续 3 次无响应：{exc}') from exc
+            time.sleep(10)
+            continue
+        request_failures=0
         update_automation_run(run_id,status='running',stage='transcribing',error='')
         if job.get('status')=='completed': return job
         if job.get('status') in ('failed','cancelled','interrupted'):
@@ -2463,7 +2729,9 @@ def ensure_automation_transcript(run:dict[str,Any]):
     if job_id:
         try: existing=transcriber_request('GET',f'/api/jobs/{job_id}').json()
         except Exception: existing=None
-    if existing and 'transcript.jsonl' in (existing.get('downloads') or []):
+    compatible=bool(existing and (existing.get('options') or {}).get('asr_engine')=='whisper'
+                    and (existing.get('options') or {}).get('skip_alignment'))
+    if compatible and 'transcript.jsonl' in (existing.get('downloads') or []):
         response=transcriber_request('GET',f'/api/jobs/{job_id}/download/transcript.jsonl?inline=1')
         rows=[json.loads(line) for line in response.text.splitlines() if line.strip()]
         segments=transcript_segments(rows)
@@ -2471,8 +2739,8 @@ def ensure_automation_transcript(run:dict[str,Any]):
             update_automation_run(run['id'],transcript=segments,stage='transcribed')
             notify_automation_stage('asr_completed',run,segment_count=len(segments),output_path=existing.get('output_path',''))
             return segments
-    if existing and existing.get('status') in ('failed','cancelled','interrupted'):
-        work=set(existing.get('work_downloads') or []); resume_stage='align' if 'asr_chunks.json' in work else ('asr' if 'audio.wav' in work else 'all')
+    if existing and (not compatible or existing.get('status') in ('failed','cancelled','interrupted')):
+        work=set(existing.get('work_downloads') or []); resume_stage='asr' if 'audio.wav' in work else 'all'
         payload=automation_transcriber_payload(run['source'],run.get('transcriber_run_id') or existing.get('run_id'),resume_stage)
         resumed=transcriber_request('POST','/api/jobs',json=payload).json(); job_id=resumed['id']
         run=update_automation_run(run['id'],transcriber_job_id=job_id,transcriber_run_id=resumed.get('run_id',''),stage='transcribing')
@@ -2635,6 +2903,180 @@ def create_imported_song_job(song:dict[str,Any],segments:list[dict[str,Any]],pro
         c.execute(JOB_INSERT,(jid,now,now,'song_review',relative,'local',song['title'],'',' '.join(row['text'] for row in asr),json.dumps({'asr_segments':asr,'lines':asr,'offset_ms':0,'automation_import':{'source':song.get('source'),'clip_start_ms':song['clip_start_ms']}},ensure_ascii=False),json.dumps(style,ensure_ascii=False),'',json.dumps({}),identity['identified_title'],identity['identified_artist'],identity['identity_source'])); c.commit()
     song.update({'project_id':jid,'status':'project_created'}); return getjob(jid)
 
+# --- BililiveTool publishing preparation (Phase 1: no upload endpoint) -----------
+PUBLISH_JOB_INSERT='''INSERT OR IGNORE INTO publish_jobs(
+    id,source_job_id,automation_run_id,created_at,updated_at,status,publish_attempts,
+    video_path,video_size,video_mtime,streamer,identified_title,identified_artist,
+    identity_source,bililive_preset_id,bililive_uid
+) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'''
+
+def publish_job_row(row):
+    result=dict(row)
+    for key,default in (('tags_json',[]),('bililive_payload_json',{}),('validation_result_json',{})):
+        try: result[key[:-5] if key.endswith('_json') else key]=json.loads(result.get(key) or json.dumps(default))
+        except Exception: result[key[:-5] if key.endswith('_json') else key]=default
+    return result
+
+def get_publish_job(publish_id:str):
+    with db() as c: row=c.execute('SELECT * FROM publish_jobs WHERE id=?',(publish_id,)).fetchone()
+    if not row: raise HTTPException(404,'投稿准备任务不存在')
+    return publish_job_row(row)
+
+def update_publish_job(publish_id:str,**fields):
+    fields['updated_at']=time.time()
+    values=tuple(json_text(value) if isinstance(value,(dict,list)) else value for value in fields.values())
+    with db() as c:
+        c.execute('UPDATE publish_jobs SET '+','.join(f'{key}=?' for key in fields)+' WHERE id=?',values+(publish_id,))
+    return get_publish_job(publish_id)
+
+def ensure_publish_job(project:dict[str,Any],run:dict[str,Any],output:dict[str,Any]):
+    """Persist the immutable identity snapshot after a full automatic render."""
+    if not PUBLISH_SETTINGS.enabled or output.get('sample') is not False:
+        return None
+    video=Path(str(output.get('path') or '')).resolve()
+    if not video.is_file():
+        raise RuntimeError(f'成片文件不存在，无法创建投稿准备任务：{video}')
+    stat=video.stat(); now=time.time(); publish_id=uuid.uuid4().hex
+    try: profile=get_automation_profile(str(run.get('profile_id') or ''))
+    except HTTPException: profile={}
+    streamer=str(profile.get('publish_streamer') or '').strip() or streamer_from_source(str(run.get('source') or project.get('source') or ''))
+    preset_id=str(profile.get('bililive_preset_id') or '').strip()
+    # Profiles created before per-streamer preset binding remain unselected.
+    # Do not silently hand their videos to another streamer's global preset;
+    # reconciliation will create the job after the operator saves a choice.
+    if not preset_id:
+        return None
+    with db() as c:
+        c.execute(PUBLISH_JOB_INSERT,(
+            publish_id,project['id'],run.get('id'),now,now,'pending',0,str(video),stat.st_size,stat.st_mtime,
+            streamer,str(project.get('identified_title') or '').strip(),str(project.get('identified_artist') or '').strip(),
+            str(project.get('identity_source') or '').strip(),preset_id,PUBLISH_SETTINGS.bililive_uid,
+        ))
+        row=c.execute('SELECT * FROM publish_jobs WHERE source_job_id=?',(project['id'],)).fetchone()
+    publish_wakeup.set()
+    return publish_job_row(row)
+
+def reconcile_publish_rows(rows,limit:int|None=None):
+    """Create missing hand-offs from completed automation rows, newest first."""
+    created=0
+    for raw in rows:
+        run=automation_run_row(raw,False)
+        for song in reversed(run.get('songs') or []):
+            if limit is not None and created>=limit: return created
+            if song.get('status')!='completed' or not song.get('project_id'): continue
+            try:
+                project=getjob(song['project_id']); output=project.get('output') or song.get('output') or {}
+                if project.get('status')!='completed' or output.get('sample') is not False: continue
+                with db() as c: existed=c.execute('SELECT 1 FROM publish_jobs WHERE source_job_id=?',(project['id'],)).fetchone()
+                if not existed and ensure_publish_job(project,run,output): created+=1
+            except Exception:
+                print(f'[publish-worker] 补建任务失败，run={run.get("id","")} project={song.get("project_id","")}\n{traceback.format_exc()}',file=sys.stderr,flush=True)
+    return created
+
+def reconcile_publish_jobs():
+    """Repair hand-offs completed since the previous durable reconciliation."""
+    if not PUBLISH_SETTINGS.enabled: return 0
+    scan_until=time.time()
+    with db() as c:
+        state=c.execute("SELECT value FROM app_meta WHERE key='publish_reconcile_since'").fetchone()
+        since=float(state['value']) if state else scan_until
+        rows=c.execute("SELECT * FROM automation_runs WHERE status IN ('completed','completed_with_errors') AND updated_at>=? AND updated_at<=? ORDER BY updated_at DESC",(since,scan_until)).fetchall()
+    created=reconcile_publish_rows(rows)
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('publish_reconcile_since',?)",(str(scan_until),))
+    return created
+
+def backfill_recent_publish_jobs(limit:int=2):
+    """Explicit Phase 1 acceptance backfill; never walks the whole archive."""
+    limit=max(1,min(int(limit),2))
+    with db() as c:
+        rows=c.execute("SELECT * FROM automation_runs WHERE status IN ('completed','completed_with_errors') ORDER BY updated_at DESC").fetchall()
+    return reconcile_publish_rows(rows,limit)
+
+def prepare_publish_job(publish_id:str):
+    job=get_publish_job(publish_id)
+    if job['status'] not in ('pending','preparing'): return job
+    attempt=int(job.get('publish_attempts') or 0)+1
+    job=update_publish_job(publish_id,status='preparing',publish_attempts=attempt,publish_error='',next_retry_at=None)
+    client=None
+    try:
+        identified_title=str(job.get('identified_title') or '').strip()
+        identified_artist=str(job.get('identified_artist') or '').strip()
+        streamer=str(job.get('streamer') or '').strip()
+        title=build_title(streamer,identified_title)
+        description=build_description(streamer,identified_title,identified_artist)
+        tags=build_tags(streamer,identified_title,identified_artist)
+        video=Path(job['video_path']).resolve()
+        if not video.is_file(): raise PublishPrepareError(f'成片 MP4 不存在：{video}')
+
+        payload=job.get('bililive_payload') or {}
+        cover_path=str(job.get('cover_path') or '')
+        if not payload:
+            template=choose_cover_template(PUBLISH_SETTINGS.cover_template_root,streamer,identified_title)
+            cover=render_cover(template,PUBLISH_SETTINGS.cover_output_root/f'{publish_id}.jpg',identified_title,streamer)
+            cover_path=str(cover)
+            bililive_video=map_to_bililive_path(video,PUBLISH_SETTINGS)
+            bililive_cover=map_to_bililive_path(cover,PUBLISH_SETTINGS)
+            client=BililiveToolClient(PUBLISH_SETTINGS.bililive_base_url,PUBLISH_SETTINGS.bililive_passkey)
+            preset=client.get_video_preset(str(job.get('bililive_preset_id') or ''))
+            try:
+                run=get_automation_run(str(job.get('automation_run_id') or ''),False)
+                profile=get_automation_profile(str(run.get('profile_id') or ''))
+            except HTTPException:
+                run={}; profile={}
+            identity=profile.get('recorder_identity') if isinstance(profile.get('recorder_identity'),dict) else {}
+            recorded_at=float(run.get('mtime') or job.get('video_mtime') or time.time())
+            description_template=preset_description_template(preset,description)
+            description=client.format_description(description_template,{
+                'title':identified_title,
+                'username':streamer,
+                'time':datetime.fromtimestamp(recorded_at,BEIJING_TZ).isoformat(),
+                'roomId':str(identity.get('room_id') or ''),
+                'filename':Path(str(run.get('source') or video.name)).name,
+            })
+            config=merge_preset_config(preset,title,description,tags,bililive_cover)
+            payload=build_payload(int(job.get('bililive_uid') or 0),bililive_video,identified_title,config)
+            # The complete request is frozen before validation. Temporary failures
+            # retry this exact snapshot; a changed preset cannot silently mutate it.
+            job=update_publish_job(publish_id,cover_path=cover_path,title=title,description=description,
+                tags_json=tags,bililive_payload_json=payload)
+        else:
+            cover=Path(cover_path).resolve()
+            if not cover.is_file() or cover.stat().st_size<=0:
+                raise PublishPrepareError(f'已快照的封面文件不存在：{cover}')
+            client=BililiveToolClient(PUBLISH_SETTINGS.bililive_base_url,PUBLISH_SETTINGS.bililive_passkey)
+
+        validation=client.validate_upload_config(payload['config'])
+        return update_publish_job(publish_id,status='ready',validation_result_json=validation,publish_error='',next_retry_at=None)
+    except PublishRetryableError as exc:
+        delay=retry_delay_seconds(attempt,PUBLISH_SETTINGS.retry_base_seconds)
+        update_publish_job(publish_id,status='pending',publish_error=str(exc)[:2000],next_retry_at=time.time()+delay)
+        return get_publish_job(publish_id)
+    except PublishPrepareError as exc:
+        update_publish_job(publish_id,status='failed',publish_error=str(exc)[:2000],next_retry_at=None)
+        return get_publish_job(publish_id)
+    except Exception as exc:
+        print(f'[publish-worker] 准备任务异常，publish_job={publish_id}\n{traceback.format_exc()}',file=sys.stderr,flush=True)
+        update_publish_job(publish_id,status='failed',publish_error=str(exc)[:2000],next_retry_at=None)
+        return get_publish_job(publish_id)
+    finally:
+        if client: client.close()
+
+def publish_worker_loop():
+    last_reconcile=0.0
+    while True:
+        try:
+            now=time.time()
+            if now-last_reconcile>=60:
+                reconcile_publish_jobs(); last_reconcile=now
+            with db() as c:
+                row=c.execute("SELECT id FROM publish_jobs WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY created_at LIMIT 1",(now,)).fetchone()
+            if row:
+                prepare_publish_job(row['id']); continue
+        except Exception:
+            print(f'[publish-worker] 后台循环异常：\n{traceback.format_exc()}',file=sys.stderr,flush=True)
+        publish_wakeup.wait(10); publish_wakeup.clear()
+
 def process_automation_song(run:dict[str,Any],profile:dict[str,Any],segments:list[dict[str,Any]],songs:list[dict[str,Any]],index:int):
     song=songs[index]
     if song.get('status') in ('completed','skipped'): return
@@ -2663,12 +3105,18 @@ def process_automation_song(run:dict[str,Any],profile:dict[str,Any],segments:lis
         if project.get('status')=='failed': raise RuntimeError('Qwen 逐字失败：'+project.get('error',''))
         song['status']='aligned'; update_automation_run(run['id'],songs=songs,stage='song_rendering')
         output=project.get('output') or {}; output_path=Path(str(output.get('path','')))
-        if not output_path.is_file():
+        if output.get('sample') is not False or not output_path.is_file():
             waited=wait_for_render_slot(run,songs,index)
             add_render_wait(run['id'],waited)
             render_task(project['id'],False,0); project=getjob(project['id']); output=project.get('output') or {}
         if project.get('status')!='completed': raise RuntimeError('成片失败：'+project.get('error',''))
         song.update({'status':'completed','output':output,'output_url':f'/api/jobs/{project["id"]}/output-file'})
+        try:
+            ensure_publish_job(project,run,output)
+        except Exception:
+            # Publishing is deliberately downstream and best-effort. A database,
+            # cover or BililiveTool problem must never turn a valid MP4 red.
+            print(f'[publish] 创建准备任务失败，run={run.get("id","")} project={project.get("id","")}\n{traceback.format_exc()}',file=sys.stderr,flush=True)
     except Exception as exc:
         song.update({'status':'failed','error':str(exc)[:1000]})
     finally:
@@ -2703,21 +3151,25 @@ def process_automation_run(run_id:str):
         for index in range(len(songs)):
             process_automation_song(get_automation_run(run_id,True),profile,segments,songs,index)
             if automation_cancelled(run_id): raise RuntimeError('任务已中止')
-        failed=sum(song.get('status') in ('failed','skipped') for song in songs)
-        finished=update_automation_run(run_id,status='completed_with_errors' if failed else 'completed',stage='completed',current_song=-1,error=(f'{failed} 首歌曲跳过或失败' if failed else ''))
+        failed_count=sum(song.get('status')=='failed' for song in songs)
+        skipped_count=sum(song.get('status')=='skipped' for song in songs)
+        # Expected skips remain visible per song, but do not turn the recording
+        # red or count it as a failed run.
+        finished=update_automation_run(run_id,status='completed_with_errors' if failed_count else 'completed',stage='completed',current_song=-1,error=(f'{failed_count} 首歌曲失败' if failed_count else ''))
         output_paths=[]
         for song in songs:
             raw=str((song.get('output') or {}).get('path') or '')
             if not raw: continue
-            try: output_paths.append(str(OUTPUT_HOST/Path(raw).resolve().relative_to(OUTPUT)))
+            try:
+                relative=Path(raw).resolve().relative_to(OUTPUT)
+                host_root=OUTPUT_HOST if (OUTPUT/relative).is_file() else OUTPUT_LEGACY_HOST
+                output_paths.append(str(host_root/relative))
             except ValueError: output_paths.append(raw)
         if output_paths:
             output_dir=os.path.commonpath([str(Path(path).parent) for path in output_paths])
         else:
             output_dir=''
         completed_count=sum(song.get('status')=='completed' for song in songs)
-        failed_count=sum(song.get('status')=='failed' for song in songs)
-        skipped_count=sum(song.get('status')=='skipped' for song in songs)
         timings=mark_run_timing(run_id,songs_finished_at=time.time())
         # One entry per song carrying how much attention it needs and why, so
         # the notification can lead with what to open first. The old payload
@@ -2787,14 +3239,28 @@ def automation_queue():
         'render_slot':{'busy':render_lock.locked()},
     }
 
+@app.get('/api/automation/summary')
+def automation_summary():
+    today=datetime.now(BEIJING_TZ).date()
+    start=datetime.combine(today,datetime.min.time(),BEIJING_TZ).timestamp()
+    end=datetime.combine(today+timedelta(days=1),datetime.min.time(),BEIJING_TZ).timestamp()
+    with db() as c:
+        active_profiles=c.execute('SELECT COUNT(*) FROM automation_profiles WHERE enabled=1').fetchone()[0]
+        runs_today=c.execute('SELECT COUNT(*) FROM automation_runs WHERE created_at>=? AND created_at<?',(start,end)).fetchone()[0]
+        completed_today=c.execute("SELECT COUNT(*) FROM automation_runs WHERE created_at>=? AND created_at<? AND status='completed'",(start,end)).fetchone()[0]
+        queued=c.execute("SELECT COUNT(*) FROM automation_runs WHERE status='queued'").fetchone()[0]
+    return {'date':today.isoformat(),'active_profiles':active_profiles,'runs_today':runs_today,
+            'completed_today':completed_today,'queued':queued}
+
 @app.get('/api/automation/broadcasters')
 def automation_broadcasters():
-    return {'broadcasters':broadcaster_directories(MEDIA)}
+    return {'broadcasters':broadcaster_choices(broadcaster_directories(MEDIA),recorder_catalog('/recorder-data/app.db'))}
 
 @app.get('/api/automation/profiles/{profile_id}/recordings')
 def automation_profile_recordings(profile_id:str,limit:int=200):
-    profile=get_automation_profile(profile_id); root=(MEDIA/profile['path']).resolve()
-    choices=recording_choices(root,MEDIA,limit)
+    profile=get_automation_profile(profile_id)
+    choices=[item for root in profile_paths(profile,MEDIA) for item in recording_choices(root,MEDIA,limit)]
+    choices=sorted({item['path']:item for item in choices}.values(),key=lambda item:-item['mtime'])[:max(1,min(limit,1000))]
     with db() as c: rows=c.execute('SELECT id,source,status,created_at FROM automation_runs WHERE profile_id=? ORDER BY created_at DESC',(profile_id,)).fetchall()
     latest={}
     for row in rows:
@@ -2807,8 +3273,8 @@ def automation_profile_recordings(profile_id:str,limit:int=200):
 def run_existing_recording(profile_id:str,body:AutomationManualRunIn):
     if not DEEPSEEK_KEY: raise HTTPException(400,'请先在 .env 配置 DEEPSEEK_API_KEY')
     profile=get_automation_profile(profile_id); profile_root=(MEDIA/profile['path']).resolve(); relative=body.source.strip('/\\'); source=(MEDIA/relative).resolve()
-    try: source.relative_to(profile_root); media_relative=source.relative_to(MEDIA)
-    except ValueError: raise HTTPException(400,'录播不在所选主播目录内')
+    if not any(root in source.parents for root in profile_paths(profile,MEDIA)): raise HTTPException(400,'录播不在所选主播目录内')
+    media_relative=source.relative_to(MEDIA)
     if not source.is_file() or source.suffix.lower()!='.mp4' or '歌曲切片' in media_relative.parts or '.partial' in source.name.lower(): raise HTTPException(400,'请选择有效的原录播 MP4')
     if not probe_media_ok(source): raise HTTPException(400,'录播尚未完成或媒体文件无效')
     stat=source.stat(); now=time.time(); run_id=uuid.uuid4().hex; source_path=media_relative.as_posix()
@@ -2819,6 +3285,20 @@ def run_existing_recording(profile_id:str,body:AutomationManualRunIn):
         c.execute('INSERT OR IGNORE INTO automation_seen VALUES(?,?,?,?,?,?,?)',(profile_id,source_path,stat.st_size,stat.st_mtime,2,'manual',now))
         c.execute("UPDATE automation_seen SET disposition='manual',updated_at=? WHERE profile_id=? AND source=? AND disposition='observing'",(now,profile_id,source_path)); c.commit()
     automation_wakeup.set(); return get_automation_run(run_id)
+
+@app.get('/api/publish-presets')
+def publish_presets():
+    client=None
+    try:
+        client=BililiveToolClient(PUBLISH_SETTINGS.bililive_base_url,PUBLISH_SETTINGS.bililive_passkey)
+        items=[bililive_preset_summary(item) for item in client.list_video_presets()]
+        return {'items':items,'default_id':PUBLISH_SETTINGS.bililive_preset_id}
+    except PublishRetryableError as exc:
+        raise HTTPException(503,str(exc)) from exc
+    except PublishPrepareError as exc:
+        raise HTTPException(502,str(exc)) from exc
+    finally:
+        if client: client.close()
 
 @app.get('/api/automation/profiles')
 def automation_profiles():
@@ -2831,9 +3311,18 @@ def create_automation_profile(body:AutomationProfileIn):
     if path!=MEDIA and MEDIA not in path.parents or not path.is_dir(): raise HTTPException(400,'主播目录不存在或超出媒体范围')
     if not .5<=body.min_confidence<=1: raise HTTPException(400,'AI 置信度必须在 0.5 到 1 之间')
     if not 0<=body.padding_seconds<=30: raise HTTPException(400,'切片余量必须在 0 到 30 秒之间')
+    identity=bind_identity(relative,body.name.strip() or path.name,'',recorder_catalog('/recorder-data/app.db'))
+    with db() as c: existing=c.execute('SELECT * FROM automation_profiles').fetchall()
+    for row in existing:
+        bound=automation_profile_row(row)
+        if relative==bound['path'] or (identity.get('room_id') and identity.get('room_id')==(bound.get('recorder_identity') or {}).get('room_id') and identity.get('platform')==(bound.get('recorder_identity') or {}).get('platform')):
+            raise HTTPException(409,'这个主播已有规则，请编辑现有规则')
     profile_id=uuid.uuid4().hex; now=time.time(); name=body.name.strip() or path.name; style=normalize_studio_style((body.style or StyleIn()).model_dump())
+    publish_streamer=body.publish_streamer.strip() or name
+    preset=bililive_preset(body.bililive_preset_id or PUBLISH_SETTINGS.bililive_preset_id)
+    preset_id=str(preset.get('id') or body.bililive_preset_id or '').strip(); preset_name=str(preset.get('name') or preset_id).strip()
     with db() as c:
-        c.execute('INSERT INTO automation_profiles VALUES(?,?,?,?,?,?,?,?,?,?,?)',(profile_id,now,now,name,relative,0,None,MIN_RECORDING_BYTES,body.min_confidence,body.padding_seconds,json.dumps(style,ensure_ascii=False))); c.commit()
+        c.execute('INSERT INTO automation_profiles(id,created_at,updated_at,name,path,enabled,enabled_at,min_bytes,min_confidence,padding,style,publish_streamer,bililive_preset_id,bililive_preset_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(profile_id,now,now,name,relative,0,None,MIN_RECORDING_BYTES,body.min_confidence,body.padding_seconds,json.dumps(style,ensure_ascii=False),publish_streamer,preset_id,preset_name)); c.commit()
     return get_automation_profile(profile_id)
 
 @app.put('/api/automation/profiles/{profile_id}')
@@ -2843,17 +3332,23 @@ def update_automation_profile(profile_id:str,body:AutomationProfileIn):
     if not .5<=body.min_confidence<=1: raise HTTPException(400,'AI 置信度必须在 0.5 到 1 之间')
     if not 0<=body.padding_seconds<=30: raise HTTPException(400,'切片余量必须在 0 到 30 秒之间')
     style=normalize_studio_style((body.style or StyleIn(**(current.get('style') or {}))).model_dump()); now=time.time()
+    publish_streamer=body.publish_streamer.strip() or str(current.get('publish_streamer') or body.name or path.name).strip()
+    preset=bililive_preset(body.bililive_preset_id or current.get('bililive_preset_id') or PUBLISH_SETTINGS.bililive_preset_id)
+    preset_id=str(preset.get('id') or body.bililive_preset_id or '').strip(); preset_name=str(preset.get('name') or preset_id).strip()
     with db() as c:
-        c.execute('UPDATE automation_profiles SET updated_at=?,name=?,path=?,min_confidence=?,padding=?,style=? WHERE id=?',(now,body.name.strip() or path.name,relative,body.min_confidence,body.padding_seconds,json.dumps(style,ensure_ascii=False),profile_id)); c.commit()
+        c.execute('UPDATE automation_profiles SET updated_at=?,name=?,path=?,min_confidence=?,padding=?,style=?,publish_streamer=?,bililive_preset_id=?,bililive_preset_name=? WHERE id=?',(now,body.name.strip() or path.name,relative,body.min_confidence,body.padding_seconds,json.dumps(style,ensure_ascii=False),publish_streamer,preset_id,preset_name,profile_id)); c.commit()
+    if relative not in (current.get('recorder_identity') or {}).get('paths',[]) and relative!=current['path']:
+        with db() as c:
+            c.execute("UPDATE automation_profiles SET recorder_identity='' WHERE id=?",(profile_id,)); c.commit()
     return get_automation_profile(profile_id)
 
 @app.post('/api/automation/profiles/{profile_id}/enable')
 def enable_automation_profile(profile_id:str):
     if not DEEPSEEK_KEY: raise HTTPException(400,'请先在 .env 配置 DEEPSEEK_API_KEY')
-    profile=get_automation_profile(profile_id); root=(MEDIA/profile['path']).resolve(); now=time.time()
-    if not root.is_dir(): raise HTTPException(400,'主播目录不存在')
+    profile=get_automation_profile(profile_id); roots=profile_paths(profile,MEDIA); now=time.time()
+    if not roots: raise HTTPException(400,'主播目录不存在')
     with db() as c:
-        for path in root.rglob('*.mp4'):
+        for path in (p for root in roots for p in root.rglob('*.mp4')):
             if eligible_recording(path,MEDIA,int(profile.get('min_bytes') or MIN_RECORDING_BYTES)):
                 stat=path.stat(); relative=path.relative_to(MEDIA).as_posix()
                 c.execute('INSERT OR REPLACE INTO automation_seen VALUES(?,?,?,?,?,?,?)',(profile_id,relative,stat.st_size,stat.st_mtime,2,'baseline',now))
@@ -2898,6 +3393,37 @@ def retry_automation_run(run_id:str):
         if song.get('status')=='failed': song['status']='clipped' if song.get('clip_path') else 'detected'; song.pop('error',None)
     update_automation_run(run_id,status='queued',stage='retrying',songs=songs,cancel_requested=0,error=''); automation_wakeup.set()
     return get_automation_run(run_id)
+
+@app.get('/api/publish-jobs')
+def publish_jobs(status:str='',limit:int=50):
+    limit=max(1,min(limit,200))
+    allowed={'pending','preparing','ready','submitting','uploading','completed','failed'}
+    if status and status not in allowed: raise HTTPException(400,'无效的投稿任务状态')
+    with db() as c:
+        rows=(c.execute('SELECT * FROM publish_jobs WHERE status=? ORDER BY created_at DESC LIMIT ?',(status,limit)).fetchall()
+              if status else c.execute('SELECT * FROM publish_jobs ORDER BY created_at DESC LIMIT ?',(limit,)).fetchall())
+    return {'publish_enabled':PUBLISH_SETTINGS.enabled,'auto_publish_enabled':PUBLISH_SETTINGS.auto_publish_enabled,
+            'items':[publish_job_row(row) for row in rows]}
+
+@app.post('/api/publish-jobs/backfill')
+def backfill_publish_jobs(limit:int=2):
+    created=backfill_recent_publish_jobs(limit)
+    publish_wakeup.set()
+    return {'created':created,'limit':max(1,min(limit,2))}
+
+@app.get('/api/publish-jobs/{publish_id}')
+def publish_job(publish_id:str):
+    return get_publish_job(publish_id)
+
+@app.post('/api/publish-jobs/{publish_id}/retry')
+def retry_publish_job(publish_id:str):
+    job=get_publish_job(publish_id)
+    if job['status']!='failed': raise HTTPException(409,'只有准备阶段失败的任务可以重试')
+    if job.get('bililive_task_id') or job.get('aid') or job.get('bvid') or job.get('publish_result'):
+        raise HTTPException(409,'已提交或已完成的任务不允许重新准备')
+    result=update_publish_job(publish_id,status='pending',publish_error='',next_retry_at=None)
+    publish_wakeup.set()
+    return result
 
 @app.get('/api/jobs/{jid}/events')
 async def events(jid:str):

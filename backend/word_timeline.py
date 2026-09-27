@@ -95,6 +95,30 @@ def separation_retry_needed(
     return coverage is not None and coverage < threshold
 
 
+def separation_retry_trigger(match_suspect: bool, sparse_word_anchors: bool, weak_word_model: bool = False) -> str:
+    """Which independent reason is asking for separated vocals.
+
+    They are independent on purpose. Until 2026-09-21 the sparse-anchor rule sat
+    inside the match-suspect branch, so a confidently identified song could never
+    reach it -- across 21 finished songs the coverage number was never once
+    computed. 《心之火》 is the case that matters: named beyond doubt, yet 7 word
+    anchors for 432 characters.
+
+    Returns "" when neither asks, which is the caller's signal to skip.
+    """
+    if match_suspect and sparse_word_anchors:
+        return "both"
+    if match_suspect and weak_word_model:
+        return "match_and_word_model_unstable"
+    if match_suspect:
+        return "match_suspect"
+    if sparse_word_anchors:
+        return "sparse_word_anchors"
+    if weak_word_model:
+        return "word_model_unstable"
+    return ""
+
+
 def _char_units(text: str, start_ms: int | None, end_ms: int | None) -> list[dict[str, Any]]:
     characters = list(str(text or ""))
     if not characters:
@@ -112,7 +136,38 @@ def _char_units(text: str, start_ms: int | None, end_ms: int | None) -> list[dic
     return output
 
 
+def _reversed_word_starts(words: list[dict[str, Any]]) -> bool:
+    """Reject a word-timed row when text order runs backwards in time."""
+    previous: int | None = None
+    for word in words:
+        start = word.get("start_ms")
+        if start is None and word.get("start") is not None:
+            start = round(float(word["start"]) * 1000)
+        if start is None:
+            continue
+        current = int(start)
+        if previous is not None and current < previous:
+            return True
+        previous = current
+    return False
+
+
+def _reversed_char_starts(chars: list[dict[str, Any]]) -> bool:
+    previous: int | None = None
+    for char in chars:
+        start = char.get("start_ms")
+        if start is None:
+            continue
+        current = int(start)
+        if previous is not None and current < previous:
+            return True
+        previous = current
+    return False
+
+
 def _provider_chars(row: dict[str, Any]) -> list[dict[str, Any]]:
+    if _reversed_word_starts(row.get("words") or []):
+        return []
     output: list[dict[str, Any]] = []
     text_cursor = 0
     for word in row.get("words") or []:
@@ -125,6 +180,8 @@ def _provider_chars(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _qwen_chars(segment: dict[str, Any]) -> list[dict[str, Any]]:
+    if _reversed_word_starts(segment.get("words") or []):
+        return []
     output: list[dict[str, Any]] = []
     for word in segment.get("words") or []:
         if word.get("timing_source") != "qwen-forced-aligner":
@@ -135,6 +192,11 @@ def _qwen_chars(segment: dict[str, Any]) -> list[dict[str, Any]]:
             start = round(float(word.get("start", 0)) * 1000)
         if end is None:
             end = round(float(word.get("end", word.get("start", 0))) * 1000)
+        # Qwen's forced aligner can collapse a run of characters onto one
+        # timestamp (end == start). Such points have no measured duration and
+        # must not cast independent votes for a lyric offset.
+        if int(end) <= int(start):
+            continue
         output.extend(_char_units(str(word.get("text", word.get("word", ""))), int(start), int(end)))
     return output
 
@@ -147,6 +209,8 @@ def _line_word_anchors(
 ) -> list[dict[str, Any]]:
     provider, qwen = _provider_chars(row), _qwen_chars(segment)
     if not provider or not qwen:
+        return []
+    if _reversed_char_starts(provider) or _reversed_char_starts(qwen):
         return []
     provider_text = "".join(item["char"] for item in provider)
     qwen_text = "".join(item["char"] for item in qwen)
@@ -206,7 +270,7 @@ def _line_delta_stats(exact_by_line: dict[int, list[int]]) -> dict[int, dict[str
     return {
         line: {"median": statistics.median(deltas), "mad": mad_ms(deltas), "count": len(deltas)}
         for line, deltas in exact_by_line.items()
-        if len(deltas) >= 2
+        if len(deltas) >= 3
     }
 
 
@@ -244,6 +308,25 @@ def _dominant_line_cluster(line_stats: dict[int, dict[str, Any]], gap_ms: int = 
 # match, so this sits with real margin below the ~9000ms failure and real
 # margin above that: neither edge is razor-thin.
 MAX_WORD_VS_LINE_SHIFT_DIFF_MS = 5000
+
+# Past that distance the word cluster is no longer refused outright -- it has to
+# stand on its own instead. On 赛蒂娅 2026-09-21 four songs had the word cluster
+# vetoed this way; re-shifted to it and re-rendered, three were confirmed better
+# by eye (《决定不想你》《不为谁而作的歌》《哎呀 爱呀》, 5.8-7.3s moves) and none
+# of the four turned out to be the wrong-repetition case the veto was written
+# for -- the word-vs-line gaps (1.7-7.3s) matched no repeat interval in any of
+# them (repeats sat at 25.7s/54.6s/65.8s/82s). So distance alone was rejecting
+# good corrections. What a far cluster must now show is agreement *among its own
+# lines*: several lines independently voting the same offset, tightly.
+FAR_CLUSTER_MAX_SPREAD_MS = 400
+# Use the same share of eligible lines for near and far shifts. A fixed five-line
+# minimum rejected 金风玉蝶's tight four-of-six word cluster even though it was the
+# clear majority. A distant shift still has to pass the spread check above.
+WORD_CLUSTER_MIN_SHARE = 0.60
+
+# Both statuses mean the same thing downstream: this word shift is the song's
+# global shift. They stay distinct only so a report can say which one earned it.
+WORD_SHIFT_PROMOTED = ("accepted", "accepted_far")
 
 
 def _bootstrap_word_shift(exact_anchors: list[dict[str, Any]], center: int) -> dict[str, Any]:
@@ -291,11 +374,16 @@ def _bootstrap_word_shift(exact_anchors: list[dict[str, Any]], center: int) -> d
     coverage = len(cluster) / len(line_stats)
     cluster_median = statistics.median(line_stats[line]["median"] for line in cluster)
     result["word_model_shift_ms"] = round(cluster_median)
-    if coverage < 0.6:
+    if coverage <= WORD_CLUSTER_MIN_SHARE:
         result["status"] = "no_dominant_cluster"
         return result
+    spread = mad_ms([line_stats[line]["median"] for line in cluster])
+    result["cluster_spread_ms"] = round(spread) if spread is not None else None
     if abs(cluster_median - center) > MAX_WORD_VS_LINE_SHIFT_DIFF_MS:
-        result["status"] = "far_from_line_shift"
+        if spread is None or spread > FAR_CLUSTER_MAX_SPREAD_MS:
+            result["status"] = "far_from_line_shift"
+            return result
+        result.update(word_shift_ms=round(cluster_median), status="accepted_far")
         return result
     result.update(word_shift_ms=round(cluster_median), status="accepted")
     return result
@@ -367,7 +455,7 @@ def score_provider_timeline(
         stat = line_stats.get(line)
         if stat is not None:
             expected, window = stat["median"], _clamp(3 * stat["mad"], 500, 2000)
-        elif bootstrap["status"] == "accepted":
+        elif bootstrap["status"] in WORD_SHIFT_PROMOTED:
             expected, window = bootstrap["word_shift_ms"], _clamp(3 * cluster_mad, 500, 2000)
         else:
             expected = interpolated_shift_ms(item["provider_start_ms"], line_result.get("evidence_anchors"), center)
@@ -384,13 +472,23 @@ def score_provider_timeline(
     accepted_exact_counts: dict[int, int] = {}
     for item in exact:
         accepted_exact_counts[item["lyric_index"]] = accepted_exact_counts.get(item["lyric_index"], 0) + 1
-    # Lines with at least two exact characters can cast one vote in the global
+    # Lines with at least three exact characters can cast one vote in the global
     # word model. The count remains diagnostic; it does not authorize a local
     # shift or a character-level rewrite.
-    local_shift_lines = {line for line, count in accepted_exact_counts.items() if count >= 2}
-    shift_source = "word" if bootstrap["status"] == "accepted" else "line"
-    shift_ms = bootstrap["word_shift_ms"] if shift_source == "word" else center
+    local_shift_lines = {line for line, count in accepted_exact_counts.items() if count >= 3}
+    # A verbatim release must never silently inherit the line-level shift. A
+    # weak word cluster is diagnostic only: the caller retries separated vocals
+    # and refuses to publish if the word model is still unresolved.
     word_model_shift_ms = bootstrap["word_model_shift_ms"]
+    if bootstrap["status"] in WORD_SHIFT_PROMOTED:
+        shift_ms = int(bootstrap["word_shift_ms"])
+    elif word_model_shift_ms is not None:
+        shift_ms = int(word_model_shift_ms)
+    elif raw_exact:
+        shift_ms = round(statistics.median(item["qwen_start_ms"] - item["provider_start_ms"] for item in raw_exact))
+    else:
+        shift_ms = center
+    shift_source = "word" if bootstrap["status"] in WORD_SHIFT_PROMOTED else "word_unresolved"
     # word_vs_line_shift_diff_ms is a *safety/consistency* signal, not a quality one:
     # how much the word model disagrees with the line model, regardless of who is
     # right. word_median_abs_residual_ms/word_mad_ms stay the pre-existing *effective*
@@ -437,7 +535,7 @@ def score_provider_timeline(
     )
     lyric_characters = sum(len(normalized(row.get("text", ""))) for row in timed)
     coverage = len({(item["lyric_index"], item["standard_char_index"]) for item in exact}) / max(1, lyric_characters)
-    timing_model = f"{shift_source}_global"
+    timing_model = "word_global" if shift_source == "word" else "word_unresolved"
     # Confidence is decided by line-level evidence alone. Word-level anchors may
     # choose the one global shift, contribute a ranking bonus and remain visible
     # in diagnostics, but never replace timestamps in the selected lyric sheet.
@@ -482,6 +580,8 @@ def score_provider_timeline(
 
 
 def _provider_character_times(row: dict[str, Any], start_ms: int, end_ms: int, shift_ms: int) -> list[dict[str, Any]]:
+    if _reversed_word_starts(row.get("words") or []):
+        return []
     text = str(row.get("text", ""))
     characters = list(text)
     duration = max(1, end_ms - start_ms)

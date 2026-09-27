@@ -12,7 +12,7 @@ MIN_RECORDING_BYTES = 1024 ** 3
 def automation_transcriber_payload(
     input_path: str, run_id: str, stage: str = "all", chunk_seconds: int = 180
 ) -> dict[str, Any]:
-    """Build the lossless-ASR request used by automatic recording jobs.
+    """Build the sentence-timed ASR request used by automatic recording jobs.
 
     Speech VAD is intentionally disabled here: singing is not reliably classified
     as speech, so skipping non-speech regions can remove whole verses.  Fixed-size
@@ -25,8 +25,8 @@ def automation_transcriber_payload(
         "stage": stage,
         "run_id": run_id,
         "chunk_seconds": int(chunk_seconds),
-        "asr_engine": "local",
-        "skip_alignment": False,
+        "asr_engine": "whisper",
+        "skip_alignment": True,
         "no_vad": True,
         "notification_mode": "automation",
     }

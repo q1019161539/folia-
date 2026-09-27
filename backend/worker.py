@@ -50,7 +50,7 @@ def unload():
     return {'ok':True,'unloaded':unloaded,'loaded':False,'aligner_loaded':False}
 
 @app.post('/recognize')
-def recognize(file:UploadFile=File(...),language:str=Form('zh')):
+def recognize(file:UploadFile=File(...),language:str=Form('zh'),vad_filter:bool=Form(True),word_timestamps:bool=Form(True)):
     suffix=Path(file.filename or 'input.mp4').suffix
     with tempfile.NamedTemporaryFile(suffix=suffix,delete=False) as f:
         while chunk:=file.file.read(1024*1024): f.write(chunk)
@@ -58,7 +58,7 @@ def recognize(file:UploadFile=File(...),language:str=Form('zh')):
     try:
         with lock:
             segments,info=get_whisper().transcribe(
-                name,language=language,beam_size=5,word_timestamps=True,vad_filter=True,
+                name,language=language,beam_size=5,word_timestamps=word_timestamps,vad_filter=vad_filter,
                 condition_on_previous_text=False,chunk_length=15,
                 hallucination_silence_threshold=2.0,
                 vad_parameters={'min_silence_duration_ms':500,'speech_pad_ms':200},

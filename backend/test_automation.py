@@ -12,12 +12,16 @@ class AutomationHelpersTest(unittest.TestCase):
     def test_automatic_asr_disables_vad_without_changing_fixed_chunking(self):
         payload = automation_transcriber_payload("主播/录播.mp4", "auto-run")
         self.assertTrue(payload["no_vad"])
+        self.assertEqual(payload["asr_engine"], "whisper")
+        self.assertTrue(payload["skip_alignment"])
         self.assertEqual(payload["chunk_seconds"], 180)
         self.assertEqual(payload["input"], "主播/录播.mp4")
         self.assertEqual(payload["notification_mode"], "automation")
 
         resumed = automation_transcriber_payload("主播/录播.mp4", "auto-run", "asr")
         self.assertTrue(resumed["no_vad"])
+        self.assertEqual(resumed["asr_engine"], "whisper")
+        self.assertTrue(resumed["skip_alignment"])
         self.assertEqual(resumed["input"], "")
 
     def test_broadcaster_directories_are_dynamic_first_level_choices(self):
@@ -155,6 +159,26 @@ class AutomationRunsInsertSchemaTest(unittest.TestCase):
         connection = self.migrated_table("some_future_column TEXT")
         connection.execute(self.insert_statement(), self.row)
         self.assertEqual(connection.execute("SELECT count(*) FROM automation_runs").fetchone()[0], 1)
+
+
+class SeparationRetryIsReachableTest(unittest.TestCase):
+    """The retry was unreachable for any confidently matched song, which is every
+    song that matters for it: the call sat inside `if low_confidence`, so the
+    coverage rule behind it never ran. Guard the call site, not just the rule."""
+
+    source = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
+
+    def test_the_retry_is_not_gated_behind_a_doubtful_match(self):
+        call = re.search(r"maybe_retry_with_separated_vocals\(jid,.*?\)", self.source, re.S)
+        self.assertIsNotNone(call, "找不到人声分离重试的调用")
+        before = self.source[: call.start()].rsplit("\n", 3)[-3:]
+        self.assertNotIn("if bool(chosen['result'].get('low_confidence'", "\n".join(before),
+                         "人声分离重试又被挂回了匹配置信度分支")
+
+    def test_a_doubtful_match_is_passed_as_one_reason_among_two(self):
+        self.assertIn("match_suspect=bool(chosen['result'].get('low_confidence'", self.source)
+        self.assertNotIn("not_needed_high_confidence", self.source,
+                         "仍在用匹配置信度直接判定不需要分离")
 
 
 if __name__ == "__main__":

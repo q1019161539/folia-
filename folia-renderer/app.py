@@ -33,6 +33,7 @@ DOCKER_STACK = VERSION_INFO["docker_stack"]
 TEXT_EDGE_PROFILE = VERSION_INFO["patch_profile"]
 STATIC_ROOT = Path(os.getenv("FOLIA_STATIC_ROOT", "/usr/share/nginx/html")).resolve()
 FONT_ROOT = Path(os.getenv("FONT_ROOT", "/fonts")).resolve()
+IMAGE_ROOT = Path(os.getenv("IMAGE_ROOT", "/images")).resolve()
 MEDIA_ROOT = Path(os.getenv("MEDIA_ROOT", "/media/bililive")).resolve()
 OUTPUT_ROOT = Path(os.getenv("OUTPUT_ROOT", "/output")).resolve()
 PORT = int(os.getenv("RENDER_PORT", "8091"))
@@ -67,6 +68,20 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     config = dict(config)
     config["background"] = {"mode": "common", "transparent": True}
     config["transparentBackground"] = True
+    assets = config.get("temperaLayerImageAssets") or []
+    if not isinstance(assets, list) or len(assets) > 16:
+        raise ValueError("Tempera 图片资产列表无效")
+    for asset in assets:
+        image_id = str(asset.get("id") or "") if isinstance(asset, dict) else ""
+        url = str(asset.get("url") or "") if isinstance(asset, dict) else ""
+        parts = url.split("/")
+        project_id = parts[2] if len(parts) == 4 else ""
+        if (len(image_id) != 64 or any(char not in "0123456789abcdef" for char in image_id)
+                or len(project_id) != 32 or any(char not in "0123456789abcdef" for char in project_id)
+                or url != f"/images/{project_id}/{image_id}"):
+            raise ValueError("Tempera 图片地址无效")
+        if not any((IMAGE_ROOT / project_id / f"{image_id}{suffix}").is_file() for suffix in (".png", ".jpg", ".webp")):
+            raise ValueError(f"Tempera 图片缺失：{image_id[:12]}")
     config["updatedAt"] = now_ms()
     theme = dict(config.get("theme") or {})
     font_url = str(theme.get("studioFontAssetUrl") or "")
@@ -88,7 +103,12 @@ def set_session(token: str, *, config: dict[str, Any] | None = None, clock: dict
 
 def get_session_snapshot(token: str) -> dict[str, Any]:
     with state_lock:
-        return json.loads(json.dumps(sessions.get(token) or {}))
+        session = sessions.get(token)
+        if session is None:
+            return {}
+        # Updates replace config/clock/audio rather than mutating them. Only
+        # the version counters need a copy before releasing the lock.
+        return {**session, "versions": session["versions"].copy()}
 
 
 @app.get("/healthz")
@@ -196,10 +216,7 @@ class OfflineAudio:
 
         bass, low_mid = energy(20, 150), energy(150, 400)
         mid, vocal, treble = energy(400, 1200), energy(1000, 3500), energy(3500, 12000)
-        spectrum = []
-        for bucket in range(256):
-            left, right = bucket * 4, (bucket + 1) * 4
-            spectrum.append(int(round(float(np.mean(bins[left:right])))))
+        spectrum = np.rint(bins.reshape(256, 4).mean(axis=1)).astype(np.uint8).tolist()
         return {
             "audioPower": self.process((bass + low_mid) / 2, 3),
             "bands": {
@@ -444,7 +461,7 @@ def render_fast_composite(
             "-framerate", str(FPS), "-video_size", f"{WIDTH}x{HEIGHT}", "-i", f"{display}.0",
             "-ss", f"{start_seconds:.3f}", "-t", f"{duration_seconds:.3f}", "-i", str(source),
             "-filter_complex", f"[0:v]trim=start={preroll}:duration={duration_seconds},setpts=PTS-STARTPTS,format=yuv420p[v]",
-            "-map", "[v]", "-map", "1:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-map", "[v]", "-map", "1:a?", "-c:v", "libx264", "-preset", "veryfast", "-threads:v", "4", "-crf", "18",
             *audio_args, "-t", f"{duration_seconds:.3f}", "-shortest", "-movflags", "+faststart", "-f", "mp4", str(partial),
         ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         target = time.monotonic() + preroll
@@ -522,21 +539,36 @@ def render_worker(rid: str, body: dict[str, Any]) -> None:
         if body.get("output_mode") == "fast":
             render_fast_composite(rid, body, source, mp4_path, manifest_path, config, start_seconds, duration_seconds, cancel)
             return
-        required = int(duration_seconds / 60 * 3_000_000_000)
-        if shutil.disk_usage(alpha_path.parent).free < required:
-            raise RuntimeError(f"可用空间不足；本次透明中间片预计需要约 {required / 1e9:.1f} GB")
+        smooth = body.get("output_mode") == "smooth"
+        if not smooth:
+            required = int(duration_seconds / 60 * 3_000_000_000)
+            if shutil.disk_usage(alpha_path.parent).free < required:
+                raise RuntimeError(f"可用空间不足；本次透明中间片预计需要约 {required / 1e9:.1f} GB")
         token = f"render-{rid}"
         set_session(token, config=config)
         update_render(rid, status="running", phase="分析音频频谱", progress=1)
         analyser = OfflineAudio(source, start_seconds, duration_seconds)
-        alpha_partial = alpha_path.with_name(alpha_path.name + ".partial")
+        alpha_partial = None if smooth else alpha_path.with_name(alpha_path.name + ".partial")
         mp4_partial = mp4_path.with_name(mp4_path.name + ".partial")
-        alpha_partial.unlink(missing_ok=True); mp4_partial.unlink(missing_ok=True)
-        encoder = subprocess.Popen([
-            "ffmpeg", "-v", "error", "-y", "-f", "image2pipe", "-framerate", str(FPS),
-            "-i", "pipe:0", "-frames:v", str(frame_count), "-an", "-c:v", "prores_ks",
-            "-profile:v", "4", "-pix_fmt", "yuva444p10le", "-alpha_bits", "16", "-f", "mov", str(alpha_partial),
-        ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        if alpha_partial: alpha_partial.unlink(missing_ok=True)
+        mp4_partial.unlink(missing_ok=True)
+        if smooth:
+            probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(source)], capture_output=True, text=True)
+            audio_args = ["-c:a", "copy"] if probe.returncode == 0 and probe.stdout.strip() == "aac" else ["-c:a", "aac", "-b:a", "192k"]
+            encoder_command = [
+                "ffmpeg", "-v", "error", "-y", "-ss", f"{start_seconds:.3f}", "-t", f"{duration_seconds:.3f}", "-i", str(source),
+                "-f", "image2pipe", "-framerate", str(FPS), "-i", "pipe:0", "-filter_complex",
+                f"[0:v]fps={FPS},scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,tpad=stop_mode=clone:stop_duration=0.1,setpts=PTS-STARTPTS[base];[1:v]setpts=PTS-STARTPTS[fg];[base][fg]overlay=0:0:shortest=1:format=auto,format=yuv420p[v]",
+                "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-threads:v", "4", "-crf", "18", *audio_args,
+                "-frames:v", str(frame_count), "-movflags", "+faststart", "-f", "mp4", str(mp4_partial),
+            ]
+        else:
+            encoder_command = [
+                "ffmpeg", "-v", "error", "-y", "-f", "image2pipe", "-framerate", str(FPS),
+                "-i", "pipe:0", "-frames:v", str(frame_count), "-an", "-c:v", "prores_ks",
+                "-profile:v", "4", "-pix_fmt", "yuva444p10le", "-alpha_bits", "16", "-f", "mov", str(alpha_partial),
+            ]
+        encoder = subprocess.Popen(encoder_command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         page = ChromiumPage(
             f"http://127.0.0.1:{PORT}/obs?obs=1&token={token}",
             config.get("studioTransform"),
@@ -552,18 +584,40 @@ def render_worker(rid: str, body: dict[str, Any]) -> None:
                     "lyricOffsetMs": 0,
                 }
                 set_session(token, clock=clock, audio=audio)
-                time.sleep(0.003)
+                if smooth:
+                    page.evaluate("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))", await_promise=True)
+                else:
+                    time.sleep(0.003)
                 png = page.screenshot()
                 assert encoder.stdin is not None
                 encoder.stdin.write(png)
                 if index % 15 == 0:
-                    update_render(rid, phase=f"生成透明帧 {index + 1}/{frame_count}", progress=round(2 + 83 * (index + 1) / frame_count, 1))
+                    label = "逐帧合成 MP4" if smooth else "生成透明帧"
+                    update_render(rid, phase=f"{label} {index + 1}/{frame_count}", progress=round(2 + (96 if smooth else 83) * (index + 1) / frame_count, 1))
         finally:
             page.close()
         assert encoder.stdin is not None
         encoder.stdin.close()
         stderr = encoder.stderr.read().decode("utf-8", "replace") if encoder.stderr else ""
         code = encoder.wait()
+        if smooth:
+            if code or not mp4_partial.is_file(): raise RuntimeError(("逐帧 MP4 合成失败：" + stderr)[-1800:])
+            os.replace(mp4_partial, mp4_path)
+            manifest = {
+                "renderer": "folia-native-frames-v1", "renderer_revision": REVISION,
+                "text_edge_profile": TEXT_EDGE_PROFILE,
+                "source": str(source), "output": str(mp4_path), "width": WIDTH, "height": HEIGHT,
+                "fps": FPS, "frames": frame_count, "start_ms": round(start_seconds * 1000),
+                "duration_ms": round(duration_seconds * 1000), "output_mode": "smooth",
+                "config": config, "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            update_render(rid, status="completed", phase="完成", progress=100, result={
+                "path": str(mp4_path), "manifest_path": str(manifest_path),
+                "size": mp4_path.stat().st_size, "output_mode": "smooth",
+            })
+            return
+        assert alpha_partial is not None
         if code or not alpha_partial.is_file(): raise RuntimeError(("透明 MOV 编码失败：" + stderr)[-1800:])
         os.replace(alpha_partial, alpha_path)
         update_render(rid, phase="合成原视频与原声音轨", progress=88)
@@ -626,6 +680,18 @@ def cancel_render(rid: str) -> dict[str, Any]:
     if event is None: raise HTTPException(404, "渲染任务不存在")
     event.set(); update_render(rid, phase="正在中止")
     return render_status(rid)
+
+
+@app.get("/images/{project_id}/{image_id}")
+def image_asset(project_id: str, image_id: str):
+    if (len(project_id) != 32 or any(char not in "0123456789abcdef" for char in project_id)
+            or len(image_id) != 64 or any(char not in "0123456789abcdef" for char in image_id)):
+        raise HTTPException(404, "图片不存在")
+    for suffix, media_type in ((".png", "image/png"), (".jpg", "image/jpeg"), (".webp", "image/webp")):
+        path = IMAGE_ROOT / project_id / f"{image_id}{suffix}"
+        if path.is_file():
+            return FileResponse(path, media_type=media_type, headers={"Cache-Control": "public, max-age=31536000, immutable"})
+    raise HTTPException(404, "图片不存在")
 
 
 @app.get("/fonts/{font_id}")

@@ -22,6 +22,10 @@ from opencc import OpenCC
 # string; converting characters there would shift those indices.
 _IDENTITY_T2S = OpenCC("t2s")
 IDENTITY_STRIP = re.compile(r"[^\w㐀-鿿]+")
+TITLE_COVER_NOTE = re.compile(
+    r"(?:\s*[（(][^()（）]*(?:cover|翻唱|翻自|原唱)[^()（）]*[）)])+\s*$",
+    re.I,
+)
 
 
 def normalize_identity(text: str) -> str:
@@ -30,8 +34,9 @@ def normalize_identity(text: str) -> str:
 
 
 def title_similarity(left: str, right: str) -> float:
-    """Compare two titles as identities, blind to 繁简 and punctuation."""
-    first, second = normalize_identity(left), normalize_identity(right)
+    """Compare song names without treating a cover credit as part of the title."""
+    first = normalize_identity(TITLE_COVER_NOTE.sub("", str(left or "")))
+    second = normalize_identity(TITLE_COVER_NOTE.sub("", str(right or "")))
     if not first or not second:
         return 0.0
     return difflib.SequenceMatcher(None, first, second, autojunk=False).ratio()
@@ -58,11 +63,19 @@ LABELLED_LINE = re.compile(r"^\s*([^:：\n]{1,12})\s*[:：]\s*(.*)$")
 # Words that mark the label as a production credit rather than a singer. Matched
 # as substrings so compounds are covered without listing every combination:
 # 人声录音 / 录音工程 / 缩混工程师 / 音乐制作发行 / 混音+母带 all reduce to one of these.
+# 《小宇》 shipped "长笛：张洪禄" as its first row and it rendered as the song's
+# opening lyric over the intro: 笛子 was listed, 长笛 was not. Additions here stay
+# multi-character on purpose. This keyword is matched as a substring of the label
+# and discards the row even when lyrics follow it, so a one-character stem like
+# 笛/箫/阮/鼓 would swallow a duet marker naming a singer (阮 is a common surname).
 CREDIT_KEYWORD = re.compile(
-    r"(作词|作曲|编曲|制作|监制|统筹|出品|发行|版权|企划|企宣|策划|宣传|宣发|推广|"
+    r"(作词|作曲|编曲|制作|监制|总监|统筹|出品|发行|版权|企划|企宣|策划|宣传|宣发|推广|"
     r"录音|混音|混缩|缩混|母带|工程|工作室|演唱|原唱|翻唱|主唱|伴唱|配唱|和声|合声|合音|和音|"
-    r"人声|弦乐|吉他|贝斯|键盘|合成器|古筝|小提琴|大提琴|二胡|琵琶|笛子|口哨|戏腔|"
-    r"封面|题字|原曲|设计|美术|MIDI|OP|SP)",
+    r"人声|弦乐|管弦|乐队|吉他|贝斯|键盘|合成器|古筝|提琴|二胡|琵琶|笛子|长笛|竹笛|短笛|"
+    r"唢呐|扬琴|萨克斯|小号|长号|圆号|簧管|竖琴|手风琴|口琴|口哨|打击乐|架子鼓|戏腔|"
+    r"封面|题字|原曲|设计|美术|MIDI|OP|SP|"
+    r"written\s+by|composed\s+by|arranged\s+by|produced\s+by|mixed\s+by|mastered\s+by|"
+    r"lyrics?\s+by|music\s+by)",
     re.I,
 )
 # Interlude markers carry no sung text but are published as timed rows, so they
@@ -341,28 +354,40 @@ def resolve_deepseek_full_realign(
 
 
 def choose_best_timeline_candidate(items: list[dict[str, Any]]) -> dict[str, Any]:
-    """Prefer a trustworthy alignment over a slightly higher raw match score.
+    """Choose a word-timed release first, then rank releases by evidence.
 
-    Among the versions that match the song title equally well, a verbatim
-    (word-timed) release wins outright: it carries per-character times the whole
-    hybrid pipeline is built on, while a line-only DJ/remix upload of the same
-    title carries none. A live cover's line-level residuals can read worse
-    against the original studio release than against a remix whose pacing
-    happens to sit closer, which previously handed the pick to the remix -- the
-    title-similarity floor keeps that preference from reaching across to a
-    verbatim release of a different song.
+    The title floor keeps an unrelated search hit from winning solely because
+    it has word times. A shortened subtitle can score around 0.5 against the
+    full title, so an exact-title line-only release must not hide it.
     """
     if not items:
         raise ValueError("没有可用歌词候选")
     best_similarity = max(float(item.get("title_similarity", 0)) for item in items)
+    verbatim = [
+        item for item in items
+        if str(item.get("candidate", {}).get("timing_type", "")) == "verbatim"
+        and float(item.get("title_similarity", 0)) >= max(0.5, best_similarity - 0.5)
+    ]
+    if verbatim:
+        return max(
+            verbatim,
+            key=lambda item: (
+                float(item.get("result", {}).get("score", 0))
+                + (2.0 if float(item.get("artist_similarity", 0)) >= 0.9 else 0.0),
+                float(item.get("title_similarity", 0)),
+                len(item.get("result", {}).get("core_anchors") or []),
+            ),
+        )
     return max(
         items,
         key=lambda item: (
-            str(item.get("candidate", {}).get("timing_type", "")) == "verbatim"
-            and float(item.get("title_similarity", 0)) >= best_similarity - 0.05,
             not bool(item.get("result", {}).get("low_confidence", True)),
             float(item.get("title_similarity", 0)),
-            float(item.get("result", {}).get("score", 0)),
+            # Prefer the fingerprinted singer only when two releases already
+            # have nearly equal lyric/ASR evidence. A bad alignment cannot win
+            # just because its uploader used the expected artist name.
+            float(item.get("result", {}).get("score", 0))
+            + (2.0 if float(item.get("artist_similarity", 0)) >= 0.9 else 0.0),
             len(item.get("result", {}).get("core_anchors") or []),
         ),
     )
@@ -419,8 +444,9 @@ def identity_recheck_needed(chosen: dict[str, Any]) -> bool:
 def choose_identity_recovery_candidate(items: list[dict[str, Any]], initial: dict[str, Any]) -> dict[str, Any]:
     """Choose normally, except when overwhelming evidence disproves a weak identity."""
     preferred = choose_best_timeline_candidate(items)
+    word_items = [item for item in items if str(item.get("candidate", {}).get("timing_type", "")) == "verbatim"]
     challenger = max(
-        items,
+        word_items or items,
         key=lambda item: (
             not bool(item.get("result", {}).get("low_confidence", True)),
             len(item.get("result", {}).get("core_anchors") or []),
