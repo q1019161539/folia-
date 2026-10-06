@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from song_identity_diagnostics import acrcloud_identify_window_result
 import ai_slot
+from automation_runtime import ScanDiagnostics
 from recorder_identity import recorder_catalog, bind_identity, profile_paths, broadcaster_choices
 from pipeline_eta import estimate_asr, estimate_songs
 from standard_timeline import balanced_candidate_pool, build_review_assessment, build_shifted_timeline, candidate_pool_quality, choose_best_timeline_candidate, choose_identity_recovery_candidate, clamp_forced_words, confidence_output_folder, estimate_untimed_timeline, find_suspect_anchor_regions, identity_evidence_can_override, identity_recheck_needed, is_high_confidence, is_lyric_metadata, lyric_render_window, normalize_identity, parse_lrc, plain_lyric_lines, resolve_deepseek_full_realign, score_timeline, title_similarity as compare_titles
@@ -94,6 +95,7 @@ job_tasks_lock=threading.Lock()
 JOB_BUSY_STATUSES=('recognizing','force_aligning','timeline_matching','rendering','queued')
 JOB_TASK_STALE_SECONDS=1800
 automation_wakeup=threading.Event(); automation_started=False
+automation_scan_diagnostics=ScanDiagnostics()
 publish_wakeup=threading.Event(); publish_started=False
 folia_upstream_wakeup=threading.Event()
 folia_upstream_store=UpstreamStatusStore(DATA/'folia-upstream-status.json')
@@ -2590,11 +2592,12 @@ def probe_media_ok(path:Path):
     try: return result.returncode==0 and float(result.stdout.strip())>0
     except ValueError: return False
 
-def scan_automation_profile(profile:dict[str,Any]):
+def scan_automation_profile(profile:dict[str,Any],counts:dict[str,int]|None=None):
     roots=profile_paths(profile,MEDIA)
     now=time.time()
     for path in (p for root in roots for p in root.rglob('*.mp4')):
         if not eligible_recording(path,MEDIA,int(profile.get('min_bytes') or MIN_RECORDING_BYTES)): continue
+        if counts is not None: counts['eligible']+=1
         relative=path.relative_to(MEDIA).as_posix(); stat=path.stat()
         with db() as c: seen=c.execute('SELECT * FROM automation_seen WHERE profile_id=? AND source=?',(profile['id'],relative)).fetchone()
         if not seen:
@@ -2618,19 +2621,32 @@ def scan_automation_profile(profile:dict[str,Any]):
             c.execute(AUTOMATION_RUN_INSERT,(run_id,profile['id'],now,now,'queued','waiting',relative,stat.st_size,stat.st_mtime,'','','[]','[]',-1,'',0))
             c.execute("UPDATE automation_seen SET disposition='queued',stable_count=?,updated_at=? WHERE profile_id=? AND source=?",(stable,now,profile['id'],relative)); c.commit()
         automation_wakeup.set()
+        if counts is not None: counts['queued']+=1
 
 def automation_scan_loop():
     while True:
+        counts={'profiles':0,'eligible':0,'queued':0}
+        automation_scan_diagnostics.start()
         try:
             with db() as c: profiles=[automation_profile_row(row) for row in c.execute('SELECT * FROM automation_profiles WHERE enabled=1').fetchall()]
-            for profile in profiles: scan_automation_profile(profile)
-        except Exception:
+            counts['profiles']=len(profiles)
+            for profile in profiles: scan_automation_profile(profile,counts)
+        except Exception as exc:
+            automation_scan_diagnostics.finish(counts,exc)
             # Never let this thread die, but never fail silently either: a scan
             # that throws every cycle means no recording is ever picked up, and
             # the only symptom used to be an automation page that stayed empty.
             # The traceback is what turns "it broke" into a line number.
             automation_loop_error('automation-scan','扫描失败')
+        else:
+            automation_scan_diagnostics.finish(counts)
         automation_wakeup.wait(30); automation_wakeup.clear()
+
+@app.get('/api/automation/health')
+def automation_runtime_health():
+    alive=any(thread.name=='automation-scan' and thread.is_alive() for thread in threading.enumerate())
+    return {'scan':automation_scan_diagnostics.snapshot(alive),'heavy_task_slot':ai_slot.snapshot(),
+            'scope':'current_process','auto_publish_enabled':PUBLISH_SETTINGS.auto_publish_enabled}
 
 def transcriber_request(method:str,path:str,**kwargs):
     with httpx.Client(timeout=60) as client:

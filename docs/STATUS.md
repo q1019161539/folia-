@@ -2,7 +2,15 @@
 
 最后整理：2026-10-06
 
+## 当前维护入口
+
+先读 CODE_MAP.md 与 ARCHITECTURE.md，再读对应模块。下方日期条目是历史记录，不能将旧版算法当成当前规则。当前自动整场用 Whisper；单曲 Qwen 只提供定位证据；标准平台字时间只统一平移；DeepSeek 全曲重排关闭；自动投稿只准备到 ready。
+
+本次整理新增 `/api/automation/health`，用于检查扫描是否真正成功而不只是进程健康；诊断仅当前进程有效，重启计数重置。封面左侧留白/《歌名》/去主播名仍未落实，Phase 2 上传未实现。历史身份或失败任务不自动批量回填、重跑。
+
 ## 已上线
+
+- 2026-10-06：完成第一轮代码整理。以 NAS 当前源码为基线更新 ARCHITECTURE、ASR 模块、预览渲染说明、README/索引，新增 CODE_MAP；历史状态记录保留并标明不得当作现行规则。新增 automation_runtime.py 与 `/api/automation/health`，只读记录扫描开始/成功/异常类型、规则/合格文件/入队计数及耗时，区分未开始、线程停止、过期、扫描中和失败；诊断状态不持久化、不改变入队决定，Dockerfile 已显式 COPY。修正 Tempera 预览测试中遗留的 0.5 断言为已上线的 1.0，快速导出仍测试 0.5，生产渲染代码未改。隔离无网络容器中 239 项后端测试全部通过（含 4 项扫描诊断测试）；Python 编译、Compose 配置与主 API 镜像构建通过。只更新 studio-api，转录/模型/渲染容器保持运行；线上检查线程存活、scan.status=ok、首次扫描 3 条规则/207 个合格文件/0 个新增入队、耗时 1.115 秒，自动 ASR 继续运行，AUTO_PUBLISH_ENABLED=false。未改数据库结构、歌曲身份、歌词算法、封面或投稿范围，未批量重跑历史任务。源码与 NAS Git 副本整理为同一基线，不在本次执行 GitHub 推送。备份：`/vol1/1000/docker/folia-video-studio-backups/20261006-code-organize/`（deployed-before.tar.gz、git-before.tar.gz）。
 
 - 2026-10-06：Qwen 强制对齐改为离线加载。此前自动歌曲的逐字对齐在查询 Hugging Face `processor_config.json` 时遭遇 SSL EOF，导致 HTTP 500、零字锚点及后续跳过。worker 在依赖导入前固定 `HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1`；将仓库名仅从本地缓存解析为完整快照目录，检查关键模型/processor 文件后传入 Qwen，保留 CPU/float32 和现有模型卸载策略。Workerfile、Compose 同步设置离线环境；缓存缺失或关键文件为空时明确失败，不运行时下载。新增 `backend/test_worker_offline.py`，4 项缓存回归测试通过，镜像构建及 Compose 配置检查通过。在 `--network none` 的独立新镜像容器中读取既有《如果有来生》切片的 14.24 秒真实音频，模型加载与对齐共 72.66 秒，返回 11 个正时长字时间戳；结果保存于 `work/qwen-offline-check-20261006/result.json`（仅验证离线可用性，不代表歌词识别准确性验收）。用户已允许中断任务，切换时停止 API、转录器和 worker，保留原数据库/录播/成片并恢复这三项服务；没有批量重跑历史失败场次。代码与文档上线前备份：`/vol1/1000/docker/folia-video-studio-backups/20261006-qwen-offline/code-before.tar`。本次不改投稿、渲染、歌词评分或其他已知数据库锁问题。
 
@@ -252,6 +260,8 @@
 - `studio-api`、`studio-web`、`local-worker` 部署后曾确认正常运行，API 与 worker 健康检查通过。
 
 ## 已知限制
+
+本节包含历史观察；涉及混合时间轴、全曲重排与旧置信度门槛的描述已被后续改动替代，现行规则以模块文档和源码为准。
 
 
 - 多源歌词站点可能独立限流或临时失败；搜索与候选解析会隔离单个平台/单个版本的失败，只要仍有可用候选就继续。低置信结果仍应先人工检查再运行 Qwen 或渲染。

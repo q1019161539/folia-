@@ -87,11 +87,12 @@ class FoliaNativeTests(unittest.TestCase):
         self.assertEqual(preview["visualizerTunings"]["sonnet"]["textureResolution"], 0.75)
         self.assertFalse(preview["visualizerTunings"]["sonnet"]["postProcessEnabled"])
 
-    def test_tempera_preview_reduces_gpu_cost(self):
+    def test_tempera_preview_preserves_clarity_without_postprocessing(self):
         job = {"id": "preview", "alignment": {"lines": []}}
         export = build_folia_config(job, normalized_folia_settings({"mode": "tempera"}))
         preview = apply_folia_preview_profile(export)
-        self.assertEqual(preview["visualizerTunings"]["tempera"]["textureResolution"], 0.5)
+        # Since 2026-09-24 only fast export uses 0.5; interactive preview uses 1.0.
+        self.assertEqual(preview["visualizerTunings"]["tempera"]["textureResolution"], 1.0)
         self.assertFalse(preview["visualizerTunings"]["tempera"]["postProcessEnabled"])
 
     def test_tempera_fast_profile_is_realtime_safe_without_mutating_export(self):
