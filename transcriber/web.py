@@ -155,7 +155,7 @@ def build_command(job: dict[str, Any]) -> list[str]:
 
 def release_studio_ai_models(job: dict[str, Any]) -> None:
     options = job.get("options") or {}
-    if job.get("stage") not in {"all", "asr"} or options.get("asr_engine") != "local":
+    if job.get("stage") not in {"all", "asr"} or options.get("asr_engine") not in {"local", "whisper"}:
         return
     request = urllib.request.Request(LOCAL_WORKER_URL + "/unload", data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(request, timeout=300) as response:
@@ -180,7 +180,7 @@ def worker() -> None:
         command = build_command(job)
         try:
             with log_path.open("a", encoding="utf-8") as log:
-                if job.get("stage") in {"all", "asr"} and (job.get("options") or {}).get("asr_engine") == "local":
+                if job.get("stage") in {"all", "asr"} and (job.get("options") or {}).get("asr_engine") in {"local", "whisper"}:
                     log.write(f"[{now()}] releasing idle studio AI models before ASR\n")
                     log.flush()
                     release_studio_ai_models(job)
@@ -422,7 +422,7 @@ def create_job():
         separate_vocals = bool(payload.get("separate_vocals", False))
         asr_source = "vocals" if separate_vocals else "mix"
         asr_engine = str(payload.get("asr_engine", "local"))
-        if asr_engine not in {"local", "aliyun"}:
+        if asr_engine not in {"local", "aliyun", "whisper"}:
             raise ValueError("未知 ASR 引擎")
         if asr_engine == "aliyun" and not os.environ.get("DASHSCOPE_API_KEY", "").strip():
             raise ValueError("阿里云 ASR 尚未配置 API Key")

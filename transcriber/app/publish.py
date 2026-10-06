@@ -40,6 +40,8 @@ def publish_recording_outputs(job: dict[str, Any], internal_output: Path, work_d
         source = internal_output / source_name
         if source.is_file():
             _atomic_copy(source, destination / target_name)
+    if (internal_output / "transcript.jsonl").is_file() and not (internal_output / "transcript_words.jsonl").is_file():
+        (destination / f"{stem}_逐字.jsonl").unlink(missing_ok=True)
     checkpoint = work_dir / "asr_chunks.json"
     if not (internal_output / "transcript.txt").is_file() and checkpoint.is_file():
         try:

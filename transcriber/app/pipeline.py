@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from pathlib import Path
 from typing import Any
 
 from .aligner import align_chunks, chunk_level_segments
-from .asr import transcribe_chunks
+from .asr import transcribe_chunks, transcribe_chunks_whisper
 from .aliyun_asr import DEFAULT_MODEL as DEFAULT_ALIYUN_MODEL, transcribe_chunks_aliyun
 from .audio import detect_voice_regions, extract_pcm, extract_voice_regions, probe_duration, split_audio
 from .benchmark import Benchmark
@@ -62,6 +63,7 @@ def run_pipeline(args: Any) -> dict[str, Any]:
     error = ""
     segments: list[dict[str, Any]] = []
     asr_chunks: list[dict[str, Any]] = []
+    recognized_model = ""
     try:
         if selected_stage in ("all", "extract"):
             stage_message("FFmpeg: extracting 16 kHz mono PCM audio")
@@ -113,7 +115,8 @@ def run_pipeline(args: Any) -> dict[str, Any]:
             stage_message(f"ASR: transcribing {len(chunks)} block(s) with {asr_engine}")
             progress_message(
                 32 if selected_stage == "all" else 5,
-                "正在连接阿里云 ASR" if asr_engine == "aliyun" else "正在加载本地 ASR 模型",
+                "正在连接阿里云 ASR" if asr_engine == "aliyun" else (
+                    "正在连接 Faster-Whisper" if asr_engine == "whisper" else "正在加载本地 ASR 模型"),
             )
             with benchmark.stage("asr_seconds"):
                 def callback(done: int, total: int) -> None:
@@ -125,13 +128,22 @@ def run_pipeline(args: Any) -> dict[str, Any]:
                         percent = 5 + 95 * done / total
                     progress_message(percent, f"ASR 已完成 {done}/{total} 块")
                 if asr_engine == "aliyun":
+                    recognized_model = DEFAULT_ALIYUN_MODEL
                     asr_chunks = transcribe_chunks_aliyun(
                         chunks,
                         model_name=DEFAULT_ALIYUN_MODEL,
                         language=args.language,
                         progress=callback,
                     )
+                elif asr_engine == "whisper":
+                    asr_chunks, recognized_model = transcribe_chunks_whisper(
+                        chunks,
+                        worker_url=os.environ.get("FOLIA_LOCAL_WORKER_URL", "http://local-worker:8001"),
+                        progress=callback,
+                        checkpoint_path=work_dir / "asr_chunks.json",
+                    )
                 else:
+                    recognized_model = args.asr_model
                     asr_chunks = transcribe_chunks(
                         chunks,
                         model_name=args.asr_model,
@@ -188,9 +200,7 @@ def run_pipeline(args: Any) -> dict[str, Any]:
             "asr_chunks": len(asr_chunks),
             "separation_model": args.separation_model if selected_stage in ("all", "separate") and not args.skip_separation else None,
             "asr_engine": getattr(args, "asr_engine", "local") if selected_stage in ("all", "asr") else None,
-            "asr_model": (
-                DEFAULT_ALIYUN_MODEL if getattr(args, "asr_engine", "local") == "aliyun" else args.asr_model
-            ) if selected_stage in ("all", "asr") else None,
+            "asr_model": recognized_model if selected_stage in ("all", "asr") else None,
             "aligner_model": args.aligner_model if alignment_enabled else None,
             "chunk_seconds": args.chunk_seconds,
             "vad_enabled": not getattr(args, "no_vad", False),

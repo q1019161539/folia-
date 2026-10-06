@@ -51,7 +51,7 @@ services:
       BILILIVETOOL_PRESET_ID: s9iw1rmff2
       BILILIVETOOL_OUTPUT_ROOT: /app/Folia成片
       BILILIVETOOL_OUTPUT_LEGACY_ROOT: /app/历史Folia成片
-      COVER_TEMPLATE_ROOT: /cover-templates
+      COVER_TEMPLATE_ROOT: /data/cover-templates
       COVER_OUTPUT_ROOT: /output/publish/covers
       PUBLISH_RECONCILE_LOOKBACK_SECONDS: "86400"
       LOCAL_WORKER_URL: http://local-worker:8001
@@ -76,7 +76,6 @@ services:
       - ./work:/work
       - /vol2/1000/video/Folia成片:/output
       - /vol1/1000/video/Folia成片:/output-legacy:ro
-      - ./cover_templates:/cover-templates:ro
     devices:
       - /dev/dri/renderD128:/dev/dri/renderD128
     group_add:
@@ -155,6 +154,8 @@ services:
       WHISPER_DEVICE: cpu
       WHISPER_COMPUTE_TYPE: int8
       HF_HOME: /models/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
     volumes:
       - ./models:/models
     healthcheck:

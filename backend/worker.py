@@ -1,6 +1,11 @@
 import ctypes, gc, json, os, subprocess, tempfile, threading
 from pathlib import Path
 
+# Set before importing Hugging Face consumers: Qwen also loads its processor
+# separately and does not forward model kwargs to that second load.
+os.environ['HF_HUB_OFFLINE']='1'
+os.environ['TRANSFORMERS_OFFLINE']='1'
+
 from fastapi import FastAPI, File, Form, UploadFile
 from faster_whisper import WhisperModel
 
@@ -28,19 +33,36 @@ def get_whisper():
         unload_aligner(); whisper_model=WhisperModel(MODEL,device=DEVICE,compute_type=COMPUTE,download_root='/models/whisper')
     return whisper_model
 
+def local_aligner_snapshot():
+    candidate=Path(ALIGNER_MODEL).expanduser()
+    if candidate.is_dir():
+        snapshot=candidate.resolve()
+    else:
+        from huggingface_hub import snapshot_download
+        try:
+            snapshot=Path(snapshot_download(repo_id=ALIGNER_MODEL,local_files_only=True)).resolve()
+        except Exception as exc:
+            raise RuntimeError(f'Qwen 离线模型缓存不可用：{ALIGNER_MODEL}；请预先安装完整模型缓存') from exc
+    required=('config.json','model.safetensors','preprocessor_config.json','tokenizer_config.json','vocab.json','merges.txt')
+    missing=[name for name in required if not (snapshot/name).is_file() or (snapshot/name).stat().st_size<=0]
+    if missing:
+        raise RuntimeError('Qwen 离线模型缓存不完整：'+', '.join(missing))
+    return str(snapshot)
+
 def get_aligner():
     global aligner_model
     if aligner_model is None:
         unload_whisper()
+        snapshot=local_aligner_snapshot()
         import torch
         from qwen_asr import Qwen3ForcedAligner
         torch.set_num_threads(max(1,min(10,os.cpu_count() or 1)))
-        aligner_model=Qwen3ForcedAligner.from_pretrained(ALIGNER_MODEL,device_map='cpu',dtype=torch.float32)
+        aligner_model=Qwen3ForcedAligner.from_pretrained(snapshot,device_map='cpu',dtype=torch.float32,local_files_only=True)
     return aligner_model
 
 @app.get('/healthz')
 def health():
-    return {'ok':True,'model':MODEL,'loaded':whisper_model is not None,'aligner':ALIGNER_MODEL,'aligner_loaded':aligner_model is not None,'device':DEVICE,'compute_type':COMPUTE}
+    return {'ok':True,'model':MODEL,'loaded':whisper_model is not None,'aligner':ALIGNER_MODEL,'aligner_loaded':aligner_model is not None,'aligner_offline':True,'device':DEVICE,'compute_type':COMPUTE}
 
 @app.post('/unload')
 def unload():

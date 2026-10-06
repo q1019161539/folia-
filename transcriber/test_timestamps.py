@@ -1,9 +1,12 @@
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from app.asr import _save_checkpoint, transcribe_chunks
+from app.asr import _matching_checkpoint, _save_checkpoint, transcribe_chunks, transcribe_chunks_whisper
+from app.aligner import chunk_level_segments
 from app.notify import automation_notification
 from app.outputs import write_outputs
 from app.publish import publish_recording_outputs, publish_song_analysis, recording_output_directory
@@ -82,6 +85,40 @@ class TimestampWordTests(unittest.TestCase):
             progress = []
             self.assertEqual(transcribe_chunks(chunks, checkpoint_path=checkpoint, progress=lambda done, total: progress.append((done, total))), saved)
             self.assertEqual(progress, [(1, 1)])
+
+    def test_whisper_checkpoint_does_not_reuse_qwen_text_and_projects_sentence_times(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "asr_chunks.json"
+            chunks = [
+                {"path": str(Path(directory) / "chunk-0.wav"), "offset": 0.0, "duration": 180.0},
+                {"path": str(Path(directory) / "chunk-1.wav"), "offset": 180.0, "duration": 180.0},
+            ]
+            _save_checkpoint(checkpoint, [{**chunks[0], "index": 0, "text": "旧 Qwen 文字"}])
+            self.assertEqual(_matching_checkpoint(checkpoint, chunks, engine="whisper", model="large-v3-turbo"), {})
+            replies = [
+                {"language": "zh", "segments": [{"start": 178.1, "end": 179.8, "text": "第一句"}]},
+                {"language": "zh", "segments": [{"start": 0.2, "end": 2.5, "text": "第二句"}]},
+            ]
+            with patch("app.asr.urllib.request.urlopen", side_effect=lambda *args, **kwargs: BytesIO(b'{"model":"large-v3-turbo"}')):
+                with patch("app.asr._whisper_request", side_effect=replies) as recognize:
+                    rows, model = transcribe_chunks_whisper(chunks, worker_url="http://worker", checkpoint_path=checkpoint)
+                self.assertEqual(model, "large-v3-turbo")
+                self.assertEqual(recognize.call_count, 2)
+                with patch("app.asr._whisper_request") as recognize:
+                    cached, _ = transcribe_chunks_whisper(chunks, worker_url="http://worker", checkpoint_path=checkpoint)
+                recognize.assert_not_called()
+            self.assertEqual(rows, cached)
+            sentences = chunk_level_segments(rows)
+            self.assertEqual([row["text"] for row in sentences], ["第一句", "第二句"])
+            self.assertEqual([(row["start"], row["end"]) for row in sentences], [(178.1, 179.8), (180.2, 182.5)])
+            self.assertTrue(all(not row.get("words") for row in sentences))
+
+    def test_sentence_only_output_has_no_word_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "transcript_words.jsonl").write_text("stale", encoding="utf-8")
+            write_outputs(root, [{"start": 1.0, "end": 2.0, "start_text": "00:00:01.000", "end_text": "00:00:02.000", "text": "歌词"}], {})
+            self.assertFalse((root / "transcript_words.jsonl").exists())
 
     def test_sentence_segments_preserve_absolute_word_times(self):
         items = [

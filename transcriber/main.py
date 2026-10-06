@@ -39,7 +39,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--chunk-seconds", type=int, default=180, choices=range(30, 181), metavar="30..180")
     value.add_argument("--no-vad", action="store_true", help="Disable silence skipping; source timestamps remain unchanged when VAD is enabled")
     value.add_argument("--language", default="Chinese")
-    value.add_argument("--asr-engine", choices=("local", "aliyun"), default="local")
+    value.add_argument("--asr-engine", choices=("local", "aliyun", "whisper"), default="local")
     value.add_argument("--asr-model", default=DEFAULT_ASR_MODEL)
     value.add_argument("--aligner-model", default=DEFAULT_ALIGNER_MODEL)
     value.add_argument("--max-new-tokens", type=int, default=1024)

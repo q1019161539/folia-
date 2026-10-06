@@ -7,6 +7,7 @@ import httpx
 from PIL import Image
 
 from publishing import (
+    BUILTIN_COVER_FONTS,
     BililiveToolClient,
     PublishPrepareError,
     PublishRetryableError,
@@ -23,6 +24,7 @@ from publishing import (
     retry_delay_seconds,
     stable_template_index,
     streamer_from_source,
+    validate_cover_font,
 )
 
 
@@ -87,25 +89,40 @@ class CoverTest(unittest.TestCase):
     def test_cover_is_1920_by_1080_and_source_video_survives(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            generic = root / "templates/generic"
-            generic.mkdir(parents=True)
-            Image.new("RGB", (1200, 1200), (60, 90, 130)).save(generic / "01.jpg")
+            source = root / "covers/01.jpg"
+            source.parent.mkdir(parents=True)
+            Image.new("RGB", (1200, 1200), (60, 90, 130)).save(source)
             video = root / "output/song.mp4"
             video.parent.mkdir(parents=True)
             video.write_bytes(b"original-mp4")
-            template = choose_cover_template(root / "templates", "芒芒_Mou", "离人赋")
+            template = choose_cover_template([source], "芒芒_Mou", "离人赋")
             cover = render_cover(template, root / "output/publish/covers/job.jpg", "离人赋", "芒芒_Mou")
             with Image.open(cover) as image:
                 self.assertEqual(image.size, (1920, 1080))
                 self.assertEqual(image.format, "JPEG")
             self.assertEqual(video.read_bytes(), b"original-mp4")
 
-    def test_missing_template_fails_without_touching_video(self):
+    def test_streamer_without_covers_fails_with_actionable_message(self):
+        with self.assertRaises(PublishPrepareError) as raised:
+            choose_cover_template([], "赛蒂娅Sentia", "b")
+        self.assertIn("赛蒂娅Sentia", str(raised.exception))
+        self.assertIn("投稿管理", str(raised.exception))
+
+    def test_cover_font_choice_is_applied_and_bad_font_is_reported(self):
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw); video = root / "song.mp4"; video.write_bytes(b"keep")
+            root = Path(raw)
+            source = root / "01.png"
+            Image.new("RGB", (1920, 1080), (60, 90, 130)).save(source)
+            serif = render_cover(source, root / "serif.jpg", "离人赋", "芒芒_Mou", BUILTIN_COVER_FONTS["builtin-serif"])
+            sans = render_cover(source, root / "sans.jpg", "离人赋", "芒芒_Mou", BUILTIN_COVER_FONTS["builtin-sans"])
+            self.assertNotEqual(serif.read_bytes(), sans.read_bytes())
+            broken = root / "broken.ttf"
+            broken.write_bytes(b"not a font")
             with self.assertRaises(PublishPrepareError):
-                choose_cover_template(root / "templates", "a", "b")
-            self.assertEqual(video.read_bytes(), b"keep")
+                render_cover(source, root / "broken.jpg", "离人赋", "芒芒_Mou", (str(broken), 0))
+            with self.assertRaises(PublishPrepareError):
+                validate_cover_font((str(broken), 0))
+            validate_cover_font(BUILTIN_COVER_FONTS["builtin-serif"])
 
 
 def hashlib_key(streamer: str, title: str) -> bytes:
@@ -195,6 +212,23 @@ class PersistenceContractTest(unittest.TestCase):
         self.assertIn("profile.get('bililive_preset_id')", handoff)
         self.assertIn("if not preset_id:\n        return None", handoff)
         self.assertNotIn("or PUBLISH_SETTINGS.bililive_preset_id", handoff)
+        update = APP.split("def update_automation_profile", 1)[1].split("\n@app.", 1)[0]
+        for route in (create, update):
+            self.assertNotIn("PUBLISH_SETTINGS.bililive_preset_id", route)
+
+    def test_prepare_uses_streamer_covers_and_font(self):
+        prepare = APP.split("def prepare_publish_job", 1)[1].split("def publish_worker_loop", 1)[0]
+        self.assertIn("profile_cover_paths(profile['id'])", prepare)
+        self.assertIn("cover_font_spec(profile.get('cover_font_id'))", prepare)
+        self.assertIn("ALTER TABLE automation_profiles ADD COLUMN cover_font_id", APP)
+
+    def test_font_delete_refuses_builtin_and_used_fonts(self):
+        delete = APP.split("def delete_font", 1)[1].split("\n@app.", 1)[0]
+        self.assertIn("'builtin-'", delete)
+        self.assertIn("font_usages(font_id)", delete)
+        usages = APP.split("def font_usages", 1)[1].split("\n@app.", 1)[0]
+        self.assertIn("FROM jobs WHERE style LIKE", usages)
+        self.assertIn("cover_font_id=?", usages)
 
     def test_source_job_is_unique_and_inserts_name_columns(self):
         schema = APP.split("CREATE TABLE IF NOT EXISTS publish_jobs", 1)[1].split("''')", 1)[0]

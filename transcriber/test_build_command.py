@@ -38,6 +38,12 @@ class BuildCommandTest(unittest.TestCase):
         self.assertIn("--no-vad", command)
         self.assertNotIn("--skip-alignment", command)
 
+    def test_automation_whisper_uses_sentence_timing_without_global_aligner(self):
+        command = build_command(job(asr_engine="whisper", no_vad=True, skip_alignment=True))
+        self.assertEqual(command[command.index("--asr-engine") + 1], "whisper")
+        self.assertIn("--no-vad", command)
+        self.assertIn("--skip-alignment", command)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,10 +22,10 @@ from image_assets import MAX_UPLOAD_BYTES, list_images, resolve_image, resolve_t
 from folia_upstream import UpstreamStatusStore
 from song_identity import backfill_identity, fingerprint_consensus, identity_fields, matched_candidate_fields, resolve_search_identity
 from recording_metadata import copy_recording_metadata_sidecar
-from publishing import (BililiveToolClient, PublishPrepareError, PublishRetryableError,
+from publishing import (BUILTIN_COVER_FONTS, DEFAULT_COVER_FONT, BililiveToolClient, PublishPrepareError, PublishRetryableError,
     PublishSettings, build_description, build_payload, build_tags, build_title,
     choose_cover_template, json_text, map_to_bililive_path, merge_preset_config,
-    preset_description_template, render_cover, retry_delay_seconds, streamer_from_source)
+    preset_description_template, render_cover, retry_delay_seconds, streamer_from_source, validate_cover_font)
 
 MEDIA=Path(os.getenv('MEDIA_ROOT','/media/bililive')).resolve()
 MEDIA_WRITE=Path(os.getenv('MEDIA_WRITE_ROOT','/media-output')).resolve()
@@ -223,6 +223,8 @@ def ensure_schema(c):
         c.execute("ALTER TABLE automation_profiles ADD COLUMN bililive_preset_id TEXT DEFAULT ''")
     if 'bililive_preset_name' not in automation_profile_columns:
         c.execute("ALTER TABLE automation_profiles ADD COLUMN bililive_preset_name TEXT DEFAULT ''")
+    if 'cover_font_id' not in automation_profile_columns:
+        c.execute("ALTER TABLE automation_profiles ADD COLUMN cover_font_id TEXT DEFAULT ''")
     c.execute('CREATE TABLE IF NOT EXISTS automation_seen(profile_id TEXT,source TEXT,size INTEGER,mtime REAL,stable_count INTEGER,disposition TEXT,updated_at REAL,PRIMARY KEY(profile_id,source))')
     c.execute('CREATE TABLE IF NOT EXISTS automation_runs(id TEXT PRIMARY KEY,profile_id TEXT,created_at REAL,updated_at REAL,status TEXT,stage TEXT,source TEXT,size INTEGER,mtime REAL,transcriber_job_id TEXT,transcriber_run_id TEXT,transcript TEXT,songs TEXT,current_song INTEGER,error TEXT,cancel_requested INTEGER DEFAULT 0)')
     c.execute('CREATE TABLE IF NOT EXISTS app_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
@@ -537,6 +539,8 @@ class ClipBatchIn(BaseModel): file_id:str; segments:list[ClipSegmentIn]; padding
 class AutomationProfileIn(BaseModel):
     name:str=''; path:str; min_confidence:float=.8; padding_seconds:float=5; style:StyleIn|None=None
     publish_streamer:str=''; bililive_preset_id:str=''
+class ProfilePublishIn(BaseModel): bililive_preset_id:str=''; cover_font_id:str=''
+class CoverPreviewIn(BaseModel): title:str; cover_id:str=''; cover_font_id:str|None=None
 class AutomationManualRunIn(BaseModel): source:str
 
 def backfill_job_identity():
@@ -613,6 +617,25 @@ def font_file(font_id:str):
     except (OSError,ValueError,KeyError,json.JSONDecodeError): raise HTTPException(404,'字体不存在')
     media_type={'.ttf':'font/ttf','.otf':'font/otf','.woff2':'font/woff2'}.get(path.suffix.lower(),'application/octet-stream')
     return FileResponse(path,media_type=media_type,filename=metadata.get('filename') or path.name)
+
+def font_usages(font_id:str)->list[str]:
+    pattern=f'%{font_id}%'
+    with db() as c:
+        projects=c.execute('SELECT id,title FROM jobs WHERE style LIKE ?',(pattern,)).fetchall()
+        profiles=c.execute('SELECT name,cover_font_id FROM automation_profiles WHERE style LIKE ? OR cover_font_id=?',(pattern,font_id)).fetchall()
+    return ([f'歌词项目《{row["title"] or row["id"][:8]}》' for row in projects]+
+            [f'主播「{row["name"]}」的'+('封面字体' if row['cover_font_id']==font_id else '自动流水线歌词效果') for row in profiles])
+
+@app.delete('/api/fonts/{font_id}')
+def delete_font(font_id:str):
+    if font_id.startswith('builtin-'): raise HTTPException(400,'内置字体不能删除')
+    try: path,_=resolve_font(FONTS,font_id)
+    except (OSError,ValueError,KeyError,json.JSONDecodeError): raise HTTPException(404,'字体不存在')
+    if render_lock.locked(): raise HTTPException(409,'正在渲染，请稍后删除字体')
+    used=font_usages(font_id)
+    if used: raise HTTPException(409,'字体正在使用，不能删除：'+'、'.join(used[:5])+(f' 等 {len(used)} 处' if len(used)>5 else ''))
+    path.unlink(); (FONTS/f'{font_id}.json').unlink(missing_ok=True)
+    return {'ok':True}
 @app.get('/api/jobs/{jid}/folia-images')
 def folia_images(jid:str):
     getjob(jid)
@@ -2494,7 +2517,23 @@ def automation_profile_row(row):
         item['path']=roots[0].relative_to(MEDIA).as_posix(); item['name']=roots[0].name
     item['publish_streamer']=str(item.get('publish_streamer') or item.get('name') or '').strip()
     item['bililive_preset_id']=str(item.get('bililive_preset_id') or '').strip()
+    item['cover_font_id']=str(item.get('cover_font_id') or '').strip()
     return item
+
+def profile_covers(profile_id:str)->Path:
+    return PUBLISH_SETTINGS.cover_template_root/profile_id
+
+def profile_cover_paths(profile_id:str)->list[Path]:
+    root=profile_covers(profile_id)
+    return [root/f"{item['id']}{item['extension']}" for item in list_images(root)]
+
+def cover_font_spec(font_id:str):
+    font_id=str(font_id or '').strip() or DEFAULT_COVER_FONT
+    if font_id in BUILTIN_COVER_FONTS: return BUILTIN_COVER_FONTS[font_id]
+    try: path,_=resolve_font(FONTS,font_id)
+    except (OSError,ValueError,KeyError,json.JSONDecodeError) as exc:
+        raise PublishPrepareError('封面字体已不存在，请在投稿管理页重新选择') from exc
+    return (str(path),0)
 
 def bililive_preset(preset_id:str):
     preset_id=str(preset_id or '').strip()
@@ -3012,18 +3051,20 @@ def prepare_publish_job(publish_id:str):
         payload=job.get('bililive_payload') or {}
         cover_path=str(job.get('cover_path') or '')
         if not payload:
-            template=choose_cover_template(PUBLISH_SETTINGS.cover_template_root,streamer,identified_title)
-            cover=render_cover(template,PUBLISH_SETTINGS.cover_output_root/f'{publish_id}.jpg',identified_title,streamer)
-            cover_path=str(cover)
-            bililive_video=map_to_bililive_path(video,PUBLISH_SETTINGS)
-            bililive_cover=map_to_bililive_path(cover,PUBLISH_SETTINGS)
-            client=BililiveToolClient(PUBLISH_SETTINGS.bililive_base_url,PUBLISH_SETTINGS.bililive_passkey)
-            preset=client.get_video_preset(str(job.get('bililive_preset_id') or ''))
             try:
                 run=get_automation_run(str(job.get('automation_run_id') or ''),False)
                 profile=get_automation_profile(str(run.get('profile_id') or ''))
             except HTTPException:
                 run={}; profile={}
+            templates=profile_cover_paths(profile['id']) if profile.get('id') else []
+            template=choose_cover_template(templates,streamer,identified_title)
+            cover=render_cover(template,PUBLISH_SETTINGS.cover_output_root/f'{publish_id}.jpg',identified_title,streamer,
+                cover_font_spec(profile.get('cover_font_id')))
+            cover_path=str(cover)
+            bililive_video=map_to_bililive_path(video,PUBLISH_SETTINGS)
+            bililive_cover=map_to_bililive_path(cover,PUBLISH_SETTINGS)
+            client=BililiveToolClient(PUBLISH_SETTINGS.bililive_base_url,PUBLISH_SETTINGS.bililive_passkey)
+            preset=client.get_video_preset(str(job.get('bililive_preset_id') or ''))
             identity=profile.get('recorder_identity') if isinstance(profile.get('recorder_identity'),dict) else {}
             recorded_at=float(run.get('mtime') or job.get('video_mtime') or time.time())
             description_template=preset_description_template(preset,description)
@@ -3319,8 +3360,9 @@ def create_automation_profile(body:AutomationProfileIn):
             raise HTTPException(409,'这个主播已有规则，请编辑现有规则')
     profile_id=uuid.uuid4().hex; now=time.time(); name=body.name.strip() or path.name; style=normalize_studio_style((body.style or StyleIn()).model_dump())
     publish_streamer=body.publish_streamer.strip() or name
-    preset=bililive_preset(body.bililive_preset_id or PUBLISH_SETTINGS.bililive_preset_id)
-    preset_id=str(preset.get('id') or body.bililive_preset_id or '').strip(); preset_name=str(preset.get('name') or preset_id).strip()
+    chosen=body.bililive_preset_id.strip()
+    preset=bililive_preset(chosen) if chosen else {}
+    preset_id=str(preset.get('id') or chosen).strip(); preset_name=str(preset.get('name') or preset_id).strip()
     with db() as c:
         c.execute('INSERT INTO automation_profiles(id,created_at,updated_at,name,path,enabled,enabled_at,min_bytes,min_confidence,padding,style,publish_streamer,bililive_preset_id,bililive_preset_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(profile_id,now,now,name,relative,0,None,MIN_RECORDING_BYTES,body.min_confidence,body.padding_seconds,json.dumps(style,ensure_ascii=False),publish_streamer,preset_id,preset_name)); c.commit()
     return get_automation_profile(profile_id)
@@ -3333,14 +3375,88 @@ def update_automation_profile(profile_id:str,body:AutomationProfileIn):
     if not 0<=body.padding_seconds<=30: raise HTTPException(400,'切片余量必须在 0 到 30 秒之间')
     style=normalize_studio_style((body.style or StyleIn(**(current.get('style') or {}))).model_dump()); now=time.time()
     publish_streamer=body.publish_streamer.strip() or str(current.get('publish_streamer') or body.name or path.name).strip()
-    preset=bililive_preset(body.bililive_preset_id or current.get('bililive_preset_id') or PUBLISH_SETTINGS.bililive_preset_id)
-    preset_id=str(preset.get('id') or body.bililive_preset_id or '').strip(); preset_name=str(preset.get('name') or preset_id).strip()
+    chosen=body.bililive_preset_id.strip()
+    if chosen:
+        preset=bililive_preset(chosen)
+        preset_id=str(preset.get('id') or chosen).strip(); preset_name=str(preset.get('name') or preset_id).strip()
+    else:
+        preset_id=str(current.get('bililive_preset_id') or '').strip(); preset_name=str(current.get('bililive_preset_name') or '').strip()
     with db() as c:
         c.execute('UPDATE automation_profiles SET updated_at=?,name=?,path=?,min_confidence=?,padding=?,style=?,publish_streamer=?,bililive_preset_id=?,bililive_preset_name=? WHERE id=?',(now,body.name.strip() or path.name,relative,body.min_confidence,body.padding_seconds,json.dumps(style,ensure_ascii=False),publish_streamer,preset_id,preset_name,profile_id)); c.commit()
     if relative not in (current.get('recorder_identity') or {}).get('paths',[]) and relative!=current['path']:
         with db() as c:
             c.execute("UPDATE automation_profiles SET recorder_identity='' WHERE id=?",(profile_id,)); c.commit()
     return get_automation_profile(profile_id)
+
+@app.put('/api/automation/profiles/{profile_id}/publish')
+def update_profile_publish(profile_id:str,body:ProfilePublishIn):
+    get_automation_profile(profile_id)
+    chosen=body.bililive_preset_id.strip()
+    if chosen:
+        preset=bililive_preset(chosen)
+        preset_id=str(preset.get('id') or chosen).strip(); preset_name=str(preset.get('name') or preset_id).strip()
+    else:
+        preset_id=preset_name=''
+    font_id=body.cover_font_id.strip()
+    if font_id:
+        try: validate_cover_font(cover_font_spec(font_id))
+        except PublishPrepareError as exc: raise HTTPException(400,str(exc)) from exc
+    with db() as c:
+        c.execute('UPDATE automation_profiles SET updated_at=?,bililive_preset_id=?,bililive_preset_name=?,cover_font_id=? WHERE id=?',(time.time(),preset_id,preset_name,font_id,profile_id)); c.commit()
+    return get_automation_profile(profile_id)
+
+COVER_MEDIA_TYPES={'.jpg':'image/jpeg','.png':'image/png','.webp':'image/webp'}
+
+def require_profile(profile_id:str):
+    with db() as c: row=c.execute('SELECT 1 FROM automation_profiles WHERE id=?',(profile_id,)).fetchone()
+    if not row: raise HTTPException(404,'主播规则不存在')
+
+@app.get('/api/automation/profiles/{profile_id}/covers')
+def profile_cover_list(profile_id:str):
+    require_profile(profile_id)
+    return {'covers':list_images(profile_covers(profile_id))}
+
+@app.post('/api/automation/profiles/{profile_id}/covers')
+async def upload_profile_cover(profile_id:str,file:UploadFile=File(...)):
+    require_profile(profile_id)
+    content=await file.read(MAX_UPLOAD_BYTES+1)
+    try: return store_image(profile_covers(profile_id),file.filename or '封面',content)
+    except ValueError as exc: raise HTTPException(400,str(exc)) from exc
+
+@app.get('/api/automation/profiles/{profile_id}/covers/{cover_id}')
+def profile_cover_file(profile_id:str,cover_id:str):
+    require_profile(profile_id)
+    try: path,item=resolve_image(profile_covers(profile_id),cover_id)
+    except (OSError,ValueError,KeyError,json.JSONDecodeError): raise HTTPException(404,'封面底图不存在')
+    return FileResponse(path,media_type=COVER_MEDIA_TYPES.get(item['extension'],'application/octet-stream'))
+
+@app.delete('/api/automation/profiles/{profile_id}/covers/{cover_id}')
+def delete_profile_cover(profile_id:str,cover_id:str):
+    require_profile(profile_id)
+    root=profile_covers(profile_id)
+    try: path,_=resolve_image(root,cover_id)
+    except (OSError,ValueError,KeyError,json.JSONDecodeError): raise HTTPException(404,'封面底图不存在')
+    path.unlink(); (root/f'{cover_id}.json').unlink(missing_ok=True)
+    return {'ok':True}
+
+@app.post('/api/automation/profiles/{profile_id}/cover-preview')
+def profile_cover_preview(profile_id:str,body:CoverPreviewIn):
+    profile=get_automation_profile(profile_id)
+    title=body.title.strip()
+    if not title: raise HTTPException(400,'请输入试用歌名')
+    streamer=str(profile.get('publish_streamer') or profile.get('name') or '').strip()
+    if body.cover_id:
+        try: template,_=resolve_image(profile_covers(profile_id),body.cover_id)
+        except (OSError,ValueError,KeyError,json.JSONDecodeError): raise HTTPException(404,'封面底图不存在')
+    else:
+        template=None
+    target=DATA/'cache'/'cover-preview'/f'{profile_id}.jpg'
+    try:
+        template=template or choose_cover_template(profile_cover_paths(profile_id),streamer,title)
+        font_id=profile.get('cover_font_id') if body.cover_font_id is None else body.cover_font_id
+        render_cover(template,target,title,streamer,cover_font_spec(font_id))
+    except PublishPrepareError as exc: raise HTTPException(400,str(exc)) from exc
+    return FileResponse(target,media_type='image/jpeg',headers={'Cache-Control':'no-store'})
 
 @app.post('/api/automation/profiles/{profile_id}/enable')
 def enable_automation_profile(profile_id:str):

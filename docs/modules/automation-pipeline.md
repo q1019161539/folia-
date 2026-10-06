@@ -4,7 +4,7 @@
 
 - 页面第四工作区“自动流水线”；前端为 `web/automation.js`。
 - 编排、SQLite 状态和 API 位于 `backend/app.py`，纯校验和时间投影位于 `backend/automation.py`。
-- 主播规则默认停用；保存规则时同时锁定投稿使用的主播显示名，并从 BililiveTool 实时读取视频投稿模板供选择。启用时先把所有现有合格 MP4 记为基线，只处理之后新增的文件。
+- 主播规则默认停用；保存规则时同时锁定投稿使用的主播显示名。投稿模板、封面底图和封面字体不在规则表单里设置，而在第五工作区“投稿管理”按主播设置；规则卡片在未选模板时显示“去投稿管理”。启用时先把所有现有合格 MP4 记为基线，只处理之后新增的文件。
 - 主播选择由 `GET /api/automation/broadcasters` 合并媒体一级目录与录播机身份。主 API 只读挂载 bililive-tools 的 data 目录（含 SQLite WAL），从 `streamer` 和 `record_history` 按平台＋房间号关联录播目录，30 秒缓存；不写录播机配置或数据库。已有规则在唯一匹配时自动绑定，保存 `recorder_identity` 的房间号和历史目录。改名时显示最新录制目录名称，持续监听该身份的新旧目录；手动历史录播也合并查询。无记录或身份不明确的目录继续按目录监听，禁止用名字前缀猜身份。新发现目录中早于规则启用时间的文件进入基线，避免意外重跑历史。页面名单按房间号合并别名，显示绑定房间号；重复锁定同一身份拒绝创建。页面打开时读取一次，有新增时点击“刷新名单”。
 - 自动流水线工作区首次打开时读取规则、任务、队列、主播目录及当前主播录播；切走再返回保留已有表单和列表，不重复扫描主播目录和历史录播。页面可见时仅每 15 秒后台刷新任务与队列；规则、主播名单及录播由对应刷新按钮或编辑动作更新。
 - UI 的队列概览在桌面放在状态侧栏，手机放在任务列表最前；主播、规则、手动执行和任务记录在手机按单列页面滚动，任务记录默认显示前 10 条并可展开更多。此布局不改变首次加载、返回保留和后台刷新逻辑。
@@ -27,9 +27,20 @@
 
 ## 成片后投稿准备（Phase 1）
 
-完整 MP4 渲染成功后，API 以项目 ID 幂等创建 `publish_jobs`。投稿任务只快照识别层的 `identified_title`、`identified_artist`、`identity_source`，以及自动规则已经锁定的主播显示名和 BililiveTool preset ID；歌词候选、手工显示标题和 LLM 不得覆盖这些值。旧规则没有选择 preset 时不创建准备任务，避免误用另一位主播的全局默认模板；保存选择后由常驻对账补建。
+完整 MP4 渲染成功后，API 以项目 ID 幂等创建 `publish_jobs`。投稿任务只快照识别层的 `identified_title`、`identified_artist`、`identity_source`，以及自动规则已经锁定的主播显示名和 BililiveTool preset ID；歌词候选、手工显示标题和 LLM 不得覆盖这些值。规则没有选择 preset 时不创建准备任务，避免误用另一位主播的全局默认模板。常驻对账只处理上次水位之后完成的成片，未选模板期间完成的成片在选好模板后不会自动补建。
 
-自动流水线页面通过 `GET /api/publish-presets` 代理 BililiveTool 的 `GET /api/preset/video`，显示模板名称和简介摘要；保存或编辑主播规则时，API 再次读取指定 preset，防止保存不存在的 ID。准备 worker 生成固定标题、tags 与 1920×1080 封面，将 `/output` 和 `/output-legacy` 映射到 BililiveTool 已挂载的 `/app/Folia成片` 和 `/app/历史Folia成片`。简介优先继承所选 preset 的 `config.desc`，通过 BililiveTool 真实的 `POST /api/bili/formatDesc` 展开直播时间等模板变量；preset 没有简介时才使用 Folia 的确定性简介。随后仅覆盖 `title/desc/tag/cover`，持久化不含 PassKey 的完整 payload 快照，再调用 `POST /api/bili/validUploadParams`。成功后停在 `ready`。
+### 投稿管理页
+
+第五工作区“投稿管理”（`web/publish.js`、`web/publish.css`）列出所有锁定主播，每位主播一张卡片：
+
+- **投稿模板**：`GET /api/publish-presets` 代理 BililiveTool 的 `GET /api/preset/video`，下拉选择并显示简介摘要；`PUT /api/automation/profiles/{id}/publish` 保存 `bililive_preset_id` 与 `cover_font_id`，API 保存前再次读取 preset，拒绝不存在的 ID，可选“未选择”。任何接口都不回退到 `BILILIVE_PRESET_ID` 全局默认；`default_id` 仅供参考，页面不据此预选。流水线规则的创建/编辑接口不再要求模板：新建为空，编辑未提交时保留原值。
+- **封面字体**：默认思源黑体，可选思源宋体或字体库中的上传字体。内置字体使用 Noto CJK 集合中的简体中文字形（索引 2）。保存时实际加载并绘制测试字形，失败返回 400；准备阶段字体已被删除则任务失败并提示重新选择。
+- **封面底图**：`GET/POST /api/automation/profiles/{id}/covers`、`GET/DELETE .../covers/{cover_id}`。复用图片库校验（PNG/JPEG/WebP、≤10 MB、≤4000 万像素、长边缩至 2048、按内容去重），存于 `data/cover-templates/<规则 ID>/`。准备任务按“主播+歌名”稳定哈希在该主播自己的底图里选一张；没有底图时任务 `failed`，提示去投稿管理页上传，上传后可重试。旧 `cover_templates/generic/` 占位图不再使用。
+- **封面预览**：`POST /api/automation/profiles/{id}/cover-preview`，填试用歌名，可指定某张底图和尚未保存的字体，只写 `data/cache/cover-preview/<规则 ID>.jpg`，不创建任务。
+- **字体库**：与歌词效果共用 `/api/fonts`；可上传，`DELETE /api/fonts/{id}` 删除上传字体。内置字体不可删；被歌词项目样式、流水线规则样式或封面设置引用时返回 409 并列出使用位置；正在渲染时拒绝删除。
+- **投稿准备任务**：显示最近 20 条 `publish_jobs` 的状态与错误，准备失败的可“重新准备”（`POST /api/publish-jobs/{id}/retry`）。
+
+准备 worker 生成固定标题、tags 与 1920×1080 封面，将 `/output` 和 `/output-legacy` 映射到 BililiveTool 已挂载的 `/app/Folia成片` 和 `/app/历史Folia成片`。简介优先继承所选 preset 的 `config.desc`，通过 BililiveTool 真实的 `POST /api/bili/formatDesc` 展开直播时间等模板变量；preset 没有简介时才使用 Folia 的确定性简介。随后仅覆盖 `title/desc/tag/cover`，持久化不含 PassKey 的完整 payload 快照，再调用 `POST /api/bili/validUploadParams`。成功后停在 `ready`。
 
 payload 一经快照便保持不变：临时网络失败重试同一份快照，后来修改规则或 BililiveTool preset 不会静默改写已经 `ready` 的历史任务。
 

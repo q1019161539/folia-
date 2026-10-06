@@ -68,12 +68,17 @@ def align_chunks(
 
 
 def chunk_level_segments(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        make_segment(
-            float(chunk["offset"]),
-            float(chunk["offset"]) + float(chunk["duration"]),
-            chunk["text"],
-        )
-        for chunk in chunks
-        if chunk["text"].strip()
-    ]
+    output: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks):
+        offset = float(chunk["offset"])
+        duration = float(chunk["duration"])
+        if chunk.get("asr_engine") == "whisper":
+            for row in sorted(chunk.get("segments") or [], key=lambda item: float(item["start"])):
+                text = str(row.get("text") or "").strip()
+                start = max(0.0, min(duration, float(row["start"])))
+                end = max(start, min(duration, float(row["end"])))
+                if text and end > start:
+                    output.append(make_segment(offset + start, offset + end, text, chunk_index=index))
+        elif str(chunk.get("text") or "").strip():
+            output.append(make_segment(offset, offset + duration, chunk["text"], chunk_index=index))
+    return output

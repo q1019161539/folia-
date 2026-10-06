@@ -1,8 +1,14 @@
 # 当前状态
 
-最后整理：2026-09-27
+最后整理：2026-10-06
 
 ## 已上线
+
+- 2026-10-06：Qwen 强制对齐改为离线加载。此前自动歌曲的逐字对齐在查询 Hugging Face `processor_config.json` 时遭遇 SSL EOF，导致 HTTP 500、零字锚点及后续跳过。worker 在依赖导入前固定 `HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1`；将仓库名仅从本地缓存解析为完整快照目录，检查关键模型/processor 文件后传入 Qwen，保留 CPU/float32 和现有模型卸载策略。Workerfile、Compose 同步设置离线环境；缓存缺失或关键文件为空时明确失败，不运行时下载。新增 `backend/test_worker_offline.py`，4 项缓存回归测试通过，镜像构建及 Compose 配置检查通过。在 `--network none` 的独立新镜像容器中读取既有《如果有来生》切片的 14.24 秒真实音频，模型加载与对齐共 72.66 秒，返回 11 个正时长字时间戳；结果保存于 `work/qwen-offline-check-20261006/result.json`（仅验证离线可用性，不代表歌词识别准确性验收）。用户已允许中断任务，切换时停止 API、转录器和 worker，保留原数据库/录播/成片并恢复这三项服务；没有批量重跑历史失败场次。代码与文档上线前备份：`/vol1/1000/docker/folia-video-studio-backups/20261006-qwen-offline/code-before.tar`。本次不改投稿、渲染、歌词评分或其他已知数据库锁问题。
+
+- 2026-09-28：新增第五工作区“投稿管理”。按自动流水线锁定的主播逐一设置 BililiveTool 投稿模板、封面标题字体（默认思源黑体，可选思源宋体或字体库上传字体）和各自的封面底图（`data/cover-templates/<规则 ID>/`），可填试用歌名生成封面预览；统一管理字体库（上传、删除上传字体，内置或仍被歌词项目/规则/封面引用的字体拒绝删除）；显示最近 20 条投稿准备任务，失败可重新准备。流水线规则表单移除模板下拉，新建规则模板为空，卡片提示“去投稿管理”。封面不再使用 `cover_templates/generic` 占位图，也不设公共兜底：主播没有底图时准备任务失败并提示上传。内置封面字体改用 Noto CJK 简体中文字形（原先误用日文字形）。**当前四位主播都还没有封面底图**，在上传前新成片的投稿准备会失败（自动上传仍关闭，不影响成片）。核验：后端 `test_publishing`/`test_automation`/`test_font_assets` 37 项通过，全量 231 项仅已知无关的 Tempera 预览测试失败；Python 编译、`node --check`、Compose 配置通过。NAS 内部临时无认证容器（仅 127.0.0.1、测试后删除）配合无头 Chromium 实测：进入页面、给芒芒上传测试底图、界面保存宋体后接口确认、用底图生成 1920×1080 预览、改回默认、确认框删除底图、流水线卡片 3 个“去投稿管理”链接跳转，以及 390 px 手机宽度 4 列底部导航无横向溢出，均无页面报错；测试数据已复原（芒芒模板 `s9iw1rmff2`、默认字体、0 张底图）。部署时小红泡整场 ASR 正在转录，仅以 `--no-deps` 重建 `studio-api`、`studio-web`，API 重启后继续跟踪原转录任务。数据库新增 `automation_profiles.cover_font_id` 列。备份：`/vol1/1000/docker/folia-video-studio-backups/20260928-publish-page/`（含 SQLite 一致性快照）。
+
+- 2026-09-27：上线投稿模板“未选择不回退”修正。此前线上仍有三处回退到全局默认 `s9iw1rmff2`：规则列表响应、`ensure_publish_job()` 创建准备任务、创建/更新规则接口；前端编辑旧规则时也会用 `default_id` 预选芒芒模板，直接保存即误绑。现规则列表如实返回空 preset，未选择 preset 的规则不创建投稿准备任务，新建规则必须显式选择，编辑只沿用本规则已保存的 preset，前端不再预选。线上核对：芒芒仍为 `s9iw1rmff2`，小红泡-管珩心、赛蒂娅Sentia、清歌喵（穿黑丝直播给兄弟们看）三条规则为空待选择；`/api/publish-presets` 读取到 4 个真实模板；`/healthz` 中 `auto_publish_enabled=false`。重建时自动化队列空闲。新 API 镜像挂载源码运行 `test_publishing`、`test_automation` 共 32 项通过，Python 编译与 `node --check` 通过；重建 `studio-api` 和 `studio-web`，均健康，转录/渲染/模型容器未重启。NAS 账号 `hermes` 已由用户加入 docker 组。修改前文件备份：`/vol1/1000/docker/folia-video-studio-backups/20260927-preset-fallback-fix/`。
 
 - 2026-09-27：自动流水线规则增加“投稿主播 + BililiveTool 投稿模板”绑定。页面实时读取 `/api/preset/video` 并让每个主播选择模板，规则持久化 preset ID/名称；成片创建投稿任务时一并快照。旧规则未选择模板时等待选择，不会静默误用另一位主播的全局默认 preset，保存后由对账补建。准备阶段继承所选模板简介，并通过 BililiveTool `/api/bili/formatDesc` 展开 `{{now}}` 等变量，模板无简介时才回退 Folia 固定简介；已经冻结的历史 payload 不被静默改写。手动验收《日不落》已由 BililiveTool 完成上传，任务 `7e44efd0-3286-4c53-aeec-462d6738d27e`，AID `117342482861714`、BVID `BV1pBa86rEYc`，状态“开放浏览”。全局 `AUTO_PUBLISH_ENABLED` 继续保持 `0`，本次自动化代码仍不调用 `/api/bili/upload`。
 

@@ -15,24 +15,28 @@ def write_outputs(output_dir: Path, segments: list[dict[str, Any]], stats: dict[
         for segment_id, segment in enumerate(segments):
             segment["segment_id"] = segment_id
             stream.write(json.dumps(segment, ensure_ascii=False) + "\n")
-    with (output_dir / "transcript_words.jsonl").open("w", encoding="utf-8") as stream:
-        for segment_id, segment in enumerate(segments):
-            for word_index, word in enumerate(segment.get("words") or []):
-                stream.write(
-                    json.dumps(
-                        {
-                            "segment_id": segment_id,
-                            "word_index": word_index,
-                            "chunk_index": segment.get("chunk_index"),
-                            "text": str(word.get("text", "")),
-                            "start_ms": int(word.get("start_ms", 0)),
-                            "end_ms": int(word.get("end_ms", 0)),
-                            "timing_source": "qwen-forced-aligner",
-                        },
-                        ensure_ascii=False,
+    word_path = output_dir / "transcript_words.jsonl"
+    if any(segment.get("words") for segment in segments):
+        with word_path.open("w", encoding="utf-8") as stream:
+            for segment_id, segment in enumerate(segments):
+                for word_index, word in enumerate(segment.get("words") or []):
+                    stream.write(
+                        json.dumps(
+                            {
+                                "segment_id": segment_id,
+                                "word_index": word_index,
+                                "chunk_index": segment.get("chunk_index"),
+                                "text": str(word.get("text", "")),
+                                "start_ms": int(word.get("start_ms", 0)),
+                                "end_ms": int(word.get("end_ms", 0)),
+                                "timing_source": str(word.get("timing_source") or "qwen-forced-aligner"),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
                     )
-                    + "\n"
-                )
+    else:
+        word_path.unlink(missing_ok=True)
     (output_dir / "transcript.txt").write_text(
         "\n".join(
             f"{segment['start_text']} --> {segment['end_text']}  {segment['text']}"

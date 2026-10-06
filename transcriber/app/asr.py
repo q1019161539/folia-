@@ -3,14 +3,20 @@ from __future__ import annotations
 import ctypes
 import gc
 import json
+import time
+import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
 
 DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B"
+WHISPER_ENGINE = "whisper"
 
 
-def _matching_checkpoint(path: Path | None, chunks: list[dict[str, object]]) -> dict[int, dict[str, Any]]:
+def _matching_checkpoint(
+    path: Path | None, chunks: list[dict[str, object]], *, engine: str = "local", model: str = DEFAULT_MODEL
+) -> dict[int, dict[str, Any]]:
     if path is None or not path.is_file():
         return {}
     try:
@@ -26,6 +32,8 @@ def _matching_checkpoint(path: Path | None, chunks: list[dict[str, object]]) -> 
                 row.get("path") == str(Path(chunk["path"]))
                 and abs(float(row.get("offset", -1)) - float(chunk["offset"])) < 0.001
                 and abs(float(row.get("duration", -1)) - float(chunk["duration"])) < 0.001
+                and row.get("asr_engine", "local") == engine
+                and row.get("asr_model", DEFAULT_MODEL) == model
             ):
                 result[index] = row
         except (IndexError, KeyError, TypeError, ValueError):
@@ -59,7 +67,7 @@ def transcribe_chunks(
     progress: Callable[[int, int], None] | None = None,
     checkpoint_path: Path | None = None,
 ) -> list[dict[str, Any]]:
-    completed = _matching_checkpoint(checkpoint_path, chunks)
+    completed = _matching_checkpoint(checkpoint_path, chunks, engine="local", model=model_name)
     output: list[dict[str, Any]] = []
     model = None
     try:
@@ -101,6 +109,8 @@ def transcribe_chunks(
                     "duration": float(chunk["duration"]),
                     "language": getattr(result, "language", language) or language,
                     "text": (getattr(result, "text", "") or "").strip(),
+                    "asr_engine": "local",
+                    "asr_model": model_name,
                 }
             )
             _save_checkpoint(checkpoint_path, output)
@@ -111,3 +121,65 @@ def transcribe_chunks(
             del model
         _trim_memory()
     return output
+
+
+def _whisper_request(path: Path, worker_url: str) -> dict[str, Any]:
+    boundary = "folia-" + uuid.uuid4().hex
+    fields = {"language": "zh", "vad_filter": "false", "word_timestamps": "false"}
+    body = bytearray()
+    for key, value in fields.items():
+        body.extend(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
+    body.extend(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{path.name}"\r\n'
+        'Content-Type: audio/wav\r\n\r\n'.encode()
+    )
+    body.extend(path.read_bytes())
+    body.extend(f'\r\n--{boundary}--\r\n'.encode())
+    request = urllib.request.Request(
+        worker_url.rstrip("/") + "/recognize", data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=1800) as response:
+        return json.load(response)
+
+
+def transcribe_chunks_whisper(
+    chunks: list[dict[str, object]], *, worker_url: str, progress: Callable[[int, int], None] | None = None,
+    checkpoint_path: Path | None = None,
+) -> tuple[list[dict[str, Any]], str]:
+    with urllib.request.urlopen(worker_url.rstrip("/") + "/healthz", timeout=30) as response:
+        model_name = str(json.load(response).get("model") or "large-v3-turbo")
+    completed = _matching_checkpoint(checkpoint_path, chunks, engine=WHISPER_ENGINE, model=model_name)
+    output: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks):
+        if index in completed:
+            output.append(completed[index])
+        else:
+            path = Path(chunk["path"])
+            for attempt in range(3):
+                try:
+                    result = _whisper_request(path, worker_url)
+                    break
+                except Exception as exc:
+                    if attempt == 2:
+                        raise RuntimeError(f"Faster-Whisper 第 {index + 1} 块连续失败 3 次：{exc}") from exc
+                    time.sleep(3)
+            duration = float(chunk["duration"])
+            native_segments = []
+            for segment in result.get("segments") or []:
+                start = max(0.0, min(duration, float(segment.get("start", 0))))
+                end = max(start, min(duration, float(segment.get("end", 0))))
+                text = str(segment.get("text") or "").strip()
+                if text and end > start:
+                    native_segments.append({"start": start, "end": end, "text": text})
+            row = {
+                "index": index, "path": str(path), "offset": float(chunk["offset"]), "duration": duration,
+                "language": str(result.get("language") or "zh"),
+                "text": " ".join(item["text"] for item in native_segments),
+                "segments": native_segments, "asr_engine": WHISPER_ENGINE, "asr_model": model_name,
+            }
+            output.append(row)
+            _save_checkpoint(checkpoint_path, output)
+        if progress:
+            progress(index + 1, len(chunks))
+    return output, model_name

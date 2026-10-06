@@ -64,6 +64,7 @@
 
 - Whisper：CPU/int8，默认 `large-v3-turbo`。
 - Qwen：CPU/float32，模型 `Qwen/Qwen3-ForcedAligner-0.6B`。
+- Qwen 强制离线加载：worker 在导入 Hugging Face 相关库前设置 `HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1`，Compose 与 Workerfile 同时声明。模型仓库名先通过 `snapshot_download(local_files_only=True)` 解析本地快照，再把真实目录传给 Qwen，使模型和内部独立加载的 processor 都从本地取文件。支持 `ALIGNER_MODEL` 指定已有本地目录；加载前检查配置、权重、预处理与分词器文件，缺失时明确报“离线模型缓存不完整”，不会自动联网下载。安装或更换模型须提前准备缓存。
 - 视频工坊 worker 内的 Whisper 与 ForcedAligner 互斥常驻，切换时显式卸载并回收内存。
 - 自动整场转录使用现有 `local-worker` 的 Faster-Whisper，启动前先释放该 worker 上闲置的 Qwen/Whisper 模型；转录服务本身不再加载 Qwen3-ASR 或整场 ForcedAligner。切片后才在同一 worker 上加载 Qwen 处理该歌曲，避免两个大模型并存。
 - 整场 ASR 每完成一个 180 秒块就原子更新 `work/jobs/<run_id>/asr_chunks.json`。自动任务同时关闭外部分段和 Faster-Whisper 内部的语音 VAD，防止歌声被误删；手动转录任务保持原选项。复用断点还须校验引擎与模型，不能把旧 Qwen 块用作 Whisper 结果。

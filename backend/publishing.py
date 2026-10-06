@@ -66,7 +66,7 @@ class PublishSettings:
             output_legacy_root=Path(os.getenv("OUTPUT_LEGACY_ROOT", "/output-legacy")).resolve(),
             bililive_output_root=Path(os.getenv("BILILIVETOOL_OUTPUT_ROOT", "/app/Folia成片")),
             bililive_output_legacy_root=Path(os.getenv("BILILIVETOOL_OUTPUT_LEGACY_ROOT", "/app/历史Folia成片")),
-            cover_template_root=Path(os.getenv("COVER_TEMPLATE_ROOT", "/cover-templates")).resolve(),
+            cover_template_root=Path(os.getenv("COVER_TEMPLATE_ROOT", str(Path(os.getenv("DATA_ROOT", "/data")) / "cover-templates"))).resolve(),
             cover_output_root=Path(os.getenv("COVER_OUTPUT_ROOT", str(output_root / "publish" / "covers"))).resolve(),
             retry_base_seconds=max(10, int(os.getenv("PUBLISH_RETRY_BASE_SECONDS", "60"))),
             reconcile_lookback_seconds=max(300, int(os.getenv("PUBLISH_RECONCILE_LOOKBACK_SECONDS", "86400"))),
@@ -122,35 +122,50 @@ def stable_template_index(streamer: str, identified_title: str, template_count: 
     return int.from_bytes(digest[:8], "big") % template_count
 
 
-def list_cover_templates(root: Path) -> list[Path]:
-    generic = root / "generic"
-    allowed = {".jpg", ".jpeg", ".png", ".webp"}
-    return sorted(path for path in generic.iterdir() if path.is_file() and path.suffix.lower() in allowed) if generic.is_dir() else []
-
-
-def choose_cover_template(root: Path, streamer: str, identified_title: str) -> Path:
-    templates = list_cover_templates(root)
+def choose_cover_template(templates: list[Path], streamer: str, identified_title: str) -> Path:
+    if not templates:
+        raise PublishPrepareError(f"主播「{streamer}」还没有封面底图，请在投稿管理页上传后重试")
     return templates[stable_template_index(streamer, identified_title, len(templates))]
 
 
-def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    candidates = (
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "C:/Windows/Fonts/msyhbd.ttc",
-        "C:/Windows/Fonts/msyh.ttc",
-    )
-    for candidate in candidates:
+# (path, face index); index 2 is the Simplified Chinese face in the Noto CJK collections.
+CoverFont = tuple[str, int]
+BUILTIN_COVER_FONTS: dict[str, CoverFont] = {
+    "builtin-sans": ("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc", 2),
+    "builtin-serif": ("/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc", 2),
+}
+DEFAULT_COVER_FONT = "builtin-sans"
+
+
+def _font(size: int, font: CoverFont | None = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    if font:
         try:
-            return ImageFont.truetype(candidate, size=size)
+            return ImageFont.truetype(font[0], size=size, index=font[1])
+        except OSError as exc:
+            raise PublishPrepareError(f"封面字体无法读取：{Path(font[0]).name}") from exc
+    candidates = (
+        BUILTIN_COVER_FONTS["builtin-sans"],
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 2),
+        ("C:/Windows/Fonts/msyhbd.ttc", 0),
+        ("C:/Windows/Fonts/msyh.ttc", 0),
+    )
+    for path, index in candidates:
+        try:
+            return ImageFont.truetype(path, size=size, index=index)
         except OSError:
             continue
     return ImageFont.load_default(size=size)
 
 
-def _fit_lines(draw: ImageDraw.ImageDraw, text: str, max_width: int, max_lines: int = 2) -> tuple[list[str], Any]:
+def validate_cover_font(font: CoverFont) -> None:
+    rendered = ImageDraw.Draw(Image.new("RGB", (8, 8))).textbbox((0, 0), "封面", font=_font(40, font))
+    if rendered[2] <= rendered[0]:
+        raise PublishPrepareError("该字体无法绘制中文封面标题")
+
+
+def _fit_lines(draw: ImageDraw.ImageDraw, text: str, max_width: int, max_lines: int = 2, cover_font: CoverFont | None = None) -> tuple[list[str], Any]:
     for size in range(190, 71, -6):
-        font = _font(size)
+        font = _font(size, cover_font)
         lines: list[str] = []
         current = ""
         for char in text:
@@ -167,7 +182,7 @@ def _fit_lines(draw: ImageDraw.ImageDraw, text: str, max_width: int, max_lines: 
     raise PublishPrepareError("歌名过长，无法在封面上完整排版")
 
 
-def render_cover(template: Path, destination: Path, identified_title: str, streamer: str) -> Path:
+def render_cover(template: Path, destination: Path, identified_title: str, streamer: str, font: CoverFont | None = None) -> Path:
     if not identified_title.strip():
         raise PublishPrepareError("缺少 identified_title，无法生成封面")
     try:
@@ -191,7 +206,7 @@ def render_cover(template: Path, destination: Path, identified_title: str, strea
     overlay_draw.rounded_rectangle((115, 170, 1805, 910), radius=46, fill=(0, 0, 0, 108))
     image = Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
     draw = ImageDraw.Draw(image)
-    lines, title_font = _fit_lines(draw, identified_title.strip(), 1540)
+    lines, title_font = _fit_lines(draw, identified_title.strip(), 1540, cover_font=font)
     line_boxes = [draw.textbbox((0, 0), line, font=title_font, stroke_width=5) for line in lines]
     heights = [box[3] - box[1] for box in line_boxes]
     spacing = 28
@@ -201,7 +216,7 @@ def render_cover(template: Path, destination: Path, identified_title: str, strea
         width = box[2] - box[0]
         draw.text(((1920 - width) // 2, y), line, font=title_font, fill="white", stroke_width=5, stroke_fill=(0, 0, 0))
         y += height + spacing
-    streamer_font = _font(64)
+    streamer_font = _font(64, font)
     streamer_box = draw.textbbox((0, 0), streamer, font=streamer_font, stroke_width=3)
     draw.text(((1920 - (streamer_box[2] - streamer_box[0])) // 2, 790), streamer, font=streamer_font, fill=(236, 236, 236), stroke_width=3, stroke_fill=(0, 0, 0))
     destination.parent.mkdir(parents=True, exist_ok=True)

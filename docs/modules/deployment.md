@@ -89,6 +89,6 @@ docker compose exec lyrics-service curl -fsS http://127.0.0.1:8090/healthz
 
 工坊 `/media-output` 直接绑定新录播目录；历史切片下载缺失时回读统一媒体视图，生成切片时也检查历史同名文件以防遮盖旧项目。API 与原生渲染器 `/output` 绑定新成片目录；旧成片只读挂在 `/output-legacy`，历史输出接口优先新路径、缺失时回读旧成片。录播工具的历史成片入口为 `/app/历史Folia成片`。
 
-投稿准备另外将 `./cover_templates` 只读挂载到 `/cover-templates`，封面写入 `/output/publish/covers`。BililiveTool 已将新成片挂载为 `/app/Folia成片:ro`、旧成片挂载为 `/app/历史Folia成片:ro`，不复制 MP4。`BILILIVETOOL_PASSKEY` 只能放在部署 `.env`；Phase 1 保持 `PUBLISH_ENABLED=1` 与 `AUTO_PUBLISH_ENABLED=0`。`cover_templates/generic/placeholder-*` 只用于联调，自动真实投稿前必须替换为正式授权素材。
+投稿封面底图按主播存于 `./data/cover-templates/<规则 ID>/`（`COVER_TEMPLATE_ROOT=/data/cover-templates`，随 `./data` 可写挂载，由投稿管理页上传），生成的封面写入 `/output/publish/covers`；2026-09-28 起不再挂载 `./cover_templates`。BililiveTool 已将新成片挂载为 `/app/Folia成片:ro`、旧成片挂载为 `/app/历史Folia成片:ro`，不复制 MP4。`BILILIVETOOL_PASSKEY` 只能放在部署 `.env`；Phase 1 保持 `PUBLISH_ENABLED=1` 与 `AUTO_PUBLISH_ENABLED=0`。旧 `cover_templates/generic/placeholder-*` 只是联调占位，已不参与投稿；各主播底图应使用有授权的正式素材。
 
 配置、代码与 SQLite 一致性备份：`/vol1/1000/docker/folia-video-studio-backups/20260926-vol2-video-paths/`。回退时恢复两份 Compose 和 `app.py` 并重建对应服务，勿删除第二块硬盘已经生成的视频。切换录播工具前必须正常停止录制并等待转封装任务完成，再恢复原正在录制的房间。

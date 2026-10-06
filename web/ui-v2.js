@@ -92,6 +92,9 @@
   makePanel($('#automationPage .automation-profiles'), 'automation-profiles');
   makePanel(overview, 'automation-queue');
   makePanel($('#automationPage .automation-runs'), 'automation-runs');
+  makePanel($('#publishPage .publish-streamers'), 'publish-streamers');
+  makePanel($('#publishPage .publish-fonts'), 'publish-fonts');
+  makePanel($('#publishPage .publish-jobs'), 'publish-jobs');
   function syncPanels() {
     for (const panel of panels) {
       const shown = panel.open || (mobile.matches && panel.stepHeader);
@@ -119,7 +122,7 @@
     try { sessionStorage.setItem('folia-mobile-steps', JSON.stringify(Object.fromEntries(steps.map(step => [step.key,step.open])))); } catch {}
   }
 
-  const navIcons = {showStudio:'♫',showClips:'✂',showAutomation:'◉'};
+  const navIcons = {showStudio:'♫',showClips:'✂',showAutomation:'◉',showPublish:'↑'};
   for (const [id,icon] of Object.entries(navIcons)) {
     const button = $('#'+id),label = button.textContent;
     button.innerHTML = `<span class="workspace-icon" aria-hidden="true">${icon}</span><span class="workspace-label">${label}</span>`;
@@ -162,6 +165,6 @@
   let workspace = 'studio';
   try { workspace = sessionStorage.getItem('folia-workspace') || 'studio'; } catch {}
   if (mobile.matches && workspace === 'transcriber') workspace = 'studio';
-  if (!['studio','clips','transcriber','automation'].includes(workspace)) workspace = 'studio';
+  if (!['studio','clips','transcriber','automation','publish'].includes(workspace)) workspace = 'studio';
   showWorkspace(workspace);
 })();

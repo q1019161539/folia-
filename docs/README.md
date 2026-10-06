@@ -13,6 +13,7 @@
 | 歌词特效、透明叠加、预览、成片 | `modules/lyrics-preview-render.md` | `effects/src/`、`web/`、`backend/app.py` |
 | 时间轴文档、批量切歌、中止 | `modules/batch-clips.md` | `web/clips.js`、`backend/app.py` |
 | 主播监听、自动判歌、整套自动出片 | `modules/automation-pipeline.md` | `web/automation.js`、`backend/automation.py`、`backend/app.py` |
+| 投稿管理：主播模板、封面底图、封面字体、字体库 | `modules/automation-pipeline.md`（投稿管理页） | `web/publish.js`、`backend/publishing.py`、`backend/app.py` |
 | Docker、端口、挂载、升级、故障 | `modules/deployment.md` | `compose.yaml`、`backend/*file`、`nginx/` |
 | 服务关系、数据流、目录用途 | `ARCHITECTURE.md` | 全局 |
 | 为什么这样设计 | `DECISIONS.md` | 全局 |

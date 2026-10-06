@@ -4,14 +4,16 @@ function showWorkspace(name){
  const clips=name==='clips';
  const transcriber=name==='transcriber';
  const automation=name==='automation';
- const studio=!clips&&!transcriber&&!automation;
- $('#studioPage').hidden=!studio;$('#studioNav').style.display=studio?'':'none';$('#clipPage').hidden=!clips;$('#transcriberPage').hidden=!transcriber;$('#automationPage').hidden=!automation;
- $('#showStudio').classList.toggle('active',studio);$('#showClips').classList.toggle('active',clips);$('#showTranscriber').classList.toggle('active',transcriber);$('#showAutomation').classList.toggle('active',automation);
+ const publish=name==='publish';
+ const studio=!clips&&!transcriber&&!automation&&!publish;
+ $('#studioPage').hidden=!studio;$('#studioNav').style.display=studio?'':'none';$('#clipPage').hidden=!clips;$('#transcriberPage').hidden=!transcriber;$('#automationPage').hidden=!automation;$('#publishPage').hidden=!publish;
+ $('#showStudio').classList.toggle('active',studio);$('#showClips').classList.toggle('active',clips);$('#showTranscriber').classList.toggle('active',transcriber);$('#showAutomation').classList.toggle('active',automation);$('#showPublish').classList.toggle('active',publish);
  document.body.dataset.workspace=name;
  try{sessionStorage.setItem('folia-workspace',name)}catch{}
- for(const [key,id] of [['studio','showStudio'],['clips','showClips'],['transcriber','showTranscriber'],['automation','showAutomation']]){$('#'+id).setAttribute('aria-current',key===name?'page':'false')}
+ for(const [key,id] of [['studio','showStudio'],['clips','showClips'],['transcriber','showTranscriber'],['automation','showAutomation'],['publish','showPublish']]){$('#'+id).setAttribute('aria-current',key===name?'page':'false')}
  if(clips)loadClipFiles().catch(e=>toast(e.message));
  if(automation)openAutomation();
+ if(publish)openPublish();
 }
 function clipHms(value){let s=Math.max(0,Math.round(Number(value)||0));return `${String(Math.floor(s/3600)).padStart(2,'0')}:${String(Math.floor(s/60)%60).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`}
 function clipSeconds(value){let p=String(value).trim().split(':').map(Number);if(p.length===2)return p[0]*60+p[1];if(p.length===3)return p[0]*3600+p[1]*60+p[2];return NaN}
