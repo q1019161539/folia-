@@ -1,0 +1,3 @@
+services:
+  fullstack:
+    image: folia-bililive-before-season:20261013

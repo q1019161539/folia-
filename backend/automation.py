@@ -9,6 +9,14 @@ from typing import Any
 MIN_RECORDING_BYTES = 1024 ** 3
 
 
+def render_output_mode(profile: dict[str, Any]) -> str:
+    """Old profiles stay fast; smooth is MP4-only, never the alpha/MOV export."""
+    mode = profile.get('render_output_mode') or 'fast'
+    if mode not in ('fast', 'smooth'):
+        raise ValueError('自动成片只支持 fast 或 smooth MP4')
+    return mode
+
+
 def automation_transcriber_payload(
     input_path: str, run_id: str, stage: str = "all", chunk_seconds: int = 180
 ) -> dict[str, Any]:

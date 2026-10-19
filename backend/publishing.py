@@ -1,7 +1,6 @@
-"""Phase 1 preparation for publishing rendered Folia clips through BililiveTool.
+"""Metadata, legacy cover helpers, and the verified BililiveTool 3.18.0 client.
 
-This module deliberately has no upload method.  Phase 1 may read a preset and
-validate a merged config, but it cannot create a BililiveTool upload task.
+All real Bilibili login, upload and submission operations belong to BililiveTool.
 """
 
 from __future__ import annotations
@@ -297,9 +296,9 @@ class BililiveToolClient:
         try:
             response = self._client.request(method, path, **kwargs)
         except httpx.RequestError as exc:
-            raise PublishRetryableError(f"BililiveTool 暂时无法访问：{exc}") from exc
+            raise PublishRetryableError("BililiveTool 暂时无法访问") from exc
         if response.status_code >= 500:
-            raise PublishRetryableError(f"BililiveTool HTTP {response.status_code}：{response.text[:500]}")
+            raise PublishRetryableError(f"BililiveTool HTTP {response.status_code}")
         return response
 
     def get_video_preset(self, preset_id: str) -> dict[str, Any]:
@@ -345,6 +344,59 @@ class BililiveToolClient:
         if response.status_code != 200 or response.text.strip() != "success":
             raise PublishPrepareError(f"BililiveTool 投稿参数校验返回异常：HTTP {response.status_code} {response.text[:1000]}")
         return result
+
+    def list_upload_tasks(self):
+        response=self._request('GET','/task',params={'type':'bili'})
+        if response.status_code!=200: raise PublishPrepareError('BililiveTool任务列表读取失败')
+        data=response.json()
+        if not isinstance(data,dict) or not isinstance(data.get('list'),list):
+            raise PublishPrepareError('BililiveTool任务列表格式无效')
+        return data['list']
+
+    def create_upload(self,payload):
+        response=self._request('POST','/bili/upload',json=payload)
+        if response.status_code!=200: raise PublishPrepareError(f'BililiveTool提交失败 HTTP {response.status_code}')
+        try: task_id=response.json()['taskId']
+        except (ValueError,KeyError,TypeError) as exc:
+            raise PublishRetryableError('BililiveTool提交响应缺少taskId，稍后恢复匹配') from exc
+        if not isinstance(task_id,str) or not task_id:
+            raise PublishRetryableError('BililiveTool提交taskId无效，稍后恢复匹配')
+        return task_id
+
+    def get_upload_task(self,task_id):
+        response=self._request('GET',f'/task/{task_id}')
+        if response.status_code in (204,404): return None
+        if response.status_code!=200: raise PublishPrepareError('BililiveTool任务查询失败')
+        data=response.json() if response.content else None
+        if data is not None and not isinstance(data,dict): raise PublishPrepareError('上传任务格式无效')
+        return data
+
+    def collection_capabilities(self):
+        response=self._request('GET','/bili/folia-season/capabilities')
+        if response.status_code!=200: raise PublishRetryableError('BililiveTool合集跟踪适配未就绪')
+        data=response.json()
+        if not isinstance(data,dict) or data.get('version')!=1 or data.get('durable') is not True:
+            raise PublishPrepareError('BililiveTool合集适配协议不匹配')
+        return data
+
+    def collection_job(self,aid,uid):
+        response=self._request('GET',f'/bili/folia-season/{aid}',params={'uid':uid})
+        if response.status_code==404: return None
+        if response.status_code in (400,401,403): raise PublishPrepareError('BililiveTool合集检查参数或鉴权失败')
+        if response.status_code!=200: raise PublishRetryableError('BililiveTool合集记录暂时不可读')
+        data=response.json()
+        if not isinstance(data,dict) or str(data.get('aid'))!=str(aid) or str(data.get('uid'))!=str(uid):
+            raise PublishPrepareError('BililiveTool合集记录身份不匹配')
+        if data.get('status') not in ('pending','processing','verifying','retry','joined','failed'):
+            raise PublishPrepareError('BililiveTool合集状态无效')
+        return data
+
+    def archive_detail(self,aid,uid):
+        response=self._request('GET','/bili/platformArchiveDetail',params={'aid':aid,'uid':uid})
+        if response.status_code!=200: raise PublishPrepareError('BililiveTool稿件详情读取失败')
+        data=response.json()
+        if not isinstance(data,dict) or not isinstance(data.get('archive'),dict): raise PublishPrepareError('稿件详情缺少archive')
+        return data
 
 
 def json_text(value: Any) -> str:

@@ -152,14 +152,14 @@ class PathAndPayloadTest(unittest.TestCase):
     def test_empty_preset_description_uses_deterministic_fallback(self):
         self.assertEqual(preset_description_template({"config": {"desc": "", "tid": 138}}, "fallback"), "fallback")
 
-    def test_payload_shape_contains_no_secret_and_never_uploads(self):
+    def test_payload_shape_contains_no_secret_or_source_delete(self):
         payload = build_payload(181647901, "/app/Folia成片/a.mp4", "离人赋", {"title": "t"})
         self.assertEqual(payload["videos"], [{"path": "/app/Folia成片/a.mp4", "title": "离人赋"}])
         self.assertEqual(payload["options"], {"removeOriginAfterUploadCheck": False})
         self.assertNotIn("passkey", json.dumps(payload).lower())
-        module = Path(__file__).with_name("publishing.py").read_text(encoding="utf-8")
-        self.assertNotIn("/bili/upload", module)
-        self.assertIn("auto_publish_enabled=False", Path(__file__).read_text(encoding="utf-8"))
+        v2 = Path(__file__).with_name("publish_v2.py").read_text(encoding="utf-8")
+        self.assertIn('if self.settings.auto_publish_enabled',v2)
+        self.assertIn('pipeline_version=2',v2)
 
 
 class ClientTest(unittest.TestCase):
@@ -208,9 +208,10 @@ class PersistenceContractTest(unittest.TestCase):
         create = APP.split("def create_automation_profile", 1)[1].split("def update_automation_profile", 1)[0]
         self.assertIn("publish_streamer,bililive_preset_id,bililive_preset_name", create)
         handoff = APP.split("def ensure_publish_job", 1)[1].split("def reconcile_publish_jobs", 1)[0]
-        self.assertIn("profile.get('publish_streamer')", handoff)
-        self.assertIn("profile.get('bililive_preset_id')", handoff)
-        self.assertIn("if not preset_id:\n        return None", handoff)
+        v2 = Path(__file__).with_name('publish_v2.py').read_text(encoding='utf-8')
+        self.assertIn("profile.get('publish_streamer')", v2)
+        self.assertIn("profile.get('bililive_preset_id')", v2)
+        self.assertIn("未绑定主播投稿模板", v2)
         self.assertNotIn("or PUBLISH_SETTINGS.bililive_preset_id", handoff)
         update = APP.split("def update_automation_profile", 1)[1].split("\n@app.", 1)[0]
         for route in (create, update):

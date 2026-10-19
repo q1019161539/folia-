@@ -1,6 +1,6 @@
 # 架构说明
 
-当前实现基线：2026-10-06。历史改动与验收记录见 STATUS.md，不应把历史规则当成当前规则。
+当前实现基线：2026-10-07。历史改动与验收记录见 STATUS.md，不应把历史规则当成当前规则；投稿V2仍需两首验收后开放上线水位。
 
 ## 服务关系
 
@@ -14,17 +14,22 @@ studio-api
   ├─ lyrics-service：LDDC，QQ/酷狗/网易云/LRCLIB
   ├─ transcriber：整场 ASR、按需人声分离重识别、结果与通知
   ├─ folia-renderer：原生预览与三种成片输出
-  ├─ DeepSeek：歌曲范围分析；全曲时间轴重排默认关闭
+  ├─ 标题接口 gpt-6.1-sol：整场歌曲范围分析；DeepSeek备用，全曲时间轴重排默认关闭
   ├─ ACRCloud（默认）/Shazam：歌曲指纹身份
-  └─ BililiveTool：读取 preset、格式化简介、校验投稿参数；不自动上传
+  ├─ GPT封面API：免费选帧后生成完整封面，单首最多两次（请求模型名不证明后端）
+  └─ BililiveTool：读取preset、格式化简介、校验、创建/查询上传任务、稿件详情
 ```
 
 ## 自动数据流
 
 录播稳定性检查 → 整场 180 秒块 Whisper ASR（无 VAD、无整场 Qwen）
-→ DeepSeek 返回首尾句段 ID → 本地校验并计算毫秒 → FFmpeg 流复制切片
+→ gpt-6.1-sol 返回首尾句段 ID（失败转DeepSeek）→ 本地校验并计算毫秒 → FFmpeg 流复制切片
 → 导入切片相对 ASR → 单曲 Qwen 逐字证据 → 指纹认歌
-→ 标准歌词版本评分 → 唯一全曲偏移 → 渲染完整 MP4 → 独立投稿准备 → ready。
+→ 标准歌词版本评分 → 唯一全曲偏移 → 渲染完整MP4
+→ 独立歌曲项目归档/同主播同歌去重 → 高置信/模板/上线白名单检查
+→ 免费选帧 → GPT封面 → preset快照/校验 → BililiveTool上传 → AID完成、BVID/审核另存。
+
+旧pipeline_version=1任务不由V2worker执行；日不落已投稿去重记录不因稿件删除重投。当前验收结果、网络阻塞与开关范围见STATUS.md和modules/automatic-publishing.md。
 
 标准逐字成品轴使用平台原始字时间加同一个偏移；Qwen 只提供定位证据，不能逐字回写平台节奏。逐字证据不足先按需分离人声重识别，仍不可靠则明确失败，不静默退为逐句偏移。
 

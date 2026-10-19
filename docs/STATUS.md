@@ -1,14 +1,280 @@
 # 当前状态
 
-最后整理：2026-10-06
+最后整理：2026-10-19
+
+## 2026-10-19 GitHub 最新源码同步与凭据检查
+
+- 用户要求同步 NAS 当前源码以便分享，并检查 AI Key 泄露。从 NAS Git 源码副本建立独立审核树，核对业务源文件与生产目录一致；不覆盖生产 .env/数据库/媒体，不重启或中断任务。合入此前仅在 NAS 保存的自动投稿 V2、AI 封面/标题、6.1-sol 判歌、响度筛查、重制、SQLite WAL、合集适配及相关测试/模块文档；一次性运维源码保留，运行制品不提交。
+- 同步前全可达历史37次提交/335个blob和235个候选路径检查，当前运行配置8项敏感值在NAS内精确比对也无命中。Gitleaks的15项均为两个公开字面量误报，仅精确豁免；没有发现需要通过历史重写清除的真实凭据，不强推或改变仓库私有状态。
+- 新增SECURITY.md、离线密钥守卫及GitHub Actions全历史扫描；加强忽略规则/构建上下文，补全无密钥.env.example。分享版AUTO_PUBLISH_ENABLED默认0、账号/模板默认空；生产compose/.env原样保留，不自动部署。README修正已落后的“仅ready”说明，明确尚无Windows免安装版本及NAS路径/外部服务/素材授权边界。
+- 隔离断网/只读源码容器使用当前API镜像执行后端全量418项，全部通过；首次416项中的4项仅因test_publish_control夹具漏引入primary_cover_configured，修复夹具并新增Gemini主用的允许/拒绝及不泄密用例，不改运行行为。离线安全守卫5项通过；122个Python文件AST解析、Compose/工作流结构、Dockerfile显式COPY路径、Git暂存差异检查通过，当前文件及全历史复扫均无真实凭据。健康检查仍正常。最终同步提交以GitHub提交记录为准；不把扫描通过等同于完整依赖或渗透审计，不在仓库保存未脱敏凭据。
+
+## 2026-10-19 用户指定《要抱抱_02》投稿（已完成）
+
+- 用户取消两遍合唱制作（此前仅只读调查，未启动合唱渲染），明确要求上传今天第二遍。核对项目3d18a332b1ed4dd6b0b42e7687242a72完整high、非样片，实际202871135字节；17日同名旧稿记录已删除，创作中心172条无同名稿，今天两遍均因旧song_key记录而duplicate。只显式放行第二遍，第一遍及其他歌曲去重/水位/开关不变。
+- 新投稿78cdc33b66245535a54bf8738175521b，taskId=c189e348-c08d-4334-868e-9f3a1a2276b6，AID117467137443746，BV12HnJ6HEN3，上传100%/completed/success，合集9133790已joined，初查审核中。稿件详情HTTP500但创作中心MID/AID/标题精确匹配取得BVID，不能因查询异常重投。
+- 复用成功封面和AI标题“💗鼓起勇气，来抱抱｜《要抱抱》｜【小红泡-管珩心】翻唱”，0次新AI请求／封面累计仍1。继承本主播preset ign19v4u95a及formatDesc，日期为2026.10.19，保留合集及策略；第二遍identified_artist为空，不拿候选艾辰或旧稿璟年补身份。视频/封面Bililive共享路径实测size+mtime_ns一致，源删除选项false，参数校验HTTP200 success。
+- 独立ops/publish-yaobaobao02-20261019/once.py，经现有客户端仅一次真实POST；先持久化次数／专用accepted receipt，再交接DB。实际第一次返回任务ID后通用checkpoint因尚无song关联报错，专用receipt已存；核对该task已completed后从receipt恢复，无再次POST，submit_attempts=1。通用checkpoint已移至歌曲主关联交接之后。旧任务ID/AID/BVID/身份/原视频/标题/简介/payload完整保留，仅唯一主关联转到新记录；歌曲两次演唱及旧发布历史不删除。
+- 一致性DB备份integrity_check=ok、原行／payload／共享路径／receipt／result／verification保留于/data/publish-template-backups/yaobaobao02-20261019，备份及凭据不入Git。Python语法、4项断网防重复提交定向测试通过；实际原视频和封面stat/hash、旧投稿核心字段保持不变，healthz正常。无新增后端运行模块／镜像变更，无服务重启、ASR中断或合唱输出；仅同步本任务运维源码/文档到NAS Git副本，不自动提交推送。
+
+## 2026-10-19 小红泡温柔教练反差精剪（单次视频制作，已完成）
+
+- 用户授权将当天“我脾气很好／最温柔的教练”与实际游戏后的反应做成完整反差切片，可使用特效。只读提取三段现有整场ASR及录播：12-35-23、13-31-56、15-02-01。14个剪辑镜头串起立人设、温柔教学、夸夸教育、调整心态、十五字缩到五字、生气、降火下播，开头预告和结尾宣言回放明确标记，未伪称时间连续。
+- 独立运维脚本ops/contrast-20261019，既有API镜像中的FFmpeg/libass/Noto CJK字体；无新后端模块或Dockerfile变更。隔离容器network=none、1CPU/2GiB、低CPU权重，录播挂载只读，仅新的歌曲切片专属目录可写。数据库由宿主只读提取所需ASR快照，渲染容器不挂生产数据库；不重启或取消生产任务、不改投稿开关、不生成publish_job、不调用任何AI或投稿接口。
+- 样式包括重点字幕弹出、阶段提示、15字→5字、轻微画面震动及结尾低饱和回放；保留原声、不加BGM。字幕基于现有ASR与少量明显文字修正，妹妹回应使用独立颜色／标记；不声称已逐句人工听校或完成说话人识别，原转录快照完整保留。最终两处切口收紧，避免带入下一句话，基础版与缓存保留。
+- Python语法、4项定向测试通过（镜头时间／顺序、ASS转义／时间、妹妹字幕分离、已开始时间线不可静默变更）；真实ASS/字体试渲染通过，基础版及最终版全片解码均通过。最终115.084秒、1920×1080/30fps/H264+AAC48k双声道、73180972字节，音视频起点均0，时长差11ms；三个源文件size+mtime_ns与制作前一致。最终字幕画面另抽14张供目检，原声和ASR个别字仍待用户试听复核。
+- NAS最终文件：/vol2/1000/video/Folia录播/小红泡-管珩心/2026-10-19/歌曲切片/温柔教练_反差精剪_v1/小红泡_最温柔的教练_反差精剪.mp4；剪辑清单、ASS、原ASR、基础版和result-final.json同目录。另复制本机output/contrast-20261019供直接查看。原录播及之前两条无损素材不动，不自动投稿，不推送GitHub。
+
+## 2026-10-18 小红泡去重长篇单集（后台生成中，未完成）
+
+- 用户明确选择全部已完成成片、按同歌去重、歌曲首尾顺畅衔接。只读盘点173个已完成工坊项目，兼容/output与/output-legacy，不局限于投稿关联85首；去重23个版本后保留148条。仅排除1个实际缺失文件与1个明确标为“我好想你-前奏”的非完整演唱片段。旧版缺identified_title不从jobs.title/歌词候选补写身份，只用原输出目录作“旧版待核对”显示标签，保留8条未核对标题；所有原数据库身份、视频、已投稿结果均不改。
+- 合集专属manifest冻结源项目/身份/路径/size/mtime、歌词边界、质量与去重依据；同歌优先高置信、已投稿、逐帧版本。同名归一与大段完全一致歌词辅助发现别名；旧读心术目录名与已确认标题一致且歌词相似0.9128，保留新版；另人工对照完整首尾歌词确认旧误标Can't Stand It实际与高置信《讨厌》同歌（相似0.9349），仅从合集清单移除旧重复条目，不改旧项目identified_*。无同名明确歌手/歌词冲突。歌单按录播日期/源路径编排，不伪称情绪/BPM/调性自动排序。
+- 独立CPU-only工具ops/compilation-20261018/compilation.py，不改后端API/前端/镜像/自动投稿开关。整体响度分析后施加恒定增益（目标-18 LUFS、峰值余量-1.5 dB，增益限定-24至+12dB，峰值限制时不保证每首精确达到目标）；不变速/变调。只有显式成片trim元数据能投影歌词边界、两侧有安全余量时才做≤0.8秒画面叠化/音频线性交叉淡化；证据不足的旧片不叠人声，改用短画面淡出淡入及10ms音频防爆音。原成片含歌词直接保留，不重新ASR/对轴/生图或改歌词。
+- 实现按歌曲主体/短转场逐段H264+无损PCM缓存，统一1080p30、片段禁B帧，最后视频流复制＋连续AAC封装为单个MP4，生成内嵌章节和歌单时间轴；部分失败/重启可复用完整缓存，.partial不替代成功输出。新增文件是只读挂载的独立运维任务，不是后台新运行模块，因此无需改逐文件COPY的backend/Dockerfile，实际容器导入/执行已验证。
+- Python语法及4项测试通过（含真实FFmpeg三段合成、两次交叉淡化、章节、7.4秒时长、音画起点、无边界淡入淡出、源stat变化拒绝、生产重任务SIGSTOP/SIGCONT只作用于本任务进程组）。最初xfade真实测试暴露帧率1/0，已在滤镜尾部重新fps=30统一；最终4项OK（2.207秒）。真实《回到过去→退后》《退后→爱琴海》两个540p/23.2秒试片均完整解码通过，H264/AAC起点和时长完全一致；叠化中间帧已目检。仅这些短片完成验收，不能误称8小时长版已完成或全片已验收。
+- 独立容器folia-xhp-compilation-render-20261018已启动，1核CPU/2GiB/低CPU权重，源/output与/output-legacy只读，仅合集目录可写。读取生产health的heavy_task_slot，忙或不可观测时等待/暂停本任务FFmpeg，空闲恢复，不取消或重启ASR/渲染/投稿。实际已处理首条并进入第二条，清单预计28905.133秒（约8:01:45），尚未完成；进度progress.json与completed-tracks.json、结果result.json在合集目录，不能只因容器running就说已生成。
+- NAS目录：/vol2/1000/video/Folia成片/小红泡-管珩心/歌曲长篇合集/2026-10-18。预期成片名小红泡_歌曲长篇合集_去重.mp4，完成才写result.json和歌单时间轴.txt。两个试片另已复制到本机output/compilation-20261018/transition-01.mp4及transition-02.mp4。运维脚本/文档同步NAS Git源码副本，不自动提交推送；不注册publish_job，不产生真实上传或额外AI请求。
+
+## 2026-10-15 完整参考图/无话筒图库（已部署）
+
+- 用户要求取消本地截半身，提供完整参考图，让AI优先半身但适合歌曲时允许全身。人工复核正比10张/Q版6张：带话筒正比22-50-32、22-50-44、22-57-04、22-57-12，Q版22-53-55共5张排除出新库，原文件不删；此前固定22-50-32确实带麦。其余6张正比原PNG作默认池，5张Q版无麦原图单独保留不启用。诊断缩略图仅本机审阅，绝不用于生产输入；新库复制原PNG并逐字节/指纹核对，无裁切/缩放/重编码。
+- cover_fallback.provided_reference新增主播references池，显式人工无麦标记、指纹校验及SHA256(主播键+NUL+歌曲键)稳定映射；publish_v2传权威归一歌曲键。新参考type=provided-transparent-full，crop=null，保存source/frame一致SHA及ID；未知主播不串图，配置坏/含未确认或带麦项终止。构图提示改为优先半身、可按歌曲内容和氛围全身，不再禁止腿部。保留旧crop兼容，不重做已有封面/原图缓存或已投稿任务，不重置次数。
+- Python语法、19项相关断网回归通过（8.841秒），覆盖整图字节/尺寸/透明度、稳定选择/顺序无关/歌曲间变化、带麦/未复核/损坏拒绝、身份保护、主用/备用、缓存/重启和10次预算。运行模块未新增，既有Dockerfile COPY已覆盖。源码/11张无麦原图/人工复核清单在ops/reference-full-20261015/stage；线上/data/cover-references/references.json已迁移到full-v1的6张正比全图池，Q版5张仅保留。旧固定带麦素材与历史裁剪副本保留不删，但新库不再选择。
+- 首次更新预检发现新整场ASR“17-07-16_【歌杂】这小牛烧心.mp4”正在运行，安全停止；先完成只读SQLite一致性备份（integrity_check=ok）及配置/源码/回滚镜像备份。随后用户明确授权“允许中断，现在部署”：保存14e3da799687468594b42f72d11a80fd原行，通过既有cancel入口确认cancelled后才重建API。新镜像56175dc27d57fc636848773411efbbe03a56d08c5a96670be0b92c1dfcb10a1f，镜像内app/构图指令导入通过，/healthz ok；只更新API，未重启转录、渲染、录播、Bililive或Web。再调用原流水线retry入口恢复为queued/retrying，保留原source/profile和transcriber工作关联；不声称从未中断或保证每个ASR计算步骤都不重做。中断/恢复快照及备份位于ops/reference-full-20261015/backup，代码/文档同步NAS Git副本，不自动提交推送，密钥/图片/DB不进入Git。
+- 查询确认前次恢复的小红泡10首均已completed取得AID和BVID，全部Gemini生成；本次不动这些封面/投稿结果。左手指月BV1g8Jy6FEip、海屿你BV1h8Jy6FETa、嘉宾BV14qJy6sEni、看着我的眼睛说BV1TqJy6sELQ、天涯BV1g8Jy6FEDQ、My WorldBV12qJy6sEDR、人间不值得BV1xBJy69Ehr、想她BV14BJy69ETR、第二杯半价BV1xBJy69E8t、勾指起誓BV1MeJy64EjA。
+
+## 2026-10-15 Gemini改为封面主用，小红泡10首恢复（已部署）
+
+- 用户要求将已验证的Gemini改为主用。新增COVER_PRIMARY_PROVIDER配置，NAS.env设gemini；第一笔实际新生图直接使用原生gemini-3-pro-image-preview/imageSize=2K/16:9，不再等待GPT累计>5。继续使用既有环境中的Gemini密钥，不复制/输出密钥，GPT配置保留但不自动回切已403的通道。配置默认gpt兼容旧部署，非法值或Gemini未启用/缺密钥明确停止。控制接口、启用门槛及投稿页按主通道显示，不再硬性依赖GPT密钥；标题仍gpt-6.1-sol不变。
+- 小红泡2026-10-15新建10首均因GPT403、累计1–5次终态而未触发原备用。经用户单独授权，只将明确10个无taskId/AID/BVID/提交次数、无封面/payload、绑定bilibili:2516117的原任务恢复pending；不新建投稿行、不清累计次数、不改身份/原MP4/已生成AI标题/模板/水位或其他旧失败。歌曲为勾指起誓、第二杯半价、想她、人间不值得、My World、天涯、看着我的眼睛说、嘉宾、海屿你、左手指月。记录ops/gemini-primary-20261015/released.json；恢复入队不等于上传完成，实际结果查投稿状态。
+- 保留每歌曲累计10次、并发1、600秒无隐藏重试、原图/成功封面缓存和重启恢复、用户半身透明参考与书名号可选。Gemini鉴权/明确参数错误继续终态，不改成无限重试；Bililive故障不重新生图，已接受/已完成不重投。新Python模块未增加，既有Dockerfile已显式COPY三个运行模块。
+- Python/JS语法、4组页面主用/配置状态用例通过，隔离断网147项完整回归通过（341.086秒）。新镜像内app/主用选择/配置门槛导入通过。备份SQLite一致性快照integrity_check=ok，原配置/源码/回滚镜像保留于ops/gemini-primary-20261015/backup；两次部署检查重任务/render和准备/提交/上传均空闲，只更新API/Web，ASR、renderer、录播和Bililive容器未重启。API镜像f6c5c7dab10096dc550491285df556e94b459c82dc3a2d15083dec2528627582，Web449a183051f1a96b6ca7a80ed970b42261ddefda55afd04904400ec9f5e07bb5，/healthz ok，运行控制确认cover_primary_provider=gemini、cover_max_attempts=10、title_model=gpt-6.1-sol。相关代码/测试/文档同步NAS Git副本，不自动提交或推送，备份/密钥/运行制品不入Git。
+
+## 2026-10-15 封面书名号可选（已部署）
+
+- 用户认可无书名号封面并授权部署；publish_v2.PROMPT改为左侧完整写出准确歌名，书名号可加可不加，由AI根据排版决定。人物身份、自然表情动作、右侧人物、独立歌曲背景及半身近景要求保留，GPT/Gemini共用。投稿AI标题/固定标题里的《歌名》不改，权威身份不改。只作用于后续实际新生图，不清已有封面/原图缓存/冻结payload，不重置次数或重新投稿，没有额外付费验证请求。
+- Python语法检查通过；隔离断网完整144项回归通过（230.966秒），覆盖提示词、投稿标题保留书名号、身份保护、成功封面缓存及累计预算。首轮测试夹具缺少7个测试模块，核心62项通过但整组报缺模块；补齐后完整重跑144项OK，不把夹具错误当成业务故障。
+- 部署前两次确认重任务/render及准备/提交/上传均空闲，SQLite一致性备份integrity_check=ok，保存原配置/源码和回滚镜像folia-api-before-cover-brackets:20261015；仅更新studio-api，未中断ASR或重启其他服务。新镜像da1fad223467772cc88cf4b23c83e8b3ae1f67164b3659cb5927661ce5ee5a0e，镜像内app/提示词/半身指令导入通过，/healthz ok、容器healthy，投稿开关保持原值。运维记录及备份位于ops/cover-brackets-20261015，凭据不入Git；同步NAS Git副本，不自动提交或推送。
+
+## 2026-10-15 原生Gemini 2K验证通过，备用已部署并恢复4首
+
+- 用户要求先验证真2K再部署。以同一小红泡半身透明参考和《游园惊梦》提示词，单次原生POST /v1beta/models/gemini-3-pro-image-preview:generateContent，generationConfig.imageConfig={aspectRatio:16:9,imageSize:2K}、responseModalities=[TEXT,IMAGE]、candidateCount=1；HTTP200、88.52秒，接口原图JPEG2752×1536/2741342字节，SHA256 f166798c2a12f051ebe575d3ea37a21d3b0b5d2f527e3c424c4e9f5b07e47886。无本地放大/叠字/去水印。返回无modelVersion且usage含estimated标记，不据请求名/估算用量证明后端或计费。此图漏《》，已明确告知，仍无OCR/付费视觉。
+- 因原生尺寸参数已验证，备用改为此协议，不再用兼容chat路径；只接受一张非thought的inlineData原图，验证最低2048×1152和横版比例，低分辨率/坏图在原累计预算内按退避处理，不静默降级或放大。逐笔attempt-N.json同时记录实际请求配置。144项断网全量回归通过（104.622秒），8项原生协议定向回归通过，新镜像782d977de3d5966f6fa0454b0e95977f0895dbdda7124f0a3b6fb4b8fa200f81，模块/app导入、运行时配置/5次边界/人物绑定检查通过。
+- 用户明确允许中断当前ASR，但现场核对时整场转录已completed，流水线正在后续analyzing。先保存bf503ac430234d48adaa4fc657bae8fb原行/转录和transcriber ID，再调用既有cancel；只更新studio-api，无录播/转录/renderer容器重启或原文件操作。该流水线随后实际completed/error为空/0首歌，原ASR任务ID和完整转录与中断前快照完全相同；保护性retry检查拒绝对completed重排，未重跑ASR或已完成分析。记录在data/publish-template-backups/gemini-fallback-20261015/interrupted-run.json及resumed-run.json。
+- 原GPT、标题密钥与模型不替换；Gemini独立环境密钥、ENABLE=1；小红泡bilibili:2516117绑定用户正比PNG半身副本，芒芒等继续自己的选帧。生产运行版本已核对原生imageConfig2K/16:9，身份不串用。健康HTTP200/ok=true，自动投稿原开关保持启用。原镜像folia-api-before-gemini:20261015及一致性DB/配置/源码备份保留。
+- release_deferred.py核对新镜像/备用配置/原行身份与标题/无提交ID和次数余量后，只把原4首next_retry_at恢复到可执行，不清计数、不改status/权威身份/MP4。金风玉蝶由9到第10次，已真实通过Gemini生成2752×1536原图并按既有整数比例裁剪2720×1530上传JPEG，开始BililiveTool上传，taskId=141073ba-9616-43e2-88cc-ddc4db0e173a已落库、submit_attempts=1。玻璃第9次已用Gemini/generating；我们俩8次、没关系7次恢复等待，未改5次HTTP400的你的酒馆对我打了烊及旧失败。仍需观察其余封面和最终上传结果；尚无AID不能误称已发布。未推送GitHub。
+- 后续正式验收：原4首均已完成Gemini原生2K封面（全部original2752×1536/upload2720×1530）、上传取得AID并确认joined合集；最终累计次数金风玉蝶10、玻璃9、我们俩9、没关系8。金风玉蝶AID117444035282702/BV1nDJy61EMB，玻璃AID117444035348320/BV16DJy61EqT；我们俩AID117444035216596、没关系AID117444051995416已completed/joined，稿件详情查询暂HTTP500，BV号按既有退避查询，绝不重投。这与最初GPT封面失败是不同阶段。
+- 逐项对比备份：既有111条completed稿件的身份/源项目/标题/简介/tags/封面/冻结payload/taskId/AID/BVID/submit_attempts全未改变；本次4首权威身份/原视频size+mtime/原AI标题和生成记录均保持不变。rollout/上线水位/授权批次/开关未改。相关运行源码、显式Docker COPY、测试、文档及运维脚本已同步NAS Git副本；同步前验证旧副本与备份一致并保存旧文件，仅修改本任务相关文件，不含.env/密钥/原图，不自动提交或推送。验证快照ops/gemini-fallback-20261015/verification.json。
+
+## 2026-10-15 Gemini封面备用与用户透明人物图（先前实施过程，部署结果以上文为准）
+
+- 用户认可小红泡透明正比图的半身Gemini封面，要求GPT累计失败超过5次的原任务使用备用。新增cover_fallback.py：现场已验证的兼容chat/completions，单参考PNG、单张、600秒无隐藏重试；严格>5后下一次切Gemini，所有provider合计仍最多10次，不清零、不重复生成成功封面。cover_model/次数先写DB，并保存attempt-N.json的provider/参考指纹/提示词/状态，无密钥。原GPT、标题、身份、去重/置信/响度/模板/投稿状态均不改；新模块已加入backend/Dockerfile。
+- 小红泡bilibili:2516117精确绑定用户正比RGBA原图（SHA256 bb19b18aa05d45a0a0b8a24e25161208d87a69f6d6bf8a22087e8f0e56fa1efa），裁剪(1500,350,2680,1250)副本作参考，原素材不动；其他主播仍用自己的视频选帧，禁止把小红泡套给芒芒。配置文件/data/cover-references/references.json，素材已复制到NAS。配置损坏终止，不静默串主播。
+- 半身实测Gemini返回1376×768而非2K，提示词确实补充“输出2K横版图片”，但兼容chat请求未传专用分辨率参数；网站公开说明未证实该通道如何强制2K。不能将文字要求当尺寸保证，也不本地放大冒充2K。GPT同条件线上客户端单次测试11.69秒HTTP502。实测图/记录在本机output/imagegen/xiaohongpao-transparent-20261015。
+- 新env变量COVER_FALLBACK_ENABLED/BASE_URL/MODEL/API_KEY/PROXY及COVER_REFERENCE_CONFIG，备用密钥只写NAS.env运行配置（已备份、权限600），未进入代码/Git/日志。原部署compose尚未替换，因此当前API仍旧f7115f803bebd424e0a0ac2eca998b3431ea8c454303a810d9669989c848f472，尚未启用备用。增量镜像已构建7c0283d2cb42588097fbcd14b2466b5d0446e3eca3c50520fd2db937de6e205a，模块和app导入通过；源代码暂存在ops/gemini-fallback-20261015/stage，未覆盖运行后端。
+- 143项断网回归完整重跑全部通过（175.850秒）。首轮141项通过、2项因测试夹具未复制Dockerfile报错；补齐夹具后两项定向通过并完整重跑143项OK。覆盖真实请求结构、阈值、预算、模型请求前落库、缓存/重启、身份保护、素材匹配、原图不动、请求错误分类、制品不带鉴权、原MP4/已提交保护。日志NAS ops/gemini-fallback-20261015/regression.log。
+- 备份SQLite integrity_check=ok、原.env/compose/源码/文档在ops/gemini-fallback-20261015/backup，另原4行快照和整库一致性备份在data/publish-template-backups/gemini-fallback-20261015。仅4首原pending、cover阶段、无task/AID/BVID/submit_attempts且次数>5的芒芒任务临时延后next_retry_at（最多24小时，等待部署，未清次数或改status/身份/源视频/标题）：金风玉蝶9次、玻璃8次、我们俩8次、没关系7次。你的酒馆对我打了烊5次HTTP400未动，海绵宝宝/跳楼机等旧失败未恢复。
+- 部署预检先遇到《第二杯半价》渲染、随后该曲准备请求，再遇新整场ASR“12-30-59_【午间陪伴系】我去 小红帽.mp4”；均在复制后端/重启前安全停止。没有擅自打断任务。已向用户询问等待ASR结束还是允许中断后部署；待确认后运行ops/gemini-fallback-20261015/deploy.py，只更新studio-api，再运行release_deferred.py（验证新镜像/备用开关/身份/无已提交/预算后仅恢复这4首的next_retry_at）。仍需部署后健康检查、真实备用生成/上传观察、最终文档和NAS Git副本同步；未推送GitHub。
+
+## 2026-10-13 《游园惊梦》合集单步实测通过（明确授权的单稿维护）
+
+- 用户指出“刚才投稿的没加入合集，正好测试”，选择最新小红泡《游园惊梦》fdcec4448cff4006992da76861c301b9/AID117432995808958/BV1FPpB6eEMV。原稿17:58已上传，新Bililive适配18:17才部署；原快照无foliaCollectionTracking、collection_status=NULL，不能把这条旧路径当成新回调失败。
+- 通过现有Bililive创作中心列表精确核对MID181647901/AID/完整标题、唯一cid_list=42708107686，并核对合集9133790的正片小节10204569；此前所属合集查询为“啥都木有”。只针对这一稿授权补加，不排其他历史稿件，不改投稿快照或重投。维护源脚本为ops/bililive-season-fix-20261013/test-existing-yuyuan.py及run-existing-yuyuan-test.py。
+- 原单行和SQLite一致性备份在/data/publish-template-backups/collection-test-20261013-fdcec4448cff4006992da76861c301b9/。调用同一队列工具仅原子保存核对后的UID/AID/CID/目标/原标题/原任务ID；录播/上传/重任务idle时重启Bililive恢复这条记录。所有账号/B站调用仍由Bililive已有SDK执行，无自己的登录/Cookie/投稿器。
+- Folia只对这条记录显式置collection_status=pending。poll_collection改以非NULL合集状态作为已授权跟踪门槛，仍核对原payload目标/UID/AID/taskId；允许显式单稿维护跟踪无新marker的旧快照，旧默认NULL依旧不读、不补加。原frozen payload原样保留，SHA256=55b248e10dce1f13b7fa2727a2f53cfe258cf033b527bf5243fd7a926d71c77f。
+- Bililive队列首次处理后joined/attempts=1；随后真实GET /bili/season/{aid}返回200、9133790/《管珩心的歌声收藏夹》，Folia同步joined、合集错误清空。这是真实SDK合集步骤验证，不是仅mock；仍未新增一次真实视频上传来验证opt-in新回调完整链路。是否已经加入在处理前也会核对，不能把流程尝试次数误称为上传次数。
+- 原MP4stat、封面/标题/简介/tags、权威身份、请求快照、AID、上传taskId和submit_attempts=1均未变；没有重新生图或上传，也没修改其他旧合集。3项定向回归（显式旧稿维护/旧NULL隔离/合集与上传分离）与语法通过，API镜像f7115f803bebd424e0a0ac2eca998b3431ea8c454303a810d9669989c848f472，healthz正常；修改源码/测试/文档同步NAS Git副本，不自动推送。
+
+## 2026-10-13 投稿合集跟踪与可靠加入（已部署，仅后续新任务）
+
+- 用户已手动补齐旧稿件并授权修复后续流程，明确不再改历史稿件。现场模板 ign19v4u95a 和最近快照均有 seasonId=9133790；《风月》父任务 completed/AID 已取得，17:39:09 日志“加入合集失败”伴随上游 HTTP 412。最近 12 条中 11 条可查到目标合集，不能误报全部漏加。
+- 线上实际 BililiveTool 3.18.0 在创建稿件的 onEnd 另调 addMedia2Season，并先 getArchive 获取 CID；合集错误只记录日志，父上传任务仍完成，且旧调用未 await。未找到已验证的同一次投稿请求加入合集参数，不猜 season_id/section_id。修复仍在同一自动流程内先创建稿件/AID、再自动加入合集（不等审核），不是原子同一次 B站请求。
+- 为固定生产镜像增加小型受鉴权适配，仍完全使用 BililiveTool 的现有 SDK/createClient/登录态。仅 options.foliaCollectionTracking=true 的新 Folia 请求使用新分支：从父任务已完成分P的 completedPart.cid 取 CID，跳过容易 412 的 getArchive；将 UID/AID/CID/模板合集/小节/标题/任务 ID 原子保存到 /app/data/folia-season-jobs/<uid>-<aid>.json。无新上传器、登录/Cookie 代码或凭据持久化，非 Folia 请求仍走原分支。
+- 独立串行队列先核对所属合集，已经加入只确认，不重复加入；目标不符停止而不移动。小节必须属于模板目标合集，缺少小节时只接受唯一正片小节。await 加入后再次核对；响应丢失/重启也先查询，不重新上传视频。累计最多6次流程尝试；一般错误 2分钟起退避，412 暂停60分钟，400/401/403 停止人工检查，不更换IP或绕过风控。损坏恢复记录保留并终态告警，不杀录播服务或创建新请求。
+- 新只读受鉴权接口 GET /api/bili/folia-season/capabilities（version=1,durable=true）、GET /api/bili/folia-season/{aid}?uid=...。没有历史补加入队/上传入口。Folia 在新准备读取适配能力后冻结标记；publish_jobs 新增 collection_status/error/attempts/next_collection_at，仅新标记请求启用，旧列默认 NULL。上传 completed/AID、审核和合集状态分开；合集查询独立于审核重试时间，不因合集失败清除AID、标题/封面或重投。
+- 页面显示合集等待/确认/退避重试/已加入/需人工核对及次数/原因；上传 completed 但合集未确认时显示“上传完成 · 合集待完成/失败”，不笼统显示整体投稿完成。已完成旧稿件不追踪回填。publish.js 查询版本更新为 20261013-collection-tracking。
+- 125项 Python 隔离断网回归、10项 Node队列测试、实际生产 bundle 回调 mock 测试、页面状态测试、Python/JS/CJS语法及镜像导入通过。初次完整测试缺少 render_revisions.py 夹具，补齐后重跑125项全部通过；未额外付费生图或真实投稿验收。下一个自然新投稿才能验证实际入合集结果，不能把 mock 成功宣传为已成功真实加入。
+- 部署前录播机/上传/重任务均 idle，SQLite 一致性备份并 integrity_check=ok；备份位于 /vol1/1000/docker/folia-video-studio/ops/bililive-season-fix-20261013/backup，保留旧源码/配置/镜像。仅更新 BililiveTool fullstack、Folia API/Web，不动 ASR/renderer/原录播/MP4。Bililive compose 原文件不改，新增 docker-compose.override.yml 固定 folia-bililive-season:20261013，以免常规重启丢失适配。
+- 新镜像：Bililive 339dec01c026ab1ec28611a3a7888d5ec734536976e8a1696a01ba2712192dbd；API最终 663fe6235585ce981416b6abda3ce0d96801d5cd90c1b706c431d0785bbaf8da；Web 6ec454848429f18c966b32d257ad440889b6b4f5979bddc402d81abf359a4319。/healthz ok、API healthy、新页面/脚本/API200；合集能力接口200、未鉴权401、非法ID400、旧《风月》记录404。历史149条身份/成片stat/封面/标题/简介/tags/payload/任务ID/AID与备份完全一致；旧任务 collection_status 均NULL、Bililive新合集队列0条，未写历史合集。
+- 补充提交前能力检查，已有ready快照也不能向回滚/不支持适配的上传器发POST。新增这项及正常跟踪/缓存3项定向测试通过；准备阶段和提交阶段均受保护，临时未就绪保持ready/退避而不增加submit_attempts。只补更API，录播/Bililive/Web不再重启；中间API镜像保留folia-api-before-season-guard:20261013。
+- 适配源码/精确 bundle 锚点补丁/测试与运维说明在 ops/bililive-season-fix-20261013，生成 original/patched/backup 和日志排除 Git。新 Python 模块未增加，现有 Dockerfile 已显式COPY两个修改模块。源文件/文档/测试同步NAS Git副本，不自动提交/推送；上游镜像升级前须重新验证锚点/协议，不能直接覆盖本镜像。
+
+## 2026-10-12 封面独立场景提示词（已部署）
+
+- 用户同意为减少同场直播背景趋同追加：“参考图仅用于保持人物身份，不沿用直播背景。根据歌曲独立设计场景、主色调和光线，避免统一套用同一种背景风格。”只改 publish_v2.PROMPT，锁脸、自然表情/动作、人物右侧/完整《歌名》左侧仍保留。
+- 不清空已有封面/原图缓存/payload，不重置次数，不重新生图/上传，不新增跨图视觉检测；新请求应用新提示词，但不保证所有封面视觉上完全不同。本次没有额外付费验证请求。
+- Python 语法、5 项容器断网回归（提示词、缓存/重启、授权重制复用、展示歌名/身份、封面写库故障）通过，新镜像实际提示词导入通过。部署前确认无准备/提交请求、无重任务，备份 SQLite 一致性快照、配置和相关源文件到 ops/cover-prompt-20261012/backup；只更新 API，其他服务/数据库业务状态不改。
+- 新镜像 SHA256 b6f3dc885b05cdeaaf8ec2c1883dd65b632558793809f559d0aca1406d753ece，/healthz ok、容器 healthy；保留上一版 sqlite-fix-20261012 可回滚。相关源文件/测试/文档同步到 NAS 与 Git 副本，不自动提交/推送。
+
+## 2026-10-12 SQLite 锁冲突与投稿恢复（已部署）
+
+- 只读调查发现线上 studio.db 使用 DELETE 日志模式，多个提交事务报 database is locked；投稿错误处理把这类临时数据库错误当成终态。库位于 NAS 本地 btrfs，不是远程共享；未确定历史锁持有线程，不能据此宣称单一长事务来源。
+- app.db 启动时串行完成一次 WAL/建表/提交，成功后才置 schema_ready。新增 sqlite_runtime.py：只重试同一事务 COMMIT，或完整回滚后重做短纯数据库更新；不重跑含网络/付费操作的整个工作流，不吞掉磁盘/损坏等其他错误。Dockerfile 显式 COPY 新模块。
+- 投稿 V2 的锁错误按退避保留待恢复状态；标题结果、已接受 task ID、已完成 AID 在 /output/publish/songs/<song_id>/checkpoints/ 原子保存输入指纹及白名单字段，DB 写失败后重启复用，不存密钥。标题随明确授权重制复用；上传凭据与 payload 指纹严格绑定，冲突停止人工核对。封面继续复用已落盘 original-N.bin，不增加生图次数。
+- 启动仅恢复 V2、精确锁错误、submit_attempts=0 且无 task ID/AID/BVID 的准备失败；提交前失败且已有 payload 回 ready。保留标题、封面、payload、所有次数，不改投稿开关/上线水位/高置信/响度/去重；旧 V1、已接受或不明提交不得重置。此次恢复目标共 7 条，原队列原资格仍生效，不扩大历史补投。
+- 小红泡《我的果汁分你一半》《春夜坠落》虽本地记上传失败，真实 archive_detail 已确认同 UID、完整标题、分P歌名和提交后 7–9 秒创建时间匹配。只回填既有 AID/BVID，保留旧 task ID/次数，无新上传：《我的果汁分你一半》BV11hpi6TEuk（开放浏览）；《春夜坠落》BV1kvpi6eEb6（稿件仅自己可见，state=-50）。上传完成与可见性继续分开，不因仅自己可见重投。
+- 已完成数据库一致性备份及 integrity_check=ok，备份路径 /vol1/1000/docker/folia-video-studio/ops/sqlite-fix-20261012/backup，含原源码/compose/.env；凭据不进源码或 Git。只更新 API，回滚镜像 folia-sqlite-rollback:20261012，新镜像 SHA256 61a3d24dd2000fda81173eebaadba51b4f1a28f5c06055f3193970927d109610。原录播/MP4/其他服务未修改。
+- Python 语法通过；容器断网隔离 119 项相关测试通过（SQLite 实际读锁/提交重试、WAL 并发初始化、标题/封面/ID/AID 写库故障恢复、重启不重复 POST、旧任务隔离、原 MP4 保护及原投稿/标题/重制回归）；新镜像导入通过。测试不访问真实 AI/上传接口。完整记录见 ops/sqlite-fix-20261012/tests.log（NAS）、reconciliation.json。
+- 部署后实测 journal_mode=wal、/healthz ok、容器 healthy；运行镜像三个修改模块 SHA256 与本机一致，自动投稿 rollout/水位/授权批次未变。首轮 7 条已恢复为 pending/ready，随后《我不配》《我是真的爱上你》取得新 task ID 并落库，《咖喱咖喱》ready；两条历史稿件完成回填。初始观察日志锁错误/traceback 均为 0；这是短时验收，不保证今后完全无锁或所有队列均已上传完成。原成片与其他服务保留，相关源码/测试/文档同步到 NAS Git 副本，不自动提交或推送 GitHub。
+- 后续观察：《我不配》BV1Zwpo6mEiE、《我承认》BV17wpo6mE8p、《咖喱咖喱》BV1qwpo6mExW 已完成；《我是真的爱上你》已保存 AID=117427643876212，稿件详情临时访问失败按退避查询，保持 completed 不重新提交。《爱要坦荡荡》上传中，《下个路口见》准备中，《热气球》待处理。automation/health 扫描 ok，scan_count=7/error_count=0、无重任务占用；本条为观察快照，后续由既有 worker 继续，不添加新监控任务。
 
 ## 当前维护入口
 
-先读 CODE_MAP.md 与 ARCHITECTURE.md，再读对应模块。下方日期条目是历史记录，不能将旧版算法当成当前规则。当前自动整场用 Whisper；单曲 Qwen 只提供定位证据；标准平台字时间只统一平移；DeepSeek 全曲重排关闭；自动投稿只准备到 ready。
+先读 CODE_MAP.md 与 ARCHITECTURE.md，再读对应模块。下方日期条目是历史记录，不能将旧版算法当成当前规则。当前自动整场用Whisper；单曲Qwen只提供定位证据；标准平台字时间只统一平移；DeepSeek全曲重排关闭。切片后先执行免费低响度筛查，明确很轻的疑似背景音乐跳过歌词及后续流程。投稿采用歌曲项目＋免费选帧＋GPT完整封面＋BililiveTool真实上传；测试白名单为空，接新水位之后的合格成片，另按用户最新授权恢复芒芒既有逐帧批次中合格未投歌曲，按原录播日期新到旧优先。其他历史库/旧V1仍隔离。高置信、严格响度、身份、去重和本主播模板保护保留。
 
-本次整理新增 `/api/automation/health`，用于检查扫描是否真正成功而不只是进程健康；诊断仅当前进程有效，重启计数重置。封面左侧留白/《歌名》/去主播名仍未落实，Phase 2 上传未实现。历史身份或失败任务不自动批量回填、重跑。
+`/api/automation/health`区分扫描是否真正成功和进程健康，诊断仅当前进程有效。投稿V2不依赖底图或字体，提示词要求人物在右、左侧完整《歌名》、不加主播名或装饰横线；技术校验后自动继续，不做收费视觉/OCR。历史身份、失败任务和投稿不自动批量回填。
+
+## 2026-10-08 小红泡《当你》补逐字LRC（单首维护）
+
+- 用户发现成品目录LRC只有句时间并授权补一份。确认项目fe8513c2bb034e8f92cb6c29e8ed9c24、10月7日高置信《当你》：55行/345字均有QQ标准字时间，ASS含345个kf标签；backend/app.py原导出只写句首，并非本次判歌模型切换或逐字对齐失败。
+- 只新增 /vol2/1000/video/Folia成片/小红泡-管珩心/2026-10-07/高置信/当你/当你.逐字.lrc（增强LRC），由现有alignment/render快照扣除trim_start_ms=18230，首句5000ms、末字结束175573ms。现有LDDC解析器回读55行/345字，逐字文字/开始/结束与对应成片时间完全一致；UTF-8无BOM，文件6095字节。
+- 原MP4、逐句LRC、alignment JSON及render manifest的SHA256/大小/mtime均未变，不改数据库/身份、无重新渲染/上传/AI调用或服务重启；healthz正常。维护校验脚本语法通过。此为单首补导出，未修复全局后续成品LRC自动导出逻辑，未来该入口仍只生成逐句LRC。
+
+## 2026-10-08 整场判歌主模型6.1-sol，DeepSeek备用（已部署）
+
+- 用户要求仅切换整场ASR后的完整演唱范围分析。新增song_analysis.py，主接口复用标题TITLE_API_BASE_URL/KEY/PROXY，独立SONG_ANALYSIS_MODEL=gpt-6.1-sol；DeepSeek V4 Flash备用。主接口超时、连接、HTTP或格式失败才转备用，各一次；有效无歌/低置信/无效ID不再强行问备用。HTTP各阶段上限600秒。Whisper、Qwen、指纹身份、标准歌词字轴及默认关闭的DeepSeek歌词重排不变。
+- 请求前保存timings.song_analysis的模型/provider/状态，错误仅类型/HTTP码，最终记录与songs原子保存，空结果重启复用；分析JSON/时间轴写实际请求模型，旧未记录模型的分析明确标注legacy，不冒称6.1。启用/手动整场入口接受主或备用任一已配置；规则页显示主/备用，任务页显示本次模型及备用使用，不返回凭据。
+- 用现有10月8日缓存整场ASR（1442句、90分钟）只读实测：主接口167.766秒成功，返回1条候选并通过现有segment ID/时间/阈值校验，未调用DeepSeek、未写入原分析、未重新切片/渲染/投稿。该样本只验证可调用，不证明第三方真实后端或识别准确率优于DeepSeek，歌曲权威身份仍由后续指纹识别维护。
+- 本地50项相关测试通过；Linux断网177项回归通过，补充后的20项新模块/编排测试也全过（含空结果重启不再分析、错误记录保留）。Python/JS语法、新镜像导入、前端模型/任务状态渲染测试通过；backend/Dockerfile已显式COPY新模块，Compose增加独立模型/超时，不复制密钥。
+- 仅更新API/Web，镜像b60f1d343e271404abc993ce9aed6ce97e48ead10d2acc71b921a36d205e96b5 / 268a2966ede4245c906116b10c243d32478dafdd1a18cc1489715540628af64e。备份数据库、配置、源码及原镜像于/vol1/1000/docker/folia-video-studio-backups/20261008-song-analysis-sol；未改全局journal_mode、身份/投稿快照或历史补投范围。
+- 更新前临时冻结1条尚未开始的重制，记录原status/error并在ASR接回后逐字段恢复（维护标记已清除）；转录器、模型、原生渲染器、BililiveTool容器身份/启动时间均未变。正在转录的cd739591be0e42a599cb0a0cf1477a33仍使用同一transcriber task ID，未取消或重新POST。9月遗留“下一个天亮”rendering行已只读确认22天未更新且renderer404，不将其误认活任务，不改其行/原视频。
+- 上线healthz/config/规则/扫描/投稿control正常，主/备用均configured，自动投稿恢复原active及原水位/范围。网页携带鉴权返回200并提供新版本automation.js，未鉴权仍401；数据库quick_check=ok。源码/测试/文档同步NAS Git副本，不含环境密钥、数据库或媒体；本次未推送GitHub。
+
+## 2026-10-08 《遇见》歌词轴纠正及显式单次重投（重制中止，未上传）
+
+- 后续检查：修正版曾启动renderer13632a3e79e44eba86205ec0a45a42dc，但单首驱动在snapshot调用失败时停止；主jobs后来为failed/error="database is locked"，没有创建0815fcdd605b57aa8a1bf40f9eb89a59投稿行或取得新task/AID/BVID。本次模型切换未追加第三次重制/上传，也未将“驱动已启动”当作重投成功。下方是此前对轴及排队记录，原稿、原封面和原身份继续保留；数据库锁及结果交接需另行核对修复。
+
+- 用户反馈 BV1bzHS6LEwe 歌词不对应，明确自行删除旧稿并授权“对完上传”；本次不调用撤稿/删除接口，不扩展历史补投或重置其他任务。
+- 定位原项目468a5fa3c75d4cd69434e40addfbaae7及逐帧克隆ed4ca17f79b54ebcbabd80cf3ff88929：沿用9月23日错误演唱会版kugou:272728602，首句62.713秒而原ASR约5秒、按错轴裁掉57.713秒；timing_confidence=low、cross_model_conflict=true、句字偏移差5115ms，但旧confidence_tier=high仍放行。长演唱会备注使正常版标题相似度0.2353低于逐字候选门槛0.5；不是快速/逐帧渲染的速度问题。
+- 单首维护脚本repair-yujian-lyrics-and-repost.py使用现有LDDC、渲染和BililiveTool客户端，不改变运行模块/开关。只查询“遇见 孙燕姿”并选qq:8145，完整25行、两个副歌；复用已有Qwen证据，统一平台字轴shift=-20129ms，54字锚点跨155648ms、P90=266ms、句字差13ms、timing=high且无冲突。识别身份、原项目/MP4及旧稿任务ID/AID/BVID/payload保留。
+- 独立修正项目b37c38a07a61575f978955555942d471，逐帧不保存MOV，裁切0–179244ms；不覆盖旧119.3秒成片，不由历史补建自动创建第二笔费用。复用原成功封面/标题/简介/合集，维护投稿id0815fcdd605b57aa8a1bf40f9eb89a59。创建新任务而非清空已完成任务，提交前持久化次数和快照，已知task ID只查询；响应丢失不自动再次POST，需检查。
+- 准备校验后事务转移歌曲主任务关联（旧发布结果和payload不改，旧关联保留在备份/演唱/维护历史），唯一约束仍只允许一个主任务；维护行pipeline_version=1与自动V2worker隔离，由显式脚本查询结果。歌曲页可通过主任务指针展示修正版，不新增第二个歌曲项目。旧稿已查询state=-100/已删除，删除由用户完成。
+- SQLite一致性及逐行备份/data/lyric-repairs/20261008-yujian；10项本地/维护安全测试及Python语法通过（坏轴拒绝、主关联唯一、旧结果不清空、只提交一次、已接收只查询、响应不明不再POST、终态渲染失败停机、完成结果只恢复）。旧项目逐字段一致、旧投稿身份/快照/task/AID/BVID/次数及封面SHA一致。独立运维进程只读确认已存在的表后标记schema ready，不在生产重任务旁重跑迁移DDL；不改变API模块或数据库journal_mode。
+- 首次修正版renderer895b73332a894526844deabe3ebba658实际failed/Chromium DevTools启动失败，主jobs仍rendering/1%（状态交接受数据库锁影响），没有产生成片或上传。确认终态后app_meta保存原错误/ID及render_retries=1，仅清理该修正版的输出状态重排；再失败即停，不重启/取消其他渲染，不能声称浏览器根因已修复。
+- 固定目标NAS驱动run-yujian-repair-once.py已启动，日志/锁/PID在/vol1/1000/docker/folia-yujian-repair-20261008/；最多等待12小时，只使用现有API正常渲染队列。已完成renderer但主状态遗留时只恢复该ID；MP4/对轴技术检查通过后生成维护快照、校验，实际在BililiveTool容器检查视频stat和封面SHA，再核对旧稿已删除后只提交一次，查询AID/BVID/审核并保存result.json。不新增AI调用，不新增开机/定时常驻服务；终态渲染/准备/上传异常或响应丢失会停止并留日志，需要核对后再处理。
+- 本条目前完成对轴并交给单首执行任务等待重制，尚未发起新上传；今天整场ASR已有4/30块证据，未获用户优先授权前不主动中断。结果以维护日志/result.json、新投稿记录为准，不因启动驱动就宣称已上传成功。
+- 这是单首显式修正，不代表已部署全局歌词候选/旧high时间质量门槛修复；其他历史错轴仍需另行核对和授权。
+
+## 2026-10-08 标题模型改为6.1-sol、歌词短句及持久化重试
+
+- 用户确认切换TITLE_API_MODEL=gpt-6.1-sol，允许选已匹配标准歌词中副歌/重复段短句作标题文案，不强制意境描述。提示词限定短句摘录不超过10个汉字，不整段引用/编造歌词，身份字段和完整标题后缀保护不变。
+- TITLE_TIMEOUT_SECONDS=120（HTTP各阶段等待上限），累计TITLE_MAX_ATTEMPTS=3；超时、连接错误、429、5xx可退避，400/鉴权/明确参数/非法标题直接固定标题兜底。每次prepare仅发一笔请求，title_generation_json在请求前保存attempts/in_flight、请求后保存history/retry_pending；重启保留次数，第三次失败继续封面/投稿，后续Bili或封面重试不额外生成成功标题。
+- 已实测旧入口单次请求gpt-6.1-sol生成《遇见》标题10.683秒/HTTP200/格式通过，响应请求名不证明真实后端。本地66项相关测试、Linux断网新镜像141项回归、Python/JS语法及镜像模块导入通过。仅更新API/Web；运行中的《想自由》renderer ID e08839bb93b4432d80f4e4c1831eb720保留，原生渲染、模型、转录和BililiveTool容器未重启。线上control确认6.1-sol/标题3次/120秒/封面10次，自动投稿恢复active、原cutover/空名单/授权批次不变。数据库和配置、源码备份在/vol1/1000/docker/folia-video-studio-backups/20261008-cover-retry-ten，密钥不进入Git或日志。
+- 显式恢复5条未提交封面网络失败，各封面2次记录不清零。奇妙能力歌/桃花旗袍/陷阱/遇见这4条未冻结payload的旧标题网络失败，原请求保留为第1次，只在原3次总上限内用新模型重试；三拜红尘凉原AI标题成功继续复用。不改其他历史失败标题/已冻结payload/已投稿或成功封面，不扩历史范围。具体新生图/上传完成结果另查队列，不因重新排队宣称已经投稿成功。
+
+## 2026-10-08 GPT封面累计请求上限提高到10次
+
+- 用户明确把每首歌曲项目的封面请求上限从2次提高到累计10次。统一COVER_MAX_ATTEMPTS=10，准备自动退避与实际请求边界一致；control返回上限，投稿页动态显示。准备重试接口拒绝无成功封面且已达10次的任务，已有成功封面继续复用；鉴权/额度/明确参数错误仍终态，不扩大真实上传重试上限。
+- 实际诊断5首（奇妙能力歌、桃花旗袍、三拜红尘凉、陷阱、遇见）最后均SSL握手UNEXPECTED_EOF_WHILE_READING，参考帧已存在、无生成原图；曾有上游502。诊断时未发付费请求，GET /models已恢复401响应，不证明生图稳定或必需代理。既有2次失败保留，最多再请求8次；不重置已成功封面或已接受投稿。
+- 原独立版本本地62项、Linux137项回归通过；第一次部署预检因正在普通渲染《血腥爱情故事》在任何变更前退出。该歌完成后与本次标题修复合并上线，最终API镜像1ab05cd1f9d31b60ef37f918d477239127cab2d106efa7c54ae9d4a7c8115b69、Web镜像6aa740804757462cd99d64f507b38f892c111acdb80ef719dea3967b27b7e5f4，141项Linux回归通过。真实恢复5首网络失败队列、每首旧2次保留；成功资源与已接受任务不改，上线watermark不扩大。
+
+## 2026-10-08 芒芒重制失败一次性恢复/重试
+
+- 诊断6条失败：奇妙能力歌、桃花旗袍为主API数据库锁/状态交接失败，原生renderer实际上completed且MP4存在；遇见、多余的解释甜妹版、单身情歌为Chromium DevTools启动失败；表白Remix旧renderer ID 404（任务保存在渲染器内存）。日志中的DBus警告不等于已确定浏览器故障根因；本次不修改SQLite journal_mode或重启服务。
+- 用户明确授权重试一次。当前仍有重制和录播任务在处理，故不部署/重启API或渲染器，不新增自动无限重试。保存显式6首运维流程 retry-mang-failed-revisions-once.py：先只读预检源文件/当前响度/已投稿去重/renderer状态，完成结果FFprobe确认音视频与时长后复用原resume_render_revision接回；failed/cancelled/确切404才允许清除克隆旧ID、原队列重新render一次；网络异常/未知状态不清除ID。保留旧失败/ID/行快照，不修改权威身份、原项目/视频、投稿payload或成功封面。
+- 实际接回奇妙能力歌renderer33ddfe8558c14d858256e43f72095254、桃花旗袍rendererb9223546760a4b1e99911d76121c279a，两个render_revisions completed且原交接函数enqueued。遇见、表白Remix、单身情歌重排为pending，仍按原录播日期优先、现行任务不抢占。多余的解释平均−36.4/峰值−4.7被当前OR规则排除，不重跑、不重开投稿。
+- 每首app_meta.render_revision_retry_once:<job_id>保存count=1、动作、请求时间和旧失败/ID；BEGIN IMMEDIATE保护一次性认领，重复执行只读返回already_requested。原队列单次失败仍停止，需要另行授权/修复，不宣称已实现可视化重制重试或所有未来失败自动重试。动作前行级备份及结果位于/data/render-retry-backups/20261008-once；脚本是外置一次性运维工具，不是新增Docker运行模块，宿主部署目录保留可重新拷贝执行。
+- Python语法及5项运维策略单测通过（完成复用、终态/404重建、活动只恢复、低响度排除、仅显式6首且无直接上传/渲染POST）。保持原自动投稿active，未改水位/名单、未取消当前逐帧或ASR任务；本次没有修复数据库锁和浏览器启动根因。源码运维工具与文档同步NAS Git副本，未推送GitHub。
+
+## 2026-10-08 投稿歌名去除括号备注
+
+- 上线核对：SQLite完整性ok，所有已有投稿任务/歌曲项目/封面与备份一致、所有原始身份未变；运行中的外部 renderer ID 保留。网页鉴权健康、自动扫描健康接口、投稿控制接口均200，已恢复自动投稿 enabled=true，芒芒合格重制队列继续，仍保留新OR响度阈值与原范围。
+
+- 用户要求歌名圆括号及其中内容不需要。新增 title_generation.song_display_title（现有模块内，无新运行文件），确定性删除中英文圆括号内容，支持连续/嵌套/混用闭合。牛仔很忙 (cover: 周杰伦)→牛仔很忙，公主殿下 (cover: 崔洋)(完整版)→公主殿下。空结果或括号未闭合在付费请求前停止准备。
+- AI标题输入和严格校验/固定兜底、GPT封面提示词、tags、模板简介title变量、BililiveTool分P标题统一用派生展示歌名。原identified_title、identified_artist、identity_source和song_key不改，不修改已接受/已投稿记录、已冻结payload或成功封面，不重置次数额外生图；无历史歌曲合并、重渲染或撤稿。
+- 106 项断网 Linux 回归及 Python语法/增量镜像导入通过，含中英文/混用/嵌套备注、空结果、AI/兜底一致、真实适配payload/简介/封面prompt、权威身份和去重键不变、缓存复用。仅更新API，原生渲染/模型未重启；标准Dockerfile已COPY两个既有模块。备份 /vol1/1000/docker/folia-video-studio-backups/20261008-display-song-name，旧镜像 folia-api-before-display-name:20261008 保留。源码、测试、文档同步 NAS Git副本，不含密钥/数据库/媒体，未推送GitHub。
+
+## 2026-10-08 响度宁错杀档：任一低电平排除
+
+- 最终健康/自动扫描/控制接口经网页鉴权均200，SQLite完整性ok；原项目、旧V1、已接受投稿记录、封面和生成次数与备份一致。已恢复 active，空白名单、原cutover和授权批次保留，合格逐帧版继续按原录播日期新到旧。原生渲染《第57次取消发送》ID acd4cb91be8f4922830ff3c9af323dc5 仍相同；核对时重制完成11、失败3、等待25、运行1、跳过2。
+
+- 用户明确要求“有一个满足就排除、宁错杀不放过、继续提高标准”。当前默认平均 RMS ≤−30 dB **或**峰值 ≤−15 dB 即 skip；版本 quiet-clip-v2-any，settings.logic=any。原 −32/−18 且同时满足规则仅作历史记录。继续使用免费 FFmpeg volumedetect，不是 LUFS 或主播身份分类器；正常响度背景原唱仍可能漏过，真实演唱也可能误拦。
+- 修改前通过原控制 API 暂停新生图/提交，未取消已接受任务。遗失的心跳当时已经 completed，AID117402142508196 / BV133HU61Euf；新规则真实解码 −37.0/−9.1 dB 为 skip，但不撤稿、不重投、不篡改已投稿快照。
+- 对已授权芒芒批次 33 首重新判定，只有 source path/size/mtime_ns 完全一致才复用先前真实 FFmpeg 测量。未提交新增排除《忽然之间》−38.3/−1.8（未开始的重制克隆 skipped）和《多余的解释（甜妹版)》−36.4/−4.7（既有失败保留、不清错）。另 25 首未提交通过（其中仍有重制失败）；已经接受的歌曲/投稿/封面不改。原项目、原 MP4 均不改，不扫其他历史库。
+- publish_v2.eligible 在准备/提交边界使用当前规则重算已有电平，旧 AND pass 不再放行，测量缺失/非法则拒绝；授权批次还要求当前版本、配置和输入 stat。拒绝不产生生图或上传，已成功封面/次数保留。新切片仍在建立项目前筛查，不进入识别/歌词/Qwen/渲染/投稿。
+- 96 项断网 Linux 回归、Python语法和增量API镜像构建/导入通过；含任一低值/等号边界、旧缓存失效、旧 pass 拦准备/上传、成功封面和原 MP4 不变。真实解码遗失的心跳、目及皆是你为 skip；一笑倾城、鱼仔、慢歌1通过，媒体 stat 不变。仅更新 API，不重启原生渲染/模型，当前 renderer ID 保留。备份 /vol1/1000/docker/folia-video-studio-backups/20261008-any-performance-gate 与 /data/publish-policy-backups/20261008-any-performance-gate；源码/测试/文档同步 NAS Git 副本，未推送 GitHub。
+
+## 2026-10-08 恢复芒芒逐帧批次投稿、新日期优先
+
+- 用户最新明确恢复芒芒投稿，优先原演唱日期新的、仅投稿重制成功的版本。复查已绑定的 Bili 房间 25984441、preset s9iw1rmff2，以及模板合集 9136587 / 小节 10207730；再读 B 站现有稿件排重。批次 `26e223f70d714588b6e40cdca70e9fca` 42 首中 33 首未投高置信且严格响度通过，5 首已投不重投、3 首本地对齐不投稿、《望穿秋水》低响度禁投且未开始的克隆标 skipped，原项目/切片/成品不改。33 首中 3 首现重制失败继续保留错误，不回退快速版、不擅自重建丢失的 renderer ID；其余 30 首随成功重制继续。
+- rollout 新增明确 `{batch_id,profile_id}` 的 `authorized_render_batches`，保持 active、allowlist=[]、全局 cutover 与暂停区间不变，不降低水位、不扫其他主播历史。该批次只在 smooth 完整高置信、标记允许、归属正确规则、当前严格响度 pass 且源文件 stat 未变时绕过历史水位。页面暂停仍阻止本批付费请求/提交；有任务ID/AID/BVID仍只查询。
+- `publish_jobs` / `render_revisions` 各新增 `priority_at` 默认0，实际原录播开始时间作为优先级，不篡改 created_at/finalized_at 或识别身份。已接收/提交中的投稿优先恢复查询，未提交新版按日期降序；其他无优先级任务保持原先顺序。渲染中任务不抢占，剩余高置信重制先新日期；已完成新版之间优先新日期，不阻塞等待尚未完成的歌。
+- 已通过原交接函数将4首已完成合格新版入队，首首《泪桥》原录播 2026-10-07 09:05:22，AI标题“🌉把没说完的话，留在桥的那头｜《泪桥》｜【芒芒_Mou】翻唱”，开始准备且生图1次；检查时牛仔很忙已重制成功入队，下一首正在重制《好像掉进爱情海里》。投稿开始不等于上传完成，结果后续补记；所有请求仍沿用原两次上限和成功封面缓存。
+- 最终《泪桥》completed：task a1379456-8657-4460-ba9e-c9f55f465e25，AID 117402125732195，BVID BV1gVHU65E5P，BililiveTool主任务100%，生图/提交均1次。冻结payload继承合集9136587/小节10207730、简介2026.10.07，源删除false；共享逐帧MP4与封面在BililiveTool容器可读。牛仔很忙上传task 9cab9ec4-5d1e-4110-ad9c-970707e6374b已持久化，生图/提交各1；遗失的心跳开始准备，其余继续队列。SQLite完整性、所有原项目不变、旧V1逐项不变及已接受任务ID/AID/BVID/次数/快照不变通过，Nginx鉴权健康/新范围JS 200、未鉴权401，自动扫描ok/错误0。3首失败重制未清错；原《目及皆是你》不撤稿不重投。检查时重制完成10、等待27、运行1、失败3、跳过1。
+- 93 项断网 Linux 回归、Python/JS语法、增量API/Web镜像与导入通过；新批次授权包含错误主播、非smooth、低置信、响度skip、源改变等拒绝测试，重制/投稿排序测试保留原创建时间。只更新 API/Web，不重启模型/原生渲染；原《牛仔很忙》render ID `6e90ec93a81a47a8baf564cba73ebbb2`保留。首次部署探针抢在启动迁移完成前报告字段缺失，启动健康后确认两个priority字段存在，旧投稿逐项不变，无迁移丢失；探针已改为等待HTTP健康。备份 `/vol1/1000/docker/folia-video-studio-backups/20261008-mang-resume` 与 `/data/publish-policy-backups/20261008-resume-mang-revised`，旧镜像 api/web-before-mang-resume 保留。源码、测试、页面及文档同步 NAS Git 副本，不含凭据/数据库/媒体，未推送 GitHub。
+
+## 2026-10-08 响度库存核对与严格档上线
+
+- 只读核对 4 位主播自动成片（逐帧克隆不重复计数）：未投完整演唱 300 次；按权威身份去重 243 首，重复额外演唱 23 次，缺权威歌名 34 次。测完 462 个有项目切片及 7 个未建项目切片，错误 0，视频 size/mtime 未变；旧规则筛出《望穿秋水》《改变自己》及原已短片跳过的《当你》。报告保存在 `/data/audits/unpublished-20261007-222539/`（目录名 UTC，报告时间上海 2026-10-08 06:25:40），未恢复历史投稿/生图或改变项目状态。
+- 用户明确没有需要保留的轻唱、允许更严格。默认阈值由平均 RMS ≤−38、峰值 ≤−25 dB 收紧为平均 ≤−32 **且**峰值 ≤−18 dB；不是改成 OR 或声纹检测。现有 469 个测量回算不合格 9 个（新增 6），其中 7 个有成片。额外为清歌喵《白色风车》《今生你作伴》《聊表心意》《第二杯半价》《从头再来》及短片《打工人》。这些仍只记录核对结果，历史已完成项目不自动改判/重跑；新切片在创建项目前执行严格档。
+- 严格镜像真实解码《目及皆是你》−45.0/−30.9 dB 为 skip；《一笑倾城》《鱼仔》《阴天》《慢歌1》实际抽取演唱样本均 pass，媒体 stat 不变。现有默认缓存因 settings 不同重新核对；90 项断网 Linux 回归通过，新增严格边界/真实样本电平和旧缓存失效测试。较响原唱仍可能漏过，整体偏轻的真实演唱也可能误拦，结果仍只称疑似背景音乐。
+- 仅更新 API 内 `performance_gate.py` 默认值，无新依赖，Dockerfile 已 COPY；运行环境没有阈值覆盖。备份 `/vol1/1000/docker/folia-video-studio-backups/20261008-strict-performance-gate`，旧镜像 `folia-api-before-strict-gate:20261008` 保留。原生渲染服务未重启，《泪桥》同 ID `0eb179ea5e8b49e49531fd603c673434` 继续运行；投稿 rollout/全部任务/封面次数/SHA 均未变，历史批次继续禁投。模块/测试/文档显式同步 NAS Git 副本，不含凭据或媒体，未推送 GitHub。
+
+## 2026-10-08 停止历史投稿、切片低响度筛查上线
+
+- 用户核对原演唱日期后撤销这批历史投稿。先通过控制 API 暂停新生成/提交，备份 `/data/publish-policy-backups/20261008-stop-historical/`，再将批次 `26e223f70d714588b6e40cdca70e9fca` 的 42 个克隆 `render_revision_publish=0`、交接 `publish_status=not_requested`；未接受投稿的主任务记 policy 失败，禁止准备重试重新放行，成品/切片/成功封面保留。只是取消投稿，剩余渲染队列未擅自取消。
+- 停止前本批已有 5 首 completed：《慢歌1》BV1JDH16HExA、《目及皆是你》BV1JDH16HEpD、《我想要你的爱》BV17RH16UEzV、《爱情专属权》BV1fiHU6tEYC、《七月末》BV1FiHU6bENA；未删除、撤稿或重复上传。检查时无准备/提交请求在途。政策调整后旧投稿 task/AID/BVID、身份/metadata/payload、封面次数/SHA 均未变化。
+- 新增 `performance_gate.py`，直接 FFmpeg 解码现有切片并用 volumedetect 测平均 RMS/峰值电平，不转码、不写视频、无模型/收费 API。默认平均 ≤−38 dB 且峰值 ≤−25 dB 才自动跳过；缺音轨、解码失败、超时或非法测量停止该首并可重试，不悄悄继续付费流程。缓存以版本/文件路径/size/mtime_ns/阈值匹配；保存 `song.performance_gate` 与 skip 原因、前端显示“切片演唱筛查”。在 `create_imported_song_job` 之前执行，skip 不创建歌词项目、不运行指纹/歌词/Qwen/渲染/生图/投稿，不改识别身份。已经完成/跳过的歌曲不自动回溯重判。
+- 实测原《目及皆是你》平均 −45.0 dB、峰值 −30.9 dB，新生产函数在隔离调用中用真实切片判 skip、后续调用 0、文件 size/mtime 不变；《一笑倾城》《鱼仔》《阴天》平均 −18.6/−18.2/−18.7 dB，峰值 −0.4/−0.2/−0.4 dB，均 pass。《慢歌1》−25.9/−4.2 dB 也不会误拦。注意这是保守低响度筛查，不是声纹、主播身份或完整歌唱检测；正常响度原唱播放仍可能通过，极轻演唱也可能被误判，保留切片供人工核对。
+- 默认启用，运行环境可调 `PERFORMANCE_GATE_ENABLED`、`PERFORMANCE_GATE_MEAN_DB`、`PERFORMANCE_GATE_PEAK_DB`。没有新增依赖；Dockerfile 显式 COPY 新模块。88 项 Linux 断网隔离回归通过，含真实低/正常电平解码、边界无下游调用、缓存/失败/身份保护与 policy 重试拒绝；Python/JS 语法及增量镜像构建/导入通过。
+- 只更新 API/Web，转录/模型/原生渲染服务不重启。上线时唯一活动外部逐帧任务《我想我不够好》ID `216dfb29b8bf4b23b37a4a98269d6ebe` 保留，API 重启后仅恢复查询同 ID、进度继续。部署备份 `/vol1/1000/docker/folia-video-studio-backups/20261008-performance-gate`，旧镜像 `folia-api-before-performance-gate:20261008`、`folia-web-before-performance-gate:20261008` 保留。SQLite 完整性、原项目不变、Nginx 鉴权 API/资源 200 与未鉴权 401 已核对，未以测试产生生图/投稿。
+- 上线后恢复未来新成片自动投稿，mode=active、allowlist=[]、cutover=`1791411419.8232932`，历史批次继续禁投，暂停区间持久化；没有重新开放旧 V1 或全库历史。检查时重制完成 6、失败 3、等待 32、运行 1，这些不代表仍会投稿。源码/测试/文档同步 NAS Git 副本，不含凭据/数据库/媒体，未推送 GitHub。
+
+## 2026-10-08 取消测试白名单、启用自动投稿
+
+- NAS 恢复后按用户明确授权，通过现有 `/api/publish-v2/control` 启用自动投稿。持久化 rollout 为 `active`，`allowlist=[]`；接收水位为已授权批次 `26e223f70d714588b6e40cdca70e9fca` 的创建时间 `1791378780.944397`，而不是本次启用时刻，确保先完成的三首也放行。执行前再次核对水位之后的完整成片仅来自这批重制，未开放更早全库历史补投。后续合格新成片自动处理，不需逐首白名单；页面开关读取为 enabled=true，仍可暂停/恢复。
+- 原 PUBLISH_ENABLED/AUTO_PUBLISH_ENABLED、严格高置信、身份保护、主播模板、同主播同歌去重、两次封面上限和已接受任务不重复提交均保留；旧 V1 的 50 条记录逐项与此次备份一致，不自动迁移或重新提交。备份 `/data/publish-control-backups/20261008-no-test-whitelist/` 包含启用前 SQLite 一致性快照及控制状态。仅修改持久化控制状态，不重建/重启生产服务。
+- 实际检查《慢歌1》已完成封面并交给 BililiveTool 上传，task ID `58eb5191-8050-4ea0-a105-18a829b70ee7`，提交 1 次、封面 1 次；尚未取得 AID/BVID，不宣称投稿已完成。《目及皆是你》正在生图（1 次），《我想要你的爱》等待；其余重制成功后自动续入。43 项投稿控制/V2隔离测试通过，运维脚本语法通过，SQLite integrity_check=ok、API/自动扫描健康。
+- NAS 全栈重启后另有三首重制失败保留待修：《表白 (Remix版)》旧渲染 ID 丢失，《遇见(央视星光璀璨中国巨星演唱会)》《多余的解释（甜妹版)》浏览器启动失败。诊断进程初始化 schema 后持有长事务导致《爱情专属权》数据库锁失败，已修正独立核对脚本的事务范围，并查询确认原 renderer ID `f41a0d5fb4734394b658271080180512` 仍运行后恢复为待续接，不创建新渲染。检查时重制完成 3、失败 3、待处理 35、运行 1；失败不影响原 MP4，不因放开投稿范围自动清空错误或重复生图。
+- 最终回读《慢歌1》已 completed，AID `117401806964266`、BVID `BV1JDH16HExA`，仍仅提交/生图各 1 次；《目及皆是你》已取得 task ID `1d8c1e4a-1cd7-4ffe-b36b-6f45f674a1fe` 并 uploading（提交/生图各 1），《我想要你的爱》生图 1 次正在准备。active/空测试名单、API 健康、SQLite 完整性及旧 V1 50 条不变再次确认。控制与状态文档已同步 NAS Git 副本，未推送 GitHub。
+
+## 2026-10-07 芒芒逐帧默认与历史重制队列
+
+- 后续用户明确要求取消测试白名单，允许本批逐帧重制及未来合格成片自动投稿，仍保留高置信/身份/主播模板/去重保护、隔离旧 V1 队列。执行前 NAS `100.111.1.11` 连续 SSH 超时，Tailscale 显示节点离线且 ping 无回复；尚未变更线上开关或水位。已准备独立运维脚本，拟通过现有 control API 启用，再以本批起点为水位并清空测试名单，防止漏掉先完成的《慢歌1》且不扫更早历史库。必须恢复连接后先核对状态再执行；这条授权记录目前仅本地，未能同步 NAS。
+- 用户授权芒芒默认逐帧生成、不保存 MOV，并补充要求成品进入投稿队列。已仅将芒芒规则 `bc87122ccfbb4403a15efafb3ae01cc6` 的 `render_output_mode` 改为 `smooth`；其他主播仍 `fast`。自动流水线页面新增单规则 MP4 模式设置及历史重制进度。
+- 显式核对原完整成片、权威歌曲身份、缓存歌词时间轴和实际共享路径，并只读核对 BililiveTool 当前稿件，排除已投稿《一笑倾城》《日不落》《离人赋》《阴天》《鱼仔》及同主播重复演唱。批次 `26e223f70d714588b6e40cdca70e9fca` 共 42 首：39 首满足严格高置信投稿门槛，完成后进入 V2 投稿队列；《表白》《大圈圈》《身骑白马》3 首本地对齐版仅重制，不升级置信度、不投稿。
+- 新增 `render_revisions.py` 和独立持久化队列，复用原源切片与歌词时间轴，不重新 ASR/识别/搜词。克隆项目具名插入，保留原身份和时间轴，独立输出目录，`keep_alpha_mov=false`。已有 renderer ID 只恢复查询，不重复创建渲染；投稿交接失败与成品失败分离，可独立重试。新模块已显式加入 backend/Dockerfile。
+- 已启动后台串行重制。检查时《慢歌1》逐帧进度 76.4%，另外 41 首待处理，尚不能宣称全部完成；42 个原项目及 MP4 size/mtime 均不变，克隆权威身份/歌词时间轴逐项一致。批次与原输入快照保存在 `/data/mang-smooth-batch-20261007.json`，不进入 Git。
+- 投稿入队不代表扩展发布授权：仍保留原 `acceptance` 两首白名单，未 activate，新的高置信重制任务入队后等待当前范围放行，不因此启动全量付费生图或真实上传。未提交的同歌曲主任务可以改指向新逐帧成片并复用已有封面；有任务 ID/AID/BVID 或已接受提交的主任务绝不替换。
+- 相关 118 项 Linux 隔离测试及另外 4 项实际路由测试通过（共 122 项），Python/JS 语法和镜像模块导入通过。只更新 API/Web，部署前确认重任务空闲，不重启转录或原生渲染服务。备份 `/vol1/1000/docker/folia-video-studio-backups/20261007-smooth-revisions`；旧镜像 `folia-api-before-smooth:20261007`、`folia-web-before-smooth:20261007` 保留。SQLite 完整性与自动扫描健康，浏览器只读检查确认芒芒逐帧选项、42 首进度和入队说明。检查时原 53 条投稿任务及封面次数不变，未新生图/上传。
+- 最终检查首首《慢歌1》已完成并交接入队：新项目 `d4aa0a80d884418dbe3f5c01e8c116f4`，投稿任务 `02ceec5358734adf98eb78144702fefa` 为 V2 `pending`、`publish_status=enqueued`，封面次数/提交次数均 0，无 BililiveTool 任务 ID。实际 MP4 为 H.264/AAC、1920×1080、30fps、92.933 秒、58,039,490 字节，新目录没有 MOV。队列转为完成 1、运行 1、等待 40，《目及皆是你》接续逐帧处理；原 53 条投稿记录/封面仍与备份一致，总任务数因新增入队成为 54。源码/测试/文档同步 NAS Git 副本，未推送 GitHub；临时只读检查页面/服务已关闭。
+
+## 2026-10-07 投稿V2单首真实上传验收
+
+- 用户授权补充可视化自动投稿开关，已上线API/Web：“歌曲项目与投稿记录”顶部提供启用新成片/暂停、测试模式暂停按钮、范围与上海时间显示，并确认AI费用和真实投稿。GET/POST /api/publish-v2/control，严格boolean，首次启用要求两首完成取得AID且环境总开关/封面密钥有效；旧activate共用检查。rollout持久化paused及暂停区间、首次水位；重复启用不移动水位，重启保留，恢复原队列但不补投暂停期间成片。暂停在标题/选帧/提交请求边界再次检查，已经发出的请求可完成，已提交上传/审核继续查询。相关76项测试及JS语法通过，API/Web增量镜像成功；标准Dockerfile原已COPY修改模块，无新运行模块。窄屏浏览器只读验收确认开关可用但未开启，截图output/publish-control-20261007/page.png；正式Nginx静态文件读取权限修正后首页/JS/CSS/control鉴权200、未鉴权401，API/自动扫描健康。数据库/源码/配置备份/vol1/1000/docker/folia-video-studio-backups/20261007-publish-control，旧API/Web镜像保留；原投稿任务状态/身份/metadata/payload/任务ID/AID/BVID/提交数及封面路径/SHA/生成次数与备份一致，无新生图或上传。仍acceptance白名单、未activate，启用留给用户页面操作。源码/文档同步NAS Git副本，未推送GitHub。
+
+- 用户核对提示词并授权部署AI标题。新增title_generation.py，使用独立环境密钥及同站/chat/completions，请求gpt-5.6-terra；只润色外围文案，严格保留歌名/主播后缀、单行80字符。一次请求、45秒HTTP超时，鉴权/额度/网络/格式错误均固定标题兜底。title_generation_json及标题在封面前保存，重启/后续失败复用，已冻结payload不重新生成。相关63项测试通过，断网增量镜像构建成功，标准Dockerfile显式COPY新模块；仅更新API，数据库/配置备份在/vol1/1000/docker/folia-video-studio-backups/20261007-ai-title，旧镜像folia-api-before-ai-title:20261007保留。实机独立标题请求15.136秒成功：“☁️阴云落进心里，安静地听一场雨｜《阴天》｜【芒芒_Mou】翻唱”；仅测试输出，没有修改已投稿标题/数据库。SQLite完整性ok，原53条任务的身份、标题、简介、payload、任务ID/AID/BVID及状态均与上线前备份一致，V2原MP4 size/mtime不变。仍acceptance两首白名单，未activate、未生图、未上传或扩展历史补投；API健康。源码和文档同步NAS Git副本，未推送GitHub。
+
+- 用户随后授权修正直播时间，已上线：既有recorder_identity.py新增只读recording_start_time，V2及旧准备入口均改用源录播开始时间，删除run.mtime/video_mtime/当前时间回退。按精确目录/stem匹配BililiveTool记录（兼容.flv转.mp4），以平台/房间过滤，record_start_time实际为毫秒；缺失时仅解析原YYYY-MM-DD/HH-mm-ss_命名，多个时间冲突或未知时间终止，V2在付费生图前检查。新增8项时间测试及2项V2回归，相关54项通过，增量CPU断网镜像构建成功，现有Dockerfile已COPY三个修改模块。只更新API；上线前确认唯一活动任务为兼容的外部Whisper整场ASR、无渲染/切片/投稿处理中，重启后原transcriber_job_id保留且任务继续运行。备份/vol1/1000/docker/folia-video-studio-backups/20261007-record-start-time/及旧镜像folia-api-before-record-time:20261007；API/自动扫描健康，模板合集设置保留，无新生图/上传、不修改已投稿快照。代码、测试、文档同步NAS Git副本，未推送GitHub。
+- 用户要求修正芒芒模板合集。实查BililiveTool preset s9iw1rmff2的seasonId原为null、三首冻结payload也为空、稿件详情in_season=false。通过线上GET /bili/seasons确认“芒芒_Mou的歌曲合集”9136587及正片小节10207730；核对3.18.0路由后PUT /preset/video/s9iw1rmff2，仅改seasonId/sectionId，回读一致，其他模板及其他字段未变。旧模板备份/data/publish-template-backups/s9iw1rmff2-before-season-1791369995.json；后续新准备会继承合集，不自动修改已投稿稿件或已冻结payload、不重投。直播时间调查：当前formatDesc.time取run.mtime（文件修改时间）而不是开始时间；鱼仔/阴天源芒芒_Mou/2026-10-07/09-05-13_其实我超喜欢你.mp4，mtime为当日10:36:20；一笑倾城源10-35-23文件、mtime为11:01:47。现有简介只显示日期2026.10.07，与源录播目录日期一致；跨午夜或改mtime不可靠，未在此次日期询问中擅自修改时间算法。
+- 本轮两首最终完成：阴天任务9012bb94-08ba-45d7-a2ad-335dc12f70f0，AID 117399172941325，BVID BV119Hk6QEFd，开放浏览；鱼仔任务c0dc7208-3288-4e46-8413-abb841555e10，AID 117399173006468，BVID BV1N9Hk6XE7f，检查时审核中。各仅提交一次；两张GPT原图/投稿JPEG均2048×1152，阴天本次生成1次，鱼仔累计2次含此前网络失败。人工查看歌名和书名号存在，风格随歌曲变化；不保证人物完全保真。两首原MP4 size/mtime不变，封面SHA一致、共享路径映射一致，BililiveTool容器均可读，删除源视频选项false，SQLite完整性ok。当前33旧ready/16旧failed/1旧completed保持隔离，3个V2completed；仍acceptance，只允许鱼仔与阴天，无pending/ready待自动提交任务，未activate。API/自动扫描健康，新的整场ASR正常运行，未为检查再次重启。源码/提示词回归及文档同步NAS Git副本，未推送GitHub。
+- 用户选择GPT锁脸版，并授权再投稿两首。重新核对后选定《鱼仔》（b7d19c329e934b788dbfb1a7451ab93b）与《阴天》（bd2d92a28c174477a1ccd9cd2824df0f），均高置信完整MP4、无身份疑点、芒芒模板已绑定、未提交/未重复。显式将acceptance白名单替换为这两首，不activate、不放行其他历史成片；已完成一笑倾城记录不变。提示词改为锁脸型/五官比例/瞳色/发型/标志配饰，允许表情/视线/动作/姿态变化；新增提示词回归，相关44项通过，CPU断网增量镜像构建成功。备份/vol1/1000/docker/folia-video-studio-backups/20261007-face-prompt-two/含DB一致性快照/旧模块文档，旧镜像folia-api-before-face-prompt:20261007保留。只更新API，重任务及队列空闲，网络免费探测401；两首已入准备队列，最终结果待记录。
+- 用户继续授权GPT/Grok各一张锁脸对比（独立预览，不替换封面、不投稿、不改生产提示词/次数）：同一8.8081秒视频参考帧，同一提示词要求脸型/五官比例/瞳色/发型/标志配饰不变，允许表情/视线/动作/姿态变化。请求gpt-image-2返回2048×1152、102.71秒；沿用此前验证的Grok JSON编辑结构，请求grok-imagine-image-2.0返回2816×1584、357.48秒，各仅一次且无重试。原图和完整无密钥记录在/output/publish/preview-tests/yixiaoqingcheng-face-20261007/{gpt,grok}/。人工查看两张歌名/书名号均存在，人物面部仍有一定重绘；Grok文字下方出现装饰拖笔，不能宣称完全满足人物保真或禁横线。请求模型名不证明上游实际模型。
+- 上传后用户另行授权一张放宽人物约束的独立对比图：沿用视频参考帧与GPT接口，仅保持人物主体/辨识度，允许动作、姿态、表情自然发挥；明确不替换已投稿封面、不再投稿、不重置歌曲项目2/2计数。记录及原图位于/output/publish/preview-tests/yixiaoqingcheng-relaxed-20261007/，单次请求117.12秒，返回2048×1152。人工查看人物有持麦/伸手动作，歌名字形可读，但漏了要求的《》；此图仅供比较，生产提示词尚未更改。
+- 用户恢复代理后授权只测试一首。NAS API容器免费GET /models返回401，确认HTTPS连接恢复；只通过准备重试接口放行《一笑倾城》，复用8.8081秒的1920×1080参考帧。累计生图次数2/2（第一次为此前网络失败），本次返回2048×1152原图及同尺寸JPEG，未本地叠字，未追加请求。
+- 《一笑倾城》继承芒芒模板并完成真实校验/上传：标题“芒芒_Mou《一笑倾城》｜直播翻唱”；BililiveTool任务2815b94f-ba4b-4484-8986-4627e3bdc96d，提交次数1，AID 117398954838812，BVID BV1anHC6PEe7，上传100%，检查时审核中。投稿完成与审核状态分离，不因审核中重传。
+- 实际审计原MP4大小/mtime未变；《鱼仔》保持failed、生图1/2、提交0，无额外测试或历史补投。上线仍为acceptance，两首白名单中的另一首尚未验收，未调用activate、未开放未来成片自动发布。以下实施记录中的网络阻塞是此前状态。
+
+## 2026-10-07 投稿V2实施与待验收
+
+- 新增publish_v2.py、song_projects/song_performances及投稿版本/上传恢复字段；身份快照不读歌词/手工标题。绑定平台房间去重、明确歌手冲突停住，重复演唱不再生图。已完成日不落进入已投稿去重记录，即使稿件删除不重投。
+- worker只领取pipeline_version=2，旧任务隔离。原33 ready不动；两首白名单从原19 failed中显式迁入，剩17旧failed不动。只允许一笑倾城（3d6f5fd9bd8d4a918414ef0317c0dbc6）、鱼仔（b7d19c329e934b788dbfb1a7451ab93b）；已重新核对完整MP4、output/alignment均high、无身份疑点、芒芒preset s9iw1rmff2已绑定。两首取得AID前禁止activate；未来只放行output.finalized_at高于上线水位的成片，不能用修改updated_at误补历史。
+- 免费选帧均完成1920×1080 PNG并缓存；每首GPT尝试计数1/2。当前NAS对codex789 HTTPS握手SSL EOF，未取得生图响应、未创建上传任务；两首已停为准备失败，保留参考帧/计数，不能重置计数扩大测试。NAS mihomo为TUN auto-route，默认自动选择显示套餐已过期；普通curl可能仍被TUN接管，尚不能据此断言服务必须使用代理。电脑既有代理不带鉴权GET models返回401，说明能到达服务。对NAS网络规则的变更待用户授权，未修改代理配置。
+- 请求gpt-image-2、单张2048×1152/high、600秒、无隐藏重试，付费并发1、每首最多2次，发出前持久化次数；成功原图/JPEG/SHA复用，后续BililiveTool故障不会重新生图。API密钥只NAS .env/运行环境，payload/日志/Git不含凭据。
+- 真实3.18.0接口已从线上包核对：task列表{list,runningTaskNum}、upload返回taskId、父任务completed.output为AID、archive详情另取BVID/审核。已知taskId丢失只报错，不重投；无ID中断先可靠匹配、最多再提交一次，保留响应丢失重复风险，不引入submit_unknown。真实上传、审核与生图尚未完成端到端验收，不能宣称已验证。
+- 272项后端测试在断网CPU隔离容器通过，含新22项V2回归；JS语法检查通过。新模块加入标准Dockerfile；标准全量构建遇NAS PyPI SSL EOF、nginx仓库401，部署复用既有依赖镜像增量COPY业务代码，API新模块导入验证成功。只更新API/Web，其他转录/模型/歌词/渲染容器不重启；上线前重任务/自动队列空闲，API及自动扫描健康。
+- 管理页已改为歌曲项目与投稿记录，显示模板/人物区域、参考帧、封面、演唱归档、生成次数、上传进度/BV/审核/准备与上传失败、旧任务隔离。浏览器只读检查已确认4个preset、芒芒绑定、其他主播未绑定、两首1/2失败记录和51条旧记录；临时测试不改变生产鉴权。NAS SSH禁止端口转发，不能依赖SSH隧道访问；只读页面检查通过SSH命令读取API绕过转发限制，不修改SSH设置。
+- 备份：/vol1/1000/docker/folia-video-studio-backups/20261007-publish-v2（SQLite一致性快照、compose/.env、backend/web/docs，凭据备份权限600）；保留旧镜像folia-api-before-publish-v2:20261007与folia-web-before-publish-v2:20261007。当前AUTO_PUBLISH_ENABLED=1仅白名单门控；两首为failed且无自动重试，不会运行旧ready或扫全库。待网络恢复后用准备重试复用参考帧，剩各一次生图机会，再完成上传验收并开放未来水位。
+
+模块协议、数据/接口与回滚详见modules/automatic-publishing.md。
+
+最终更新已再次仅重启API/Web：重启前后均为33旧ready、17旧failed、1旧completed、2 V2网络准备失败，两首生图次数仍各1、提交次数0、BililiveTool bili任务数0；视频size/mtime均与持久化快照一致。源码与文档已同步NAS Git副本，保留原有免费选帧改动，不包含.env/数据库/媒体；本轮不推送GitHub。全量272项复测通过。
+
+最终实机检查：BililiveTool容器两首共享MP4均可读，SQLite integrity_check=ok；新版首页/JS/CSS/歌曲项目API经生产Nginx鉴权均200，未带鉴权401。镜像内四个投稿/选帧模块编译通过；实际浏览器只读检查含窄屏歌曲项目主视图，截图保留在本地output/publish-v2-check-20261007/publish-page.png。临时页面服务器和测试连接在检查后关闭，不留额外公开端口。
 
 ## 已上线
+
+- 2026-10-07：新增独立免费参考帧模块 `backend/cover_frames.py`，12 张候选、按主播区域亮度/清晰度评分、近似去重、原分辨率 PNG、持久化时间点及缓存复用；11 项单测和语法检查通过。NAS 断网限 1 CPU/512 MiB 隔离容器验证芒芒《一笑倾城》与小红泡《喂猪》，芒芒耗时 9.17 秒；小红泡全画面初测 11.47 秒，配置实际人物区域后复测 10.59 秒、选 17.842103 秒。均生成 1920×1080 PNG；第二次直接复用，原视频大小/mtime 不变。Dockerfile 显式 COPY 模块；源码独立交付，不启动自动选帧 worker，不接旧模板叠字 prepare_publish，不调用付费生图或投稿，不修改数据库/身份/ASR/歌词/渲染。当前 API `/healthz` 健康且 `auto_publish_enabled=false`。区域示例为芒芒、小红泡按实际画面配置；不能判断闭眼、遮脸或身份，其他主播区域与批量效果仍待核对。详见 `modules/cover-reference-frames.md`。
 
 - 2026-10-06：完成第一轮代码整理。以 NAS 当前源码为基线更新 ARCHITECTURE、ASR 模块、预览渲染说明、README/索引，新增 CODE_MAP；历史状态记录保留并标明不得当作现行规则。新增 automation_runtime.py 与 `/api/automation/health`，只读记录扫描开始/成功/异常类型、规则/合格文件/入队计数及耗时，区分未开始、线程停止、过期、扫描中和失败；诊断状态不持久化、不改变入队决定，Dockerfile 已显式 COPY。修正 Tempera 预览测试中遗留的 0.5 断言为已上线的 1.0，快速导出仍测试 0.5，生产渲染代码未改。隔离无网络容器中 239 项后端测试全部通过（含 4 项扫描诊断测试）；Python 编译、Compose 配置与主 API 镜像构建通过。只更新 studio-api，转录/模型/渲染容器保持运行；线上检查线程存活、scan.status=ok、首次扫描 3 条规则/207 个合格文件/0 个新增入队、耗时 1.115 秒，自动 ASR 继续运行，AUTO_PUBLISH_ENABLED=false。未改数据库结构、歌曲身份、歌词算法、封面或投稿范围，未批量重跑历史任务。源码与 NAS Git 副本整理为同一基线，不在本次执行 GitHub 推送。备份：`/vol1/1000/docker/folia-video-studio-backups/20261006-code-organize/`（deployed-before.tar.gz、git-before.tar.gz）。
 

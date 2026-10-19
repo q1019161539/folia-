@@ -1,0 +1,21 @@
+title = "Folia secret scanning (default rules plus relay-key coverage)"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "folia-relay-ai-key"
+description = "AI relay keys, including long hexadecimal sk keys"
+regex = '''\bsk-[A-Za-z0-9_-]{20,}'''
+keywords = ["sk-"]
+
+# Only two inspected public literals, not entire paths/commits/rules, are exempt.
+[[rules]]
+id = "generic-api-key"
+[[rules.allowlists]]
+description = "SQL metadata key and a Docker image tag are not credentials"
+regexTarget = "secret"
+regexes = [
+  '''^publish_v2_rollout$''',
+  '''^collection-existing-test-20261013$''',
+]

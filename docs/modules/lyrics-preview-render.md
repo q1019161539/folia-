@@ -8,6 +8,7 @@
 - 服务转发：`nginx/default.conf`
 - ASS/FFmpeg 渲染：`backend/app.py` 中 `ass_karaoke`、`render_task`
 - Folia 原生配置转换：`backend/folia_native.py`
+- 缓存歌词逐帧重制与队列：`backend/render_revisions.py`，`app.py render_revision_loop`；复用旧时间轴、保留旧成片，新版独立目录，不保存MOV。
 - Folia 原生浏览器渲染：`folia-renderer/app.py`，固定使用 `v0.7.8` / revision `9cf822015328e47ee5e22061213010a70b4ec5c9` / Stack `1.0.27`
 - 字体资产：`backend/font_assets.py`、`data/fonts/`
 - Tempera 图片资产：`backend/image_assets.py`、`data/images/`、`web/folia-images.js`
@@ -54,6 +55,8 @@
 - 快速输出：`<原名>_folia_<mode>_fast.mp4` 与 `<原名>_folia_<mode>.fast.render.json`。流畅输出：`<原名>_folia_<mode>_smooth.mp4` 与 `<原名>_folia_<mode>.smooth.render.json`。透明输出：`<原名>_folia_<mode>_alpha.mov`、`<原名>_folia_<mode>.mp4`、`<原名>_folia_<mode>.render.json`。
 
 ## 数据
+
+2026-10-08单首维护：小红泡10月7日《当你》新增同目录 `当你.逐字.lrc`（Enhanced LRC，逐字角括号时间戳）。55行/345字直接取现有标准字轴，并统一扣除成片裁切18230ms；使用现有LDDC解析器核对文字及每字起止。原 `.lrc` 保留为逐句兼容版，JSON快照仍为源切片时间。此次不改全局导出代码，其他/后续成品的逐字LRC导出尚未统一接入。
 
 时间轴行保存在 `alignment.lines`。新标准逐字项目使用平台原始字时间加统一偏移，不再融合 Qwen 现场字时间；历史 `qwen-lddc-hybrid` 标记只表示旧数据，不能作为当前算法说明。旧 ASR 推导行仍可用 Qwen 逐字；没有有效字时间的行使用整句近似效果，不伪装为真实逐字成功。
 

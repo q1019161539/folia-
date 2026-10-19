@@ -1,0 +1,10 @@
+'use strict';
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const text=fs.readFileSync(process.argv[2],'utf8');
+const fn=text.slice(text.indexOf('function publishCollectionInfo('),text.indexOf('const publishDefaultRegions'));
+const scope={esc:x=>String(x).replaceAll('<','&lt;')};vm.createContext(scope);vm.runInContext(fn,scope);
+assert.equal(scope.publishCollectionInfo({status:'completed'}),'');
+assert(scope.publishCollectionInfo({collection_status:'joined',collection_attempts:1}).includes('已加入合集'));
+assert(scope.publishCollectionInfo({collection_status:'retry',collection_error:'<script>',collection_attempts:2}).includes('&lt;script>'));
+assert(text.includes('上传完成 · 合集待完成'));assert(text.includes('${publishCollectionInfo(job)}'));
+console.log('COLLECTION_PAGE_TEST_OK');

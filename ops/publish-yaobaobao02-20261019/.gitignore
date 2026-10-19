@@ -1,0 +1,4 @@
+__pycache__/
+stage-docs/
+backup-docs/
+*.log

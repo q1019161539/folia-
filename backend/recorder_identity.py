@@ -3,10 +3,61 @@ import json
 import sqlite3
 import threading
 import time
+import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path, PurePosixPath
 
 _lock = threading.Lock()
 _cached = (0, [])
+
+
+def recording_start_time(source, identity=None, database='/recorder-data/app.db'):
+    """Read recording start (milliseconds), never file mtime or render time.
+
+    BililiveTool history retains .flv after conversion to .mp4; match only the
+    exact relative directory/stem and known recording extensions. Missing history
+    falls back to the recorder's YYYY-MM-DD/HH-mm-ss_name path, in Shanghai time.
+    """
+    path = PurePosixPath(str(source or '').replace('\\', '/'))
+    if path.is_absolute() or '..' in path.parts or len(path.parts) < 3 or path.suffix.lower() != '.mp4':
+        raise ValueError('原录播路径无效，无法确定录播开始时间')
+    filenames = ['/app/video/' + str(path.with_suffix(extension)) for extension in ('.mp4', '.flv', '.ts', '.mkv')]
+    query = ('SELECT h.record_start_time FROM record_history h JOIN streamer s ON s.id=h.streamer_id '
+             'WHERE h.video_file IN (?,?,?,?)')
+    values = list(filenames)
+    identity = identity or {}
+    if identity.get('platform') and identity.get('room_id'):
+        query += ' AND lower(s.platform)=? AND CAST(s.room_id AS TEXT)=?'
+        values += [str(identity['platform']).lower(), str(identity['room_id'])]
+    rows = []
+    try:
+        with sqlite3.connect(Path(database).resolve().as_uri() + '?mode=ro', uri=True, timeout=2) as c:
+            rows = c.execute(query, values).fetchall()
+    except (sqlite3.Error, OSError):
+        pass  # Recorder history may not exist for legacy recordings.
+    timestamps = set()
+    for row in rows:
+        try:
+            value = int(row[0])
+            if value > 0:
+                started = datetime.fromtimestamp(value / 1000, ZoneInfo('Asia/Shanghai'))
+                if 2000 <= started.year <= 2100:
+                    timestamps.add(value)
+        except (ValueError, TypeError, OverflowError, OSError):
+            continue
+    if len(timestamps) > 1:
+        raise ValueError('同一原录播有多个不同开始时间，请人工核对')
+    if timestamps:
+        return datetime.fromtimestamp(next(iter(timestamps)) / 1000, ZoneInfo('Asia/Shanghai'))
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', path.parent.name) and re.match(r'^\d{2}-\d{2}-\d{2}(?:_|$)', path.stem):
+        try:
+            started = datetime.strptime(path.parent.name + ' ' + path.stem[:8], '%Y-%m-%d %H-%M-%S')
+            if 2000 <= started.year <= 2100:
+                return started.replace(tzinfo=ZoneInfo('Asia/Shanghai'))
+        except ValueError:
+            pass
+    raise ValueError('缺少可靠的录播开始时间，请核对录播记录或原文件日期/时间命名')
 
 
 def recorder_catalog(database):

@@ -1,0 +1,2 @@
+FROM folia-web-before-gemini-primary:20261015
+COPY stage/web/publish.js stage/web/index.html /usr/share/nginx/html/

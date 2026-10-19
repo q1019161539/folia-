@@ -1,0 +1,4 @@
+backup/
+*.log
+verification.json
+__pycache__/

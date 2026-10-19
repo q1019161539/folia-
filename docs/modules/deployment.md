@@ -34,7 +34,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 ```
 
 不使用阿里云时 `DASHSCOPE_API_KEY` 可留空。本地识别与 Qwen 对齐不依赖它。
-自动歌曲分析需要 `DEEPSEEK_API_KEY`；Key 不得写入代码、文档、数据库或日志。
+自动歌曲分析优先复用标题的 `TITLE_API_KEY`/`TITLE_API_BASE_URL`/`TITLE_API_PROXY`，`SONG_ANALYSIS_MODEL=gpt-6.1-sol`、`SONG_ANALYSIS_TIMEOUT_SECONDS=600`；`DEEPSEEK_API_KEY`仅备用，任一配置即可启用。新增 `song_analysis.py` 必须加入 backend/Dockerfile COPY。Key 不得写入代码、文档、数据库或日志。
 
 ## 常用命令
 
@@ -60,6 +60,12 @@ docker compose exec lyrics-service curl -fsS http://127.0.0.1:8090/healthz
 
 ## 更新步骤
 
+2026-10-13 合集适配涉及现有BililiveTool fullstack和Folia API/Web，须检查录播机、上传与重任务空闲后更新。/vol1/1000/docker/bililive-tool/docker-compose.override.yml固定folia-bililive-season:20261013，原compose保持不变。代码/补丁/测试/备份工具在Folia ops/bililive-season-fix-20261013；原生产 bundle 严格锚点匹配，生成文件与凭据备份不入Git。常规compose自动读override；升级上游或直接指定-f时不可无意绕过适配。回滚覆盖为rollback.override.yaml对应旧镜像并恢复API/Web源码/镜像，不覆盖当前SQLite/任务ID或删除folia-season-jobs记录。
+
+2026-10-08 最新响度默认为 PERFORMANCE_GATE_MEAN_DB=-30、PERFORMANCE_GATE_PEAK_DB=-15，平均或峰值任一低即排除；quiet-clip-v2-any / settings.logic=any。下方 −32/−18 同时低的规则仅历史记录。显式环境阈值会覆盖默认；上线必须核对实际 gate_settings。仅更新 API，保留正在运行的外部原生 renderer ID。
+
+2026-10-08 新增切片低响度筛查模块 performance_gate.py，backend/Dockerfile 必须显式 COPY。默认免费/CPU-only、无新依赖；可选运行环境 PERFORMANCE_GATE_ENABLED=1、PERFORMANCE_GATE_MEAN_DB=-32、PERFORMANCE_GATE_PEAK_DB=-18。用户确认没有轻唱后由最初 −38/−25 收紧；部署若有显式环境阈值会覆盖模块默认，需要核对实际 gate_settings。平均和峰值同时低才跳过，不是完整主播演唱识别；独立配置无需把密码/密钥写入代码或数据库。
+
 1. 在本机副本修改并完成语法检查。
 2. 只同步本次改动的文件到飞牛项目目录。
 3. 只重建受影响服务。
@@ -68,6 +74,9 @@ docker compose exec lyrics-service curl -fsS http://127.0.0.1:8090/healthz
 6. 把结果写回 `docs/STATUS.md`。
 
 ## 数据保护
+
+- 2026-10-12 起 studio.db 为本地 WAL；启动一次串行初始化，不要把数据库挪到 SMB/NFS。backup 必须使用 SQLite backup API 取得一致快照，不能在运行时仅复制 studio.db 而遗漏 WAL。不得手工删除 -wal/-shm；旧镜像仍可读取 WAL，回滚不能覆盖当前投稿结果。
+- SQLite 锁修复模块 sqlite_runtime.py 必须加入 backend/Dockerfile COPY。有限提交重试不能包裹整个 AI/上传业务；新 checkpoint 位于共享 output/publish/songs/<song_id>/checkpoints，应与封面及任务状态一起保留。
 
 - 重建容器不会删除 `data/`、`models/`、`work/` 或媒体挂载。
 - 转录服务复用 `/vol1/1000/docker/folia-asr-mvp` 下既有的 `.env`、`models/`、`work/`、`output/`；不要删除旧目录或执行带 `-v` 的清理命令。

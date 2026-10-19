@@ -1,0 +1,4 @@
+backup/
+stage/
+*.log
+verification.json

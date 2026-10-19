@@ -15,12 +15,24 @@
 
 ## 串行流程
 
+2026-10-08 用户授权本批失败重试一次：外置运维脚本 retry-mang-failed-revisions-once.py（部署根目录 / NAS Git ops），默认只读预检、--execute才执行，目标为当时显式6首而非全库。完成renderer+有效MP4复用原恢复函数，不重渲染；确切终态/404可重新排原队列一次，活动renderer只恢复查询、未知/网络错误不清ID。当前响度skip/已有接受投稿均不重试。app_meta.render_revision_retry_once:<job_id>以事务认领count=1，保存旧ID/错误，重复操作不再排队；行级备份/data/render-retry-backups/20261008-once。当前API仅有投稿交接publish-retry，没有可视化重制重试入口；本次是维护流程，不是新增所有失败自动重试。现行任务不抢占，不改原成片/识别/封面次数。
+
+2026-10-08 最新响度规则覆盖下方历史说明：平均 RMS ≤−30 dB **或**峰值 ≤−15 dB，任一满足即跳过后续流程；环境默认 PERFORMANCE_GATE_MEAN_DB=-30 / PERFORMANCE_GATE_PEAK_DB=-15。quiet-clip-v2-any / settings.logic=any 使旧 AND 缓存失效。保留切片，不修改原历史成品，不运行后续识别/歌词/Qwen/渲染/投稿。已授权芒芒未提交重制队列复查新规则，不取消已接受上传，真实演唱误拦是用户明确接受的取舍。
+
+2026-10-07：automation_profiles.render_output_mode支持fast（旧规则默认）/smooth（逐帧MP4，无MOV）。规则卡片可单独修改默认成片，PUT /api/automation/profiles/{id}/render-output只改这一项，不改歌词效果、模板或监听范围；smooth要求Folia原生效果。process_automation_song在真正开始渲染时读取最新规则，因此已经开始的整场ASR也能使用更新后的默认。芒芒默认smooth，其余主播仍fast。
+
+显式历史重制：POST /api/automation/profiles/{id}/render-revisions {project_ids:[...],enqueue_publish:true}。只复用已完成自动成片的源切片、权威身份与缓存歌词，按同主播同歌排除已接受投稿及重复，不提升置信等级；旧classic效果的副本用主播当前原生效果。独立新项目保存render_revision_parent_id/batch_id，不修改原演唱项目或旧MP4。render_revisions队列单次一首、同主API内存槽位；重启复用成品/查询原render_id，外部渲染器丢失ID时失败而不重新POST。GET /api/render-revisions显示批次、进度和独立投稿交接状态，自动任务卡片显示并链接新版MP4。
+
+明确enqueue_publish的完整高置信新版成品交接到V2 pending；其他版本保留成品、标记ineligible。入队不扩大rollout白名单或打开自动投稿；交接错误只记录publish_status/publish_error，POST /api/render-revisions/{jid}/publish-retry只重试交接，不重新渲染、清空封面或重复提交已接受上传。
+
+2026-10-08 用户恢复芒芒该批逐帧投稿，范围见automatic-publishing.md。render_revisions.priority_at保存原录播开始时间，运行中任务优先恢复、不抢占，pending按priority_at降序、同优先级保留创建顺序；默认0不改其他队列。已完成交接也按新日期优先。重制失败保留，不以旧快速版投稿；本地对齐只重制、低响度未开工克隆跳过，原项目/媒体不删除。
+
 1. 每 30 秒扫描所有已启用主播目录，并把新录播写入 `automation_runs`。
 2. 调用 `folia-video-transcriber` 将整场音频按 180 秒块送入现有 Faster-Whisper worker；关闭语音 VAD 和逐字时间计算，直接取得块内逐句时间并加回源时间 offset。整场不运行 Qwen ForcedAligner，也不发布空的逐字文件。关闭 VAD 避免把歌声误删；转录工作台的手动任务保持原选项。
-3. 将逐句转录交给 DeepSeek V4 Flash。模型只能返回歌名与首尾 ASR `segment_id`；后端根据真实句段计算时间，低于规则阈值、重叠、过短、过长或无效 ID 均跳过。
+3. 将逐句转录交给标题接口的 `gpt-6.1-sol`，DeepSeek V4 Flash 作为备用（`backend/song_analysis.py`）。主接口连接/超时/HTTP错误/返回格式异常时切备用，各调用一次，无隐藏重试；有效 `songs:[]`、低置信或无效句段候选不触发备用来强行判歌。两个接口均失败则整场分析失败，可用原有重试入口复用 ASR。模型只能返回歌名与首尾 ASR `segment_id`；后端根据真实句段计算时间，低于规则阈值、重叠、过短、过长或无效 ID 均跳过。任务 `timings.song_analysis` 持久化请求模型、provider、备用使用、脱敏错误与耗时；完成记录和歌曲结果原子保存，明确无歌结果重启不再请求。已有分析/切片直接复用，不批量重判历史歌曲。
    - 校验后的结果在切片前同时发布到 ASR 的录播名目录：`<录播名>_歌曲分析.json` 保存毫秒时间、segment ID、置信度、理由和未采用候选；`<录播名>_歌曲时间轴.txt` 是可读时间轴。两者用于人工审阅，实际切片仍读取同一份已校验数据写入的数据库批次，避免手工文件被篡改后绕过校验。
 4. 使用 FFmpeg 流复制把完整歌曲写入原录播同级 `歌曲切片/`，默认前后 5 秒，不覆盖同名文件。自动模式不使用 `-avoid_negative_ts make_zero`，保留隐藏关键帧预卷，使可见起点对应请求时间。
-5. 将整场 ASR 句段减去切片起点后导入歌曲项目，不重复运行 Whisper。切片时长低于 90 秒直接跳过整套歌词渲染流程（状态 `lyrics_skipped_short_clip`），计入结束时的汇总通知，不搜索候选、不补逐字 ASR、不渲染。
+5. 先由 `performance_gate.screen_clip` 免费解码切片测电平，平均 RMS ≤−32 dB 且峰值 ≤−18 dB 时标记 `skipped/suspected_quiet_background`，保留切片，直接返回，不创建歌曲项目、不运行指纹/歌词/Qwen/渲染或投稿。保存 `songs[].performance_gate`（版本、输入 stat、配置、两项电平、决定/原因）；缓存只对同版本/同输入/同阈值复用。解码失败/无音轨/90 秒超时停止该首并记 failed，不默认放行。运行环境 `PERFORMANCE_GATE_ENABLED=1`（默认）、`PERFORMANCE_GATE_MEAN_DB=-32`、`PERFORMANCE_GATE_PEAK_DB=-18`；2026-10-08 用户确认没有轻唱后收紧，原档 −38/−25 仅历史记录。阈值变更会使旧配置缓存失效，但已完成/已跳过的历史项目不自动重跑。这是低响度筛查，不证明主播身份，较响原唱可能漏过、整体偏轻的真实演唱可能误拦。通过后将整场 ASR 句段减去切片起点导入歌曲项目，不重复运行 Whisper。切片时长低于 90 秒仍直接跳过整套歌词渲染流程（状态 `lyrics_skipped_short_clip`），计入结束时汇总通知。
 6. 每首切片补 Qwen 现场字时间，再对平台歌词版本评分并计算统一偏移。逐字候选无可靠字偏移时先按需分离人声重识别，仍失败则明确报错。最终平台字时间只做全曲统一平移；DeepSeek 全曲重排默认关闭，输出分类为高置信、本地对齐版及显式开启时的 DeepSeek版。详见 `asr-alignment.md`。
 
 所有主播共享一个后台执行队列，避免 Whisper、Qwen 和渲染同时占用内存。一首失败不会阻止同录播中的其他歌曲。
@@ -32,6 +44,8 @@
 完整 MP4 渲染成功后，API 以项目 ID 幂等创建 `publish_jobs`。投稿任务只快照识别层的 `identified_title`、`identified_artist`、`identity_source`，以及自动规则已经锁定的主播显示名和 BililiveTool preset ID；歌词候选、手工显示标题和 LLM 不得覆盖这些值。规则没有选择 preset 时不创建准备任务，避免误用另一位主播的全局默认模板。常驻对账只处理上次水位之后完成的成片，未选模板期间完成的成片在选好模板后不会自动补建。
 
 ### 投稿管理页
+
+2026-10-07起当前行为见[歌曲项目与高置信自动投稿V2](automatic-publishing.md)。以下底图/字体/只停ready说明保留为旧Phase1维护记录，不代表新worker。旧任务隔离，新流程不依赖底图或字体。
 
 第五工作区“投稿管理”（`web/publish.js`、`web/publish.css`）列出所有锁定主播，每位主播一张卡片：
 
@@ -71,7 +85,7 @@ SQLite 表：`automation_profiles`、`automation_seen`、`automation_runs`。运
 
 ## 安全配置
 
-`DEEPSEEK_API_KEY` 只能放 `.env`。页面和 API 只返回是否已配置及模型名，不返回 Key。默认模型为 `deepseek-v4-flash`，默认地址为 `https://api.deepseek.com`。
+主接口复用 `TITLE_API_KEY`、`TITLE_API_BASE_URL`、`TITLE_API_PROXY`，不受 `AI_TITLE_ENABLED` 控制；独立 `SONG_ANALYSIS_MODEL=gpt-6.1-sol`、`SONG_ANALYSIS_TIMEOUT_SECONDS=600`（HTTP各阶段等待上限，不是整个操作总时限）。备用沿用 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL=https://api.deepseek.com`、`DEEPSEEK_MODEL=deepseek-v4-flash`。主或备用有一个已配置即可启用规则；主缺失会标明缺少密钥并用备用。密钥只在运行环境，不进入数据库/文档/日志。规则页显示主/备用配置，任务记录显示本次实际请求模型（不证明第三方真实后端）。整场 ASR、单曲Qwen、指纹身份以及默认关闭的DeepSeek全曲歌词重排不变。
 
 ## 最低验证
 
